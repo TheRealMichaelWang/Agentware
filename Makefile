@@ -5,7 +5,13 @@ FS_DIR := initramfs
 AW_CORE_DIR := agentwarecore
 TARGET := x86_64-unknown-linux-musl
 
-.PHONY: all build buildcore buildsupervisor pack run clean
+.PHONY: all build buildcore buildsupervisor pack run selftest clean
+
+# Shared QEMU invocation. virtio-vga is what gives the guest /dev/dri/card0,
+# which ui-manager will render onto via DRM/KMS.
+QEMU := qemu-system-x86_64 -enable-kvm -m 4G -cpu host \
+	-kernel $(KERNEL) -initrd $(INITRAMFS_ARCHIVE) \
+	-device virtio-vga -no-reboot
 
 # ---------------------------------------------------------
 # Default Target
@@ -51,23 +57,28 @@ pack: build
 	# 3. Copy the compiled Rust binary
 	cp $(AW_CORE_DIR)/supervisor/target/$(TARGET)/release/supervisor $(FS_DIR)/init
 	
-	# 4. Pack the filesystem (Requires sudo to read the device node)
-	cd $(FS_DIR) && sudo find . -print0 | sudo cpio --null -o --format=newc | gzip -9 > ../$(INITRAMFS_ARCHIVE)
-	
-	# 5. Give ownership of the final image back to your user
-	sudo chown $(USER):$(USER) $(INITRAMFS_ARCHIVE)
+	# 4. Pack the filesystem.
+	#
+	# No sudo needed: cpio records a device node's major/minor from stat, it
+	# never opens the device. -R 0:0 makes everything root-owned inside the
+	# archive regardless of who ran the build.
+	cd $(FS_DIR) && find . -print0 | cpio --null -o --format=newc -R 0:0 --quiet | gzip -9 > ../$(INITRAMFS_ARCHIVE)
 
 # Boot QEMU (depends on 'pack' being finished)
 run: pack
 	@echo "==> Booting Agentware in QEMU..."
-	qemu-system-x86_64 -enable-kvm -m 4G \
-		-cpu host \
-		-kernel $(KERNEL) \
-		-initrd $(INITRAMFS_ARCHIVE) \
-		-device virtio-vga \
-		-display gtk \
-		-serial stdio \
+	$(QEMU) -display gtk -serial stdio \
 		-append "console=tty0 console=ttyS0,115200"
+
+# Headless boot that exercises the supervisor end to end and powers itself off.
+#
+# Passing agentware.selftest makes the supervisor spawn a throwaway child, reap
+# it, and run a full shutdown. QEMU exiting on its own is the pass signal; if it
+# hangs, something in that chain is broken.
+selftest: pack
+	@echo "==> Running supervisor selftest (headless)..."
+	$(QEMU) -display none -serial stdio \
+		-append "console=ttyS0,115200 agentware.selftest"
 # ---------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------
