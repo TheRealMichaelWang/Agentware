@@ -24,6 +24,13 @@
 //! This is a library rather than a module of the supervisor so that the
 //! stand-in binaries speak the same protocol by construction instead of by
 //! copy-paste.
+//!
+//! The same framing carries the display protocol, in [`display`]. That one runs
+//! between a drawing client and the haimanager and never touches PID 1, but it
+//! lives here for the same reason: two processes that must agree on a wire
+//! should read it out of one file.
+
+pub mod display;
 
 use std::fmt;
 use std::io::{self, Read};
@@ -63,7 +70,7 @@ pub enum ProtoError {
 impl fmt::Display for ProtoError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ProtoError::TooLarge(n) => write!(f, "frame of {n} bytes exceeds the {MAX_FRAME} limit"),
+            ProtoError::TooLarge(n) => write!(f, "frame of {n} bytes exceeds the limit"),
             ProtoError::NotUtf8 => write!(f, "frame is not valid UTF-8"),
         }
     }
@@ -83,12 +90,25 @@ pub fn encode(fields: &[&str]) -> Vec<u8> {
 /// A stream socket splits and merges writes freely, so a read may contain half
 /// a frame, three frames, or two and a half. Reassembly has to live somewhere,
 /// and this is it.
-#[derive(Default)]
 pub struct Decoder {
     buf: Vec<u8>,
+    /// Longest frame this decoder will accept. The control socket wants a tight
+    /// ceiling because PID 1 must not be made to allocate; a display connection
+    /// carries whole documents and needs a looser one.
+    limit: usize,
+}
+
+impl Default for Decoder {
+    fn default() -> Self {
+        Self { buf: Vec::new(), limit: MAX_FRAME }
+    }
 }
 
 impl Decoder {
+    pub fn with_limit(limit: usize) -> Self {
+        Self { buf: Vec::new(), limit }
+    }
+
     pub fn feed(&mut self, bytes: &[u8]) {
         self.buf.extend_from_slice(bytes);
     }
@@ -100,7 +120,7 @@ impl Decoder {
         }
 
         let len = u32::from_le_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]) as usize;
-        if len > MAX_FRAME {
+        if len > self.limit {
             return Err(ProtoError::TooLarge(len));
         }
         if self.buf.len() < HEADER + len {

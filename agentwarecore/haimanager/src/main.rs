@@ -4,38 +4,65 @@
 //! Agentware that touches any of them. Everything else describes what it wants
 //! shown as AWML and receives events back.
 //!
-//! Milestone 4: a markup document is parsed, laid out, painted and hit tested.
-//! The document is still held locally rather than arriving from a client, which
-//! is what the next milestone changes.
+//! Milestone 5: trees arrive from real processes. The compositor registers with
+//! the supervisor, receives one descriptor per process that draws, holds a tree
+//! per connection, diffs each new one against the one it is holding, carries the
+//! ephemeral state applications deliberately do not track, and sends events back
+//! stamped with the version of the tree they were generated against.
+//!
+//! Which connection appears where is milestone 6. For now the newest is in
+//! front and F1 cycles, which is enough to see that several clients are held
+//! independently, with independent focus and independent scroll.
 
 mod awml;
+mod client;
 mod cursor;
+mod document;
 mod drm;
 mod input;
 mod paint;
-mod specimen;
+mod status;
 mod ui;
 
-use std::io::Write;
+use std::collections::VecDeque;
+use std::io::{IoSliceMut, Write};
+use std::mem::MaybeUninit;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 
-use awproto::{ROLE_HAIMANAGER, SOCKET_PATH, encode, read_frame};
+use awproto::{Decoder, ROLE_HAIMANAGER, SOCKET_PATH, encode, read_frame};
 use rustix::event::epoll;
+use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, recvmsg};
 
-use input::Input;
+use client::Clients;
+use input::{Event, Input, Key};
 use paint::font::Fonts;
 use paint::{Canvas, Rect};
 
-/// epoll tokens. Input devices take one each, offset by their index.
+/// epoll tokens. The supervisor connection is fixed; input devices take one each
+/// offset by their index, and client connections take one derived from their own
+/// descriptor, which is unique for as long as it is open.
+const TOKEN_SUPERVISOR: u64 = 1;
 const TOKEN_INPUT_BASE: u64 = 0x100;
+const TOKEN_CLIENT_BASE: u64 = 0x1000;
+
+/// Cycles which client is in front. A stand-in for window management, which
+/// arrives with workspace compositing.
+const KEY_F1: u16 = 59;
 
 fn main() {
     log("starting");
 
-    match register() {
-        Ok(()) => log("registered with the supervisor"),
-        Err(err) => log(&format!("not registered ({err}); continuing standalone")),
-    }
+    let supervisor = match register() {
+        Ok(stream) => {
+            log("registered with the supervisor");
+            Some(stream)
+        }
+        Err(err) => {
+            log(&format!("not registered ({err}); no clients can be handed over"));
+            None
+        }
+    };
 
     let mut display = match drm::Display::open() {
         Ok(display) => display,
@@ -63,45 +90,32 @@ fn main() {
 
     let mut canvas = Canvas::new(width, height);
 
-    // The status readout sits along the bottom, so the document gets the rest.
-    let area = Rect::new(0, 0, width as i32, height as i32 - 96);
-    let mut client = match specimen::Client::new(&fonts, area) {
-        Ok(client) => client,
-        Err(err) => {
-            log(&format!("FATAL: could not parse the document: {err}"));
-            std::process::exit(1);
-        }
-    };
-    log(&format!("parsed {} nodes", client.node_count()));
+    // The status readout sits along the bottom, so clients get the rest.
+    let area = Rect::new(0, 0, width as i32, height as i32 - status::HEIGHT);
+    let mut clients = Clients::new(area);
 
-    // Printed once so the reduced schema can be read against the document that
-    // produced it. Both come from the same tree, which is the claim being made.
-    for line in client.agent_view().lines() {
-        log(&format!("agent view | {line}"));
-    }
-    if let Some(rect) = client.locate("send") {
-        log(&format!("locate send -> {},{} {}x{}", rect.x, rect.y, rect.w, rect.h));
-    }
-
-    // Paint once before waiting, so a machine with no input at all still shows
+    // Paint once before waiting, so a machine with nothing attached still shows
     // something rather than a blank screen.
-    redraw(&mut display, &mut canvas, &fonts, &input, &client);
+    redraw(&mut display, &mut canvas, &fonts, &input, &clients);
     log(&format!("{} glyphs rasterized for the first frame", fonts.glyph_count()));
 
-    run(&mut display, &mut canvas, &fonts, &mut input, &mut client);
+    run(&mut display, &mut canvas, &fonts, &mut input, &mut clients, supervisor);
 }
 
-/// Wait for input and repaint when something changes.
+/// Wait for something to happen and repaint when it does.
 ///
-/// Every device is an epoll source, so the process sleeps whenever nothing is
+/// Every source is a file descriptor, so the process sleeps whenever nothing is
 /// happening. Repainting is driven by events rather than by a frame clock: a
-/// desktop that is not being touched should cost nothing.
+/// desktop that is not being touched should cost nothing, and an application
+/// that resends a tree identical to the one on screen should cost nothing
+/// either. The second of those is what the diff is for.
 fn run(
     display: &mut drm::Display,
     canvas: &mut Canvas,
     fonts: &Fonts,
     input: &mut Input,
-    client: &mut specimen::Client,
+    clients: &mut Clients,
+    supervisor: Option<UnixStream>,
 ) -> ! {
     let epoll = match epoll::create(epoll::CreateFlags::CLOEXEC) {
         Ok(epoll) => epoll,
@@ -110,6 +124,18 @@ fn run(
             park();
         }
     };
+
+    let mut handoffs = supervisor.map(Handoffs::new);
+    if let Some(handoffs) = &handoffs
+        && let Err(err) = epoll::add(
+            &epoll,
+            handoffs.borrow(),
+            epoll::EventData::new_u64(TOKEN_SUPERVISOR),
+            epoll::EventFlags::IN,
+        )
+    {
+        log(&format!("could not watch the supervisor connection: {err}"));
+    }
 
     let mut events = [epoll::Event {
         flags: epoll::EventFlags::empty(),
@@ -146,20 +172,140 @@ fn run(
         let mut dirty = false;
         for event in &events[..count] {
             let token = event.data.u64();
-            if token < TOKEN_INPUT_BASE {
-                continue;
-            }
 
-            let index = (token - TOKEN_INPUT_BASE) as usize;
-            for event in input.read_device(index) {
-                client.handle(fonts, event);
-                dirty = true;
+            match token {
+                TOKEN_SUPERVISOR => {
+                    let Some(inbox) = &mut handoffs else { continue };
+                    let (arrivals, gone) = inbox.drain();
+
+                    for (fields, fd) in arrivals {
+                        dirty |= adopt(&epoll, clients, &fields, fd);
+                    }
+
+                    if gone {
+                        // Nothing else can hand over a client, but the screen is
+                        // still ours and the clients we already have still work.
+                        log("the supervisor connection closed; no further handoffs");
+                        let _ = epoll::delete(&epoll, inbox.borrow());
+                        handoffs = None;
+                    }
+                }
+
+                token if token >= TOKEN_CLIENT_BASE => {
+                    let fd = (token - TOKEN_CLIENT_BASE) as RawFd;
+                    let Some(client) = clients.get_mut(fd) else { continue };
+
+                    let progress = client.readable(fonts);
+                    for line in progress.log {
+                        log(&line);
+                    }
+                    dirty |= progress.dirty;
+
+                    // A first tree is worth printing whole: the reduced schema
+                    // can then be read against the document that produced it,
+                    // which is the claim the design makes about them.
+                    if progress.dirty
+                        && let Some(view) = client.agent_view()
+                        && client.version() == 1
+                    {
+                        for line in view.lines() {
+                            log(&format!("agent view | {line}"));
+                        }
+                    }
+
+                    if progress.gone {
+                        let _ = epoll::delete(&epoll, client.borrow());
+                        if let Some(label) = clients.remove(fd) {
+                            log(&format!("{label} disconnected"));
+                        }
+                        dirty = true;
+                    }
+                }
+
+                token if token >= TOKEN_INPUT_BASE => {
+                    let index = (token - TOKEN_INPUT_BASE) as usize;
+                    for event in input.read_device(index) {
+                        dirty |= route(fonts, clients, event);
+                    }
+                }
+
+                other => log(&format!("event on unknown epoll token {other}")),
             }
+        }
+
+        // Any backlog a full socket left behind goes out now rather than waiting
+        // for the next thing to happen to that client.
+        clients.flush_all();
+
+        for fd in clients.broken() {
+            if let Some(client) = clients.get_mut(fd) {
+                let _ = epoll::delete(&epoll, client.borrow());
+            }
+            if let Some(label) = clients.remove(fd) {
+                log(&format!("{label} stopped reading its events and was dropped"));
+            }
+            dirty = true;
         }
 
         if dirty {
-            redraw(display, canvas, fonts, input, client);
+            redraw(display, canvas, fonts, input, clients);
         }
+    }
+}
+
+/// Take a descriptor the supervisor pushed and start watching it.
+fn adopt(epoll: &impl AsFd, clients: &mut Clients, fields: &[String], fd: Option<OwnedFd>) -> bool {
+    let Some(fd) = fd else {
+        log(&format!("handoff {:?} arrived with no descriptor", fields.join(" ")));
+        return false;
+    };
+
+    let raw = fd.as_raw_fd();
+    let label = match clients.attach(fields, fd) {
+        Ok(label) => label,
+        Err(err) => {
+            log(&format!("refused a handoff: {err}"));
+            return false;
+        }
+    };
+
+    // The client owns the descriptor now, so it is borrowed back out of the
+    // registry rather than kept here.
+    let Some(client) = clients.get_mut(raw) else { return false };
+    let watched = epoll::add(
+        epoll,
+        client.borrow(),
+        epoll::EventData::new_u64(TOKEN_CLIENT_BASE + raw as u64),
+        epoll::EventFlags::IN,
+    );
+
+    if let Err(err) = watched {
+        log(&format!("could not watch {label}: {err}"));
+        clients.remove(raw);
+        return false;
+    }
+
+    log(&format!("{label} attached"));
+    true
+}
+
+/// Send one input event where it belongs.
+///
+/// Everything goes to the client in front, except the pointer, which belongs to
+/// the compositor and only ever moves the cursor. Routing by workspace region
+/// comes with compositing.
+fn route(fonts: &Fonts, clients: &mut Clients, event: Event) -> bool {
+    match event {
+        // The cursor is drawn by the compositor, so a move is a repaint and
+        // nothing else. No client is told the pointer went past it.
+        Event::PointerMoved { .. } => true,
+
+        Event::KeyPressed(Key::Other(KEY_F1)) => clients.cycle(),
+
+        other => clients
+            .front_mut()
+            .map(|client| client.handle(fonts, other))
+            .unwrap_or(false),
     }
 }
 
@@ -168,9 +314,13 @@ fn redraw(
     canvas: &mut Canvas,
     fonts: &Fonts,
     input: &Input,
-    client: &specimen::Client,
+    clients: &Clients,
 ) {
-    client.draw(canvas, fonts);
+    match clients.front() {
+        Some(client) if client.has_document() => client.draw(canvas, fonts),
+        _ => status::draw_idle(canvas, fonts, clients),
+    }
+    status::draw(canvas, fonts, clients);
 
     let (x, y) = input.pointer();
     cursor::draw(canvas, x, y, cursor::Kind::Human);
@@ -180,7 +330,101 @@ fn redraw(
     }
 }
 
-fn register() -> Result<(), String> {
+/// The supervisor connection, once registration is done with it.
+///
+/// After the reply to `register` it carries nothing but handoffs: a frame naming
+/// what a process is, with that process's descriptor attached to the same
+/// message. The two arrive together deliberately, so a descriptor is never
+/// holding an unexplained connection.
+/// One frame from the supervisor, with the descriptor it named if it named one.
+type Handoff = (Vec<String>, Option<OwnedFd>);
+
+struct Handoffs {
+    stream: UnixStream,
+    decoder: Decoder,
+    /// Descriptors received but not yet matched to the frame that names them.
+    /// A stream socket may coalesce, so pairing is by arrival order rather than
+    /// by assuming one message per read.
+    fds: VecDeque<OwnedFd>,
+}
+
+impl Handoffs {
+    fn new(stream: UnixStream) -> Self {
+        let _ = stream.set_nonblocking(true);
+        Handoffs { stream, decoder: Decoder::default(), fds: VecDeque::new() }
+    }
+
+    fn borrow(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.stream.as_fd()
+    }
+
+    /// Everything that has arrived, and whether the supervisor hung up.
+    fn drain(&mut self) -> (Vec<Handoff>, bool) {
+        let mut gone = false;
+
+        loop {
+            let mut buf = [0u8; 4096];
+            let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(4))];
+            let mut control = RecvAncillaryBuffer::new(&mut space);
+
+            match recvmsg(
+                self.stream.as_fd(),
+                &mut [IoSliceMut::new(&mut buf)],
+                &mut control,
+                RecvFlags::empty(),
+            ) {
+                Ok(received) if received.bytes == 0 => {
+                    gone = true;
+                    break;
+                }
+                Ok(received) => {
+                    for message in control.drain() {
+                        if let RecvAncillaryMessage::ScmRights(fds) = message {
+                            self.fds.extend(fds);
+                        }
+                    }
+                    self.decoder.feed(&buf[..received.bytes]);
+                }
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(rustix::io::Errno::AGAIN) => break,
+                Err(err) => {
+                    log(&format!("supervisor connection read failed: {err}"));
+                    gone = true;
+                    break;
+                }
+            }
+        }
+
+        let mut arrivals = Vec::new();
+        loop {
+            match self.decoder.next_frame() {
+                Ok(Some(fields)) => {
+                    let attached = fields
+                        .first()
+                        .is_some_and(|verb| verb.ends_with("-attached"))
+                        .then(|| self.fds.pop_front())
+                        .flatten();
+                    arrivals.push((fields, attached));
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    log(&format!("supervisor protocol error: {err}"));
+                    gone = true;
+                    break;
+                }
+            }
+        }
+
+        (arrivals, gone)
+    }
+}
+
+/// Register as the compositor and keep the connection.
+///
+/// Registering is the readiness signal the supervisor gates dependents on, and
+/// the same connection is what descriptors are pushed down afterwards. Dropping
+/// it would tell the supervisor the compositor had gone away.
+fn register() -> Result<UnixStream, String> {
     let mut stream =
         UnixStream::connect(SOCKET_PATH).map_err(|err| format!("connect: {err}"))?;
 
@@ -193,11 +437,7 @@ fn register() -> Result<(), String> {
         return Err(format!("refused: {}", reply.join(" ")));
     }
 
-    // The connection has to outlive this function: the supervisor treats a
-    // closed connection as the role going away, and would stop considering the
-    // compositor ready the moment we hung up.
-    std::mem::forget(stream);
-    Ok(())
+    Ok(stream)
 }
 
 /// Sleep forever without burning a core. Only reached on a fatal error, where

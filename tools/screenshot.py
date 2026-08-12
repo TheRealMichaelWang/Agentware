@@ -133,7 +133,10 @@ def main():
     parser.add_argument("--do", action="append", default=[], metavar="CMD",
                         help="a QEMU monitor command to run before capturing, "
                              "repeatable. e.g. --do 'sendkey a' "
-                             "--do 'mouse_move 100 50' --do 'mouse_button 1'")
+                             "--do 'mouse_move 100 50' --do 'mouse_button 1'. "
+                             "The wheel is the third argument to mouse_move, "
+                             "as in 'mouse_move 0 0 -1'; mouse_button's wheel "
+                             "bits do not reach a PS/2 guest.")
     args = parser.parse_args()
 
     workdir = tempfile.mkdtemp(prefix="agentware-shot-")

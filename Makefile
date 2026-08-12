@@ -55,6 +55,11 @@ pack: build
 	cp $(BIN_DIR)/supervisor $(FS_DIR)/init
 	cp $(BIN_DIR)/haimanager $(FS_DIR)/bin/haimanager
 
+	# 3a. The reference client for the display protocol. It stands in for both
+	# the agentdesk and an application until either exists, which is what gives
+	# the compositor something real to render and diff.
+	cp $(BIN_DIR)/awapp $(FS_DIR)/bin/awapp
+
 	# 3b. Stand-in binaries used by `make selftest` to exercise the service
 	# table and the control socket. Harmless to ship; nothing starts them
 	# without the selftest flag on the kernel command line.
@@ -75,10 +80,15 @@ pack: build
 	cd $(FS_DIR) && find . -print0 | cpio --null -o --format=newc -R 0:0 --quiet | gzip -9 > ../$(INITRAMFS_ARCHIVE)
 
 # Boot QEMU (depends on 'pack' being finished)
+#
+# agentware.demo is on the command line because desktop-main does not exist yet,
+# so without it nothing would ever ask the broker for a workspace and the
+# compositor would come up with no clients. It substitutes a stand-in start menu
+# and a stand-in agentdesk, and drops out the moment either is written.
 run: pack
 	@echo "==> Booting Agentware in QEMU..."
 	$(QEMU) -display gtk -serial stdio \
-		-append "console=tty0 console=ttyS0,115200"
+		-append "console=tty0 console=ttyS0,115200 agentware.demo"
 
 # Headless boot that exercises the supervisor end to end and powers itself off.
 #

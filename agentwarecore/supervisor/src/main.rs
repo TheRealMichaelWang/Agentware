@@ -17,6 +17,7 @@
 //!   6. shutdown     stop everything, flush, unmount, power off
 
 mod cgroup;
+mod demo;
 mod desk;
 mod early;
 mod ipc;
@@ -115,6 +116,7 @@ fn main() {
     };
 
     let selftest = selftest::requested();
+    let demo = !selftest && demo::requested();
 
     // Stage 4a. Both of these come up before any service does, so nothing can
     // start, try to reach the broker, and lose a race it did not know it was in.
@@ -130,13 +132,17 @@ fn main() {
         }
     };
 
-    let desks = Desks::new(if selftest { selftest::programs() } else { Programs::system() });
+    let desks = Desks::new(match (selftest, demo) {
+        (true, _) => selftest::programs(),
+        (_, true) => demo::programs(),
+        _ => Programs::system(),
+    });
 
     // Stage 4b.
-    let mut services = Services::new(if selftest {
-        selftest::services()
-    } else {
-        system_services()
+    let mut services = Services::new(match (selftest, demo) {
+        (true, _) => selftest::services(),
+        (_, true) => demo::services(),
+        _ => system_services(),
     });
     services.start_all();
 

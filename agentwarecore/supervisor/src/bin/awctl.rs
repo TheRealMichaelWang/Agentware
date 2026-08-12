@@ -1,9 +1,11 @@
 //! Client for the supervisor control socket.
 //!
-//! Two uses. `awctl <verb> [args...]` issues a single request and prints the
+//! Three uses. `awctl <verb> [args...]` issues a single request and prints the
 //! reply, which is the only way to poke at the broker on a machine with no
 //! shell. `awctl selftest` runs a scripted sequence and exits non-zero if any
-//! step misbehaves, which is what the boot-time self-test runs.
+//! step misbehaves, which is what the boot-time self-test runs. `awctl demo`
+//! opens one workspace with one application in it, which is what puts something
+//! on screen while `desktop-main` does not exist.
 //!
 //! It speaks the protocol over a real socket rather than calling into the
 //! supervisor, so the framing, the partial-read handling and the dispatch all
@@ -23,6 +25,7 @@ fn main() {
             2
         }
         Some("selftest") => selftest(),
+        Some("demo") => demo(),
         Some(_) => single(&args),
     };
 
@@ -128,6 +131,54 @@ fn selftest() -> i32 {
     } else {
         println!("selftest: {failures} check(s) failed");
         1
+    }
+}
+
+/// Put a workspace and an application on screen.
+///
+/// `desktop-main` is what will do this, and it does not exist. Until it does,
+/// the compositor has nothing to render and the display half of the system
+/// cannot be looked at. This is the smallest thing that fills that gap, and it
+/// goes through the real broker: the workspace and the app are forked by PID 1,
+/// their descriptors are pushed to the haimanager by the supervisor, and nothing
+/// here is aware of any of it.
+fn demo() -> i32 {
+    let mut conn = match Conn::open() {
+        Ok(conn) => conn,
+        Err(err) => {
+            eprintln!("demo: cannot reach the supervisor: {err}");
+            return 1;
+        }
+    };
+
+    let reply = match conn.request(&["create-desk"]) {
+        Ok(reply) => reply,
+        Err(err) => {
+            eprintln!("demo: create-desk: {err}");
+            return 1;
+        }
+    };
+    if reply.first().map(String::as_str) != Some("ok") {
+        eprintln!("demo: create-desk refused: {}", reply.join(" "));
+        return 1;
+    }
+
+    let desk = reply.get(1).cloned().unwrap_or_default();
+    println!("demo: workspace {desk} created");
+
+    match conn.request(&["open-app", &desk, "awapp"]) {
+        Ok(reply) if reply.first().map(String::as_str) == Some("ok") => {
+            println!("demo: awapp opened in workspace {desk}");
+            0
+        }
+        Ok(reply) => {
+            eprintln!("demo: open-app refused: {}", reply.join(" "));
+            1
+        }
+        Err(err) => {
+            eprintln!("demo: open-app: {err}");
+            1
+        }
     }
 }
 

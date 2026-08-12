@@ -156,6 +156,19 @@ impl Node {
     pub fn disabled(&self) -> bool {
         self.flag("disabled")
     }
+
+    /// Overwrite an attribute, adding it if the element did not carry one.
+    ///
+    /// Used for exactly one thing: writing the compositor's own copy of a text
+    /// control's value back into the held tree, so that what is painted and what
+    /// an agent reads are the same string even while the application has not yet
+    /// caught up with what the human typed.
+    pub fn set(&mut self, name: &str, value: &str) {
+        match self.attrs.iter_mut().find(|(key, _)| key == name) {
+            Some((_, existing)) => *existing = value.to_owned(),
+            None => self.attrs.push((name.to_owned(), value.to_owned())),
+        }
+    }
 }
 
 pub struct Tree {
@@ -181,15 +194,6 @@ impl Tree {
             }
             index = self.nodes[index].parent?;
         }
-    }
-
-    /// Find a node by its id.
-    ///
-    /// Ids are unique within a window, so this is a scan rather than a map: a
-    /// tree is a few hundred nodes and the scan happens once per agent
-    /// interaction, not once per frame.
-    pub fn by_id(&self, id: &str) -> Option<usize> {
-        self.nodes.iter().position(|node| node.id() == Some(id))
     }
 
 }
@@ -464,8 +468,11 @@ fn unescape(text: &str) -> String {
 ///
 /// `actions` is added, computed from the element and its state rather than
 /// copied from the document.
-pub fn agent_view(tree: &Tree) -> String {
-    let mut out = String::from("<view>\n");
+pub fn agent_view(tree: &Tree, app: &str, desk: u32) -> String {
+    // The app name and the workspace come from the supervisor's handoff, not
+    // from the document, so an application cannot misreport which workspace it
+    // is in or borrow another one's name.
+    let mut out = format!("<view app=\"{app}\" desk=\"{desk}\">\n");
     emit(tree, Tree::ROOT, 1, &mut out);
     out.push_str("</view>");
     out

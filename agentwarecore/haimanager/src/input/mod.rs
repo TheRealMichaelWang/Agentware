@@ -48,8 +48,9 @@ pub enum Event {
     ButtonReleased { button: Button, x: i32, y: i32 },
     KeyPressed(Key),
     KeyReleased(Key),
-    /// Positive scrolls up, away from the user.
-    Scrolled(i32),
+    /// Positive scrolls up, away from the user. Carries the pointer position,
+    /// because which container scrolls is decided by what the wheel is over.
+    Scrolled { delta: i32, x: i32, y: i32 },
 }
 
 /// Record layout of `struct input_event` on 64-bit Linux.
@@ -214,7 +215,11 @@ impl Input {
                     self.y = (self.y + record.value).clamp(0, self.height - 1);
                     events.push(Event::PointerMoved { x: self.x, y: self.y });
                 }
-                REL_WHEEL => events.push(Event::Scrolled(record.value)),
+                REL_WHEEL => events.push(Event::Scrolled {
+                    delta: record.value,
+                    x: self.x,
+                    y: self.y,
+                }),
                 _ => {}
             },
 

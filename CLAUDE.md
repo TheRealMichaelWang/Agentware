@@ -22,10 +22,11 @@ obvious alternative was tried and failed.
 
 ```
 agentwarecore/          cargo workspace
-  awproto/              the supervisor's wire protocol, shared by everything
+  awproto/              both wire protocols: the control socket, and display
   supervisor/           PID 1: init, service table, spawn broker
     src/bin/            awtest awstubborn awctl awui: self-test stand-ins
-  haimanager/           the compositor: DRM, input, AWML, layout, paint
+  haimanager/           the compositor: DRM, input, AWML, layout, paint, clients
+  awapp/                reference client, standing in for apps and the agentdesk
 initramfs/              staged image contents (build output, gitignored)
 tools/screenshot.py     boot, inject input, capture the screen as PNG
 kernel-build/           Linux submodule
@@ -38,28 +39,40 @@ policy and backoff, readiness gating, control socket, spawn broker, cgroup per
 workspace, descriptor handoff, clean shutdown. `make selftest` exercises all of
 it and powers the machine off; QEMU exiting on its own is the pass signal.
 
-**haimanager: milestones 1 to 4 done.**
+**haimanager: milestones 1 to 5 done.**
 
 1. DRM/KMS bring-up
 2. Software rasterizer, outline fonts via `fontdue`
 3. evdev input, both cursors, event-driven loop
 4. AWML parser, layout, hit testing, agent view
+5. Client protocol, tree diffing, ephemeral state, versioned events
+
+Milestone 5 in more detail, since the rest builds on it. Clients arrive as
+descriptors the supervisor pushes over the control socket, each tagged with the
+workspace it belongs to. Each connection holds one tree, its version, and the
+ephemeral state applications deliberately do not track: focus, the caret, and
+scroll offsets, keyed by node identity so they survive a re-render. A new tree
+is diffed against the held one and an identical resend costs no frame. Events go
+back stamped with the version of the tree they were generated against.
+
+A field's `value` is the application's and the caret in it is the compositor's,
+so typing is applied locally, painted immediately, and sent on. Values sent are
+remembered until a tree comes back carrying one, which is what stops a second
+keystroke being thrown away by the echo of the first.
 
 **Remaining:**
 
-5. **Client protocol and tree diffing.** Accept trees on the inherited
-   descriptor, diff against the held tree, preserve ephemeral state across
-   re-renders, send events back carrying the tree version they were generated
-   against.
 6. **Workspace compositing.** The four regions per workspace, the global
    navigation bar, app windows, routing input to the right client.
 7. **Agent surface.** Queries scoped by connection, the reduced view, intent
    resolution with visibility and enabled checks, fake cursor animation,
    rejections.
 
-Nothing else exists yet: no `agentdesk`, no `agent`, no `desktop-main`, no apps.
-The supervisor logs and skips what is not installed rather than crash looping
-against it, so the system boots and is useful without them.
+Nothing else exists yet: no `agentdesk`, no `agent`, no `desktop-main`, no real
+apps. `awapp` stands in for the first and the last of those, and is the reference
+client for the display protocol rather than a product. The supervisor logs and
+skips what is not installed rather than crash looping against it, so the system
+boots and is useful without them.
 
 ## Building and running
 
@@ -68,6 +81,17 @@ make selftest    # headless supervisor self-test, exits 0 on success
 make run         # boot in a QEMU window
 make pack        # build and pack the initramfs without booting
 ```
+
+`make run` passes `agentware.demo` on the kernel command line. `desktop-main`
+does not exist, so nothing would otherwise ask the broker for a workspace and
+the compositor would come up with no clients at all. The flag substitutes two
+stand-ins and nothing else: `awapp desk` as the agentdesk, and `awctl demo` as
+the start menu, which asks for one workspace with one `awapp` in it. Everything
+between them is the real path. Drop the flag to see the compositor with nothing
+attached.
+
+Once it is up, F1 cycles which client is in front. That is a stand-in for window
+management, which arrives with compositing.
 
 Builds target `x86_64-unknown-linux-musl`. No sudo is needed: `cpio` records a
 device node's major/minor from `stat` and never opens it.
@@ -79,18 +103,25 @@ guest, optionally injects input through the QEMU monitor, captures the
 framebuffer and writes a PNG, which can then be viewed directly.
 
 ```
-tools/screenshot.py out.png --seconds 7 \
-  --do "mouse_move 150 -120" --do "mouse_button 1" \
-  --do "sendkey h" --do "sendkey shift-l"
+tools/screenshot.py out.png --seconds 8 --append "console=ttyS0,115200 agentware.demo" \
+  --do "mouse_move 150 -120" --do "mouse_button 1" --do "mouse_button 0" \
+  --do "sendkey h" --do "sendkey shift-l" --do "mouse_move 0 0 -1"
 ```
+
+The `--append` matters: without `agentware.demo` there is nothing on screen to
+photograph. The pointer starts in the middle of the screen and every move is a
+delta from where it is now.
 
 Use it. Every rendering bug so far was found this way and none would have been
 found any other way: a black screen where every ioctl reported success, four
 glyphs silently rendering as capitals, a list label drawn on top of its first
 item, content flush against the screen edge.
 
-The haimanager also prints its agent view to the kernel log at startup, so the
-reduced schema can be read against the document that produced it.
+The kernel log carries the other half. The haimanager prints a client's agent
+view when its first tree arrives, so the reduced schema can be read against the
+document that produced it, and prints a line per tree after that saying what the
+diff found, which is how "the application resent something identical" is told
+apart from "the screen is stale".
 
 ## Working conventions
 
@@ -132,6 +163,13 @@ is the list so it does not get relitigated.
 * The stop button is drawn by the haimanager and routes to the supervisor, so it
   works even if the agentdesk is wedged.
 * Applications send the **whole tree** every time; the haimanager diffs it.
+* The tree version is the **application's own counter**, stamped by it and echoed
+  back on every event. Checking one is then a comparison against a number the app
+  already holds, not a mapping it has to maintain.
+* Focus, the caret, and scroll offsets are the compositor's and never appear in
+  the protocol in either direction. They are carried across a re-render by
+  matching node identity: the `id` where there is one, position where there is
+  not.
 * Agents send **intents**, never events. The haimanager resolves, checks
   visibility and enabled state, animates the cursor, then synthesizes the event.
 * Element actions are **derived** from type and state, never declared by the
@@ -154,6 +192,9 @@ is the list so it does not get relitigated.
   after it vanishes.
 * **printk prints levels strictly below `console_loglevel`.** Setting it to 6
   suppresses level-6 messages.
+* **QEMU's `mouse_button` wheel bits do not reach a PS/2 guest.** Bit 8 and bit
+  16 produce nothing at all. The wheel is the optional third argument to
+  `mouse_move`, so `mouse_move 0 0 -1` is one notch down.
 * **`/dev/input` is not fully populated at startup.** QEMU's PS/2 mouse appears
   about 300ms after the directory first has entries, so devices must be
   rescanned rather than enumerated once.
