@@ -99,9 +99,10 @@ make run         # boot in a QEMU window
 make pack        # build and pack the initramfs without booting
 ```
 
-The guest display is sized by asking the host: `make run` reads the desktop
-resolution from `xrandr` and subtracts a margin for window decorations, so the
-QEMU window comes up as large as the monitor allows. The boot line prints what
+The guest display is sized by asking the host: `make run` runs
+`tools/hostsize.sh`, which tries `xrandr` and then WSLg's own log, and subtracts
+a margin for window decorations, so the QEMU window comes up as large as the
+monitor allows. On this machine that is 1896x960 out of a 1920x1080 desktop. The boot line prints what
 was chosen and what the host reported, so a wrong size is visible rather than a
 mystery. With no X display to ask it falls back to 1600x1000, and both numbers
 can still be forced:
@@ -259,6 +260,12 @@ is the list so it does not get relitigated.
   pixels still works and 530 does not, and the failure looks exactly like a
   broken hit test: the cursor is drawn where it was asked to be and the click
   lands somewhere else. Split any move over about 250 pixels into two.
+* **Detection that falls back silently is detection that never worked.** The
+  first host-size probe piped `xrandr` errors to /dev/null; xrandr was not
+  installed, so every boot used the fallback and the change appeared to do
+  nothing. The probe lives in `tools/hostsize.sh` now, it has a second source
+  (WSLg's log), and the boot line prints what the host reported so an empty
+  answer is visible.
 * **A demonstration that depends on geometry breaks at another resolution.** The
   agent script proved `not-visible` with a draft scrolled off the end of a list,
   which stopped being true the moment the display got bigger and the list fitted.

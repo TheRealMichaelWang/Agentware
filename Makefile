@@ -13,12 +13,13 @@ BIN_DIR := $(AW_CORE_DIR)/target/$(TARGET)/release
 #
 # The host screen is asked rather than guessed. Every hardcoded default so far
 # has been wrong on the actual monitor: too small looks cramped, too large gets
-# clipped by the window manager. xrandr answers in the same session `make run`
-# opens the QEMU window in, and the margins cover decorations and the WSLg
-# taskbar. If there is no X display to ask, fall back to something safe.
+# clipped by the window manager. tools/hostsize.sh knows the ways of asking,
+# including WSLg's log when no X tool is installed, and the margins cover the
+# window title bar and the Windows taskbar. If nothing answers, fall back and
+# say so on the boot line.
 #
 # Override per run: make run DISPLAY_W=2560 DISPLAY_H=1440
-HOST_PX := $(shell xrandr --current 2>/dev/null | sed -n 's/.*current \([0-9]\+\) x \([0-9]\+\).*/\1x\2/p' | head -1)
+HOST_PX := $(shell tools/hostsize.sh)
 ifneq ($(HOST_PX),)
 DISPLAY_W ?= $(shell expr $(word 1,$(subst x, ,$(HOST_PX))) - 24)
 DISPLAY_H ?= $(shell expr $(word 2,$(subst x, ,$(HOST_PX))) - 120)

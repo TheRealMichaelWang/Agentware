@@ -187,6 +187,10 @@ impl Canvas {
     /// Antialiased text is the reason this exists: a glyph edge is partly
     /// covered, and plotting it as either on or off is what makes bitmap fonts
     /// look like bitmap fonts.
+    pub fn blend_px(&mut self, x: i32, y: i32, color: Color, coverage: u8) {
+        self.blend(x, y, color, coverage);
+    }
+
     fn blend(&mut self, x: i32, y: i32, color: Color, coverage: u8) {
         if coverage == 0 || !self.clip.contains(x, y) {
             return;

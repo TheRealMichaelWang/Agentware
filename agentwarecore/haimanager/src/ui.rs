@@ -905,13 +905,27 @@ fn paint_node(
             if checked && disabled {
                 canvas.fill_round_rect(box_rect.inset(4), 2, MUTED);
             } else if checked {
-                // A tick rather than a filled square: at this size a square
-                // inside a square reads as a loading state.
-                let t = box_rect.inset(4);
-                canvas.fill_rect(Rect::new(t.x + 1, t.y + t.h / 2, 3, 3), BACKGROUND);
-                canvas.fill_rect(Rect::new(t.x + 3, t.y + t.h / 2 + 2, 3, 3), BACKGROUND);
-                canvas.fill_rect(Rect::new(t.x + 5, t.y + t.h / 2, 3, 3), BACKGROUND);
-                canvas.fill_rect(Rect::new(t.x + 7, t.y + 2, 3, 3), BACKGROUND);
+                // A tick rather than a filled square: a square inside a square
+                // reads as a loading state. Drawn as two strokes stepped along
+                // the box's own geometry, because the previous version was a
+                // hand-tuned cluster of rectangles that stopped lining up the
+                // first time the box changed size.
+                let t = box_rect.inset(3);
+                let (w, h) = (t.w as f32, t.h as f32);
+                let low = (t.x as f32 + w * 0.36, t.y as f32 + h * 0.72);
+                let strokes = [
+                    ((t.x as f32 + w * 0.08, t.y as f32 + h * 0.46), low),
+                    (low, (t.x as f32 + w * 0.90, t.y as f32 + h * 0.12)),
+                ];
+                for ((ax, ay), (bx, by)) in strokes {
+                    let steps = t.w.max(4);
+                    for step in 0..=steps {
+                        let f = step as f32 / steps as f32;
+                        let px = (ax + (bx - ax) * f).round() as i32;
+                        let py = (ay + (by - ay) * f).round() as i32;
+                        canvas.fill_rect(Rect::new(px, py - 1, 2, 2), BACKGROUND);
+                    }
+                }
             }
             canvas.draw_text(
                 fonts,
