@@ -1,17 +1,19 @@
 //! Boot-time acceptance check, enabled with `agentware.selftest` on the kernel
 //! command line.
 //!
-//! The real graphical stack does not exist yet, so without this the service
-//! table, the backoff logic and the shutdown path never run and never get
-//! tested. This substitutes a table of `awtest` processes with known behaviour,
-//! and powers the machine off once they have all reached a final state.
+//! The real userland does not exist yet, so without this the service table, the
+//! backoff logic, the control socket and the teardown path never run and never
+//! get tested. This substitutes stand-in binaries with known behaviour and
+//! powers the machine off once everything has reached a final state.
 //!
 //! QEMU exiting on its own is the pass signal. A hang means something in the
 //! chain is stuck.
 
+use crate::desk::Programs;
 use crate::service::{RestartPolicy, Service};
 
 const AWTEST: &str = "/bin/awtest";
+const AWCTL: &str = "/bin/awctl";
 
 /// True if the kernel command line asked for the self-test.
 pub fn requested() -> bool {
@@ -20,12 +22,25 @@ pub fn requested() -> bool {
         .unwrap_or(false)
 }
 
-/// Services that between them cover every branch of the restart logic.
+/// Point every process kind the broker spawns at a stand-in.
 ///
-/// `flapper` is the interesting one. It fails instantly and forever, so it
-/// exercises the whole backoff curve (250ms, 500ms, 1s) and then the give-up
-/// path. Without backoff it would be an unkillable fork bomb, which is exactly
-/// the failure this table is here to prove cannot happen.
+/// The agent exits on its own after 200ms, which is what a completed turn looks
+/// like from the supervisor's side.
+pub fn programs() -> Programs {
+    Programs {
+        desk: (AWTEST.into(), vec!["run".into()]),
+        agent: (AWTEST.into(), vec!["exit".into(), "0".into(), "200".into()]),
+        app_dir: "/bin".into(),
+    }
+}
+
+/// Services that between them cover every branch of the restart logic, plus the
+/// client that drives the control socket.
+///
+/// `flapper` is the interesting one for restarts. It fails instantly and
+/// forever, so it exercises the whole backoff curve (250ms, 500ms, 1s) and then
+/// the give-up path. Without backoff it would be an unkillable fork bomb, which
+/// is exactly the failure this table is here to prove cannot happen.
 pub fn services() -> Vec<Service> {
     vec![
         // Fails immediately, every time. Should back off with a doubling delay
@@ -36,5 +51,7 @@ pub fn services() -> Vec<Service> {
         Service::new("crasher", AWTEST, &["abort"], RestartPolicy::Limited { max: 1 }),
         // Runs briefly and exits cleanly. Should be left alone, not restarted.
         Service::new("oneshot", AWTEST, &["exit", "0", "100"], RestartPolicy::Never),
+        // Drives a full workspace lifecycle over the control socket.
+        Service::new("control", AWCTL, &["selftest"], RestartPolicy::Never),
     ]
 }

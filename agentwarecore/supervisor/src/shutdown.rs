@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use rustix::system::{RebootCommand, reboot};
 
 use crate::klog::{kinfo, kwarn};
+use crate::desk::Desks;
 use crate::service::Services;
 use crate::{early, reaper};
 
@@ -43,9 +44,12 @@ impl Action {
 /// chance to save state and so `desktop-main` goes down before the `ui-manager`
 /// it draws through. The blanket signal that follows catches everything else:
 /// orphans, agent processes, anything the table does not know about.
-pub fn shutdown(action: Action, services: &mut Services) -> ! {
+pub fn shutdown(action: Action, services: &mut Services, desks: &mut Desks) -> ! {
     kinfo!("shutdown requested, {}", action.label());
 
+    // Workspaces first. They hold the user's work, so they get the chance to
+    // wind down before the stack they are drawing through goes away.
+    desks.close_all();
     services.stop_all();
 
     // kill(-1) hits every process we have permission to signal. The kernel

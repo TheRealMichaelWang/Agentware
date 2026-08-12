@@ -57,11 +57,16 @@ pack: build
 	# 3. Copy the compiled Rust binaries
 	cp $(AW_CORE_DIR)/supervisor/target/$(TARGET)/release/supervisor $(FS_DIR)/init
 
-	# 3b. awtest is a stand-in service used by `make selftest` to exercise the
-	# service table. Harmless to ship; nothing starts it without the selftest
-	# flag on the kernel command line.
+	# 3b. Stand-in binaries used by `make selftest` to exercise the service
+	# table and the control socket. Harmless to ship; nothing starts them
+	# without the selftest flag on the kernel command line.
+	#   awtest      a service that exits, crashes, or runs on demand
+	#   awstubborn  an app that ignores SIGTERM, to force the cgroup.kill path
+	#   awctl       the control socket client
 	mkdir -p $(FS_DIR)/bin
 	cp $(AW_CORE_DIR)/supervisor/target/$(TARGET)/release/awtest $(FS_DIR)/bin/awtest
+	cp $(AW_CORE_DIR)/supervisor/target/$(TARGET)/release/awstubborn $(FS_DIR)/bin/awstubborn
+	cp $(AW_CORE_DIR)/supervisor/target/$(TARGET)/release/awctl $(FS_DIR)/bin/awctl
 	
 	# 4. Pack the filesystem.
 	#

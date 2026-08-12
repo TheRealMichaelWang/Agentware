@@ -18,8 +18,12 @@
 //!
 //! Stages 4 and the control socket half of stage 5 land with the service table.
 
+mod cgroup;
+mod desk;
 mod early;
+mod ipc;
 mod klog;
+mod proto;
 mod reaper;
 mod selftest;
 mod service;
@@ -31,6 +35,8 @@ use std::time::Instant;
 
 use rustix::event::epoll;
 
+use desk::{Desks, Programs};
+use ipc::Control;
 use klog::{kerr, kinfo, kwarn};
 use service::{RestartPolicy, Service, Services};
 use signals::SignalFd;
@@ -39,8 +45,9 @@ use signals::SignalFd;
 /// is allowed to let the process exit.
 static IS_INIT: AtomicBool = AtomicBool::new(false);
 
-/// epoll token for the signalfd. Further sources (the control socket, service
-/// readiness pipes) get their own.
+/// epoll token for the signalfd. The control socket listener is
+/// `ipc::TOKEN_LISTENER`, and each accepted connection gets a token derived from
+/// its own file descriptor.
 const TOKEN_SIGNALS: u64 = 1;
 
 /// The services that make up the Agentware userland.
@@ -108,8 +115,26 @@ fn main() {
         }
     };
 
-    // Stage 4.
     let selftest = selftest::requested();
+
+    // Stage 4a: the control socket comes up before any service does, so nothing
+    // can start, try to reach the broker, and fail a race it did not know it was
+    // in.
+    if let Err(err) = cgroup::Cgroup::init_root() {
+        kwarn!("could not create the cgroup root: {err} (workspace teardown will be degraded)");
+    }
+
+    let control = match Control::bind() {
+        Ok(control) => control,
+        Err(err) => {
+            kerr!("fatal: could not bind the control socket: {err}");
+            park();
+        }
+    };
+
+    let desks = Desks::new(if selftest { selftest::programs() } else { Programs::system() });
+
+    // Stage 4b.
     let mut services = Services::new(if selftest {
         selftest::services()
     } else {
@@ -120,7 +145,7 @@ fn main() {
     kinfo!("supervisor ready");
 
     // Stage 5.
-    main_loop(signalfd, services, selftest)
+    main_loop(signalfd, control, services, desks, selftest)
 }
 
 /// Wait for events and dispatch them, forever.
@@ -129,7 +154,13 @@ fn main() {
 /// in one epoll set: signals via signalfd today, the control socket and service
 /// readiness pipes later. There is no polling and no busy loop, the process is
 /// asleep in `epoll_wait` whenever nothing is happening.
-fn main_loop(mut signalfd: SignalFd, mut services: Services, selftest: bool) -> ! {
+fn main_loop(
+    mut signalfd: SignalFd,
+    mut control: Control,
+    mut services: Services,
+    mut desks: Desks,
+    selftest: bool,
+) -> ! {
     let epoll = match epoll::create(epoll::CreateFlags::CLOEXEC) {
         Ok(fd) => fd,
         Err(err) => {
@@ -148,6 +179,16 @@ fn main_loop(mut signalfd: SignalFd, mut services: Services, selftest: bool) -> 
         park();
     }
 
+    if let Err(err) = epoll::add(
+        &epoll,
+        control.listener_fd(),
+        epoll::EventData::new_u64(ipc::TOKEN_LISTENER),
+        epoll::EventFlags::IN,
+    ) {
+        kerr!("fatal: could not register the control socket with epoll: {err}");
+        park();
+    }
+
     let mut events = [epoll::Event {
         flags: epoll::EventFlags::empty(),
         data: epoll::EventData::new_u64(0),
@@ -158,11 +199,13 @@ fn main_loop(mut signalfd: SignalFd, mut services: Services, selftest: bool) -> 
         // one is due. That deadline becomes the epoll timeout, so waiting out a
         // backoff costs no extra file descriptor and no polling: the loop simply
         // sleeps until either an event arrives or a restart falls due.
-        let deadline = services.tick();
+        // Workspaces being torn down have deadlines of their own, so the loop
+        // wakes for whichever comes first.
+        let deadline = soonest(services.tick(), desks.tick());
 
-        if selftest && services.all_settled() {
-            kinfo!("selftest: every service reached a final state");
-            shutdown::shutdown(shutdown::Action::PowerOff, &mut services);
+        if selftest && services.all_settled() && desks.is_empty() {
+            kinfo!("selftest: every service settled and every workspace closed");
+            shutdown::shutdown(shutdown::Action::PowerOff, &mut services, &mut desks);
         }
 
         let timeout = deadline.map(|at| to_timespec(at.saturating_duration_since(Instant::now())));
@@ -183,15 +226,40 @@ fn main_loop(mut signalfd: SignalFd, mut services: Services, selftest: bool) -> 
             // `epoll::Event` is packed on x86_64, so read the field out by
             // value rather than borrowing it.
             let token = event.data.u64();
+            let flags = event.flags;
+
             match token {
                 TOKEN_SIGNALS => {
                     for signal in signalfd.drain() {
-                        handle_signal(signal, &mut services);
+                        handle_signal(signal, &mut services, &mut desks);
                     }
                 }
+
+                ipc::TOKEN_LISTENER => control.accept_ready(&epoll),
+
+                _ if ipc::is_connection_token(token) => {
+                    let fd = ipc::fd_for(token);
+                    if flags.contains(epoll::EventFlags::OUT) {
+                        control.handle_writable(fd, &epoll);
+                    }
+                    if flags.intersects(
+                        epoll::EventFlags::IN | epoll::EventFlags::HUP | epoll::EventFlags::ERR,
+                    ) {
+                        control.handle_readable(fd, &mut desks, &epoll);
+                    }
+                }
+
                 other => kwarn!("event on unknown epoll token {other}"),
             }
         }
+    }
+}
+
+/// The earlier of two optional deadlines.
+fn soonest(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (only, None) | (None, only) => only,
     }
 }
 
@@ -202,7 +270,7 @@ fn to_timespec(duration: std::time::Duration) -> rustix::event::Timespec {
     }
 }
 
-fn handle_signal(signal: libc::c_int, services: &mut Services) {
+fn handle_signal(signal: libc::c_int, services: &mut Services, desks: &mut Desks) {
     match signal {
         // A child terminated. This is almost always a process the supervisor
         // never started: an orphaned grandchild re-parented to PID 1. Once the
@@ -212,10 +280,10 @@ fn handle_signal(signal: libc::c_int, services: &mut Services) {
             for (pid, exit) in reaper::reap_all() {
                 let pid = pid.as_raw_nonzero().get();
 
-                // Anything the table does not claim is an orphaned grandchild
-                // that was re-parented to PID 1. It needed reaping, but it has
-                // no restart policy attached.
-                if !services.note_exit(pid, &exit) {
+                // Anything neither table claims is an orphaned grandchild that
+                // was re-parented to PID 1. It needed reaping, but it has no
+                // policy and no owner attached.
+                if !services.note_exit(pid, &exit) && !desks.note_exit(pid, &exit) {
                     kinfo!("reaped orphan pid {pid}: {exit}");
                 }
             }
@@ -223,14 +291,14 @@ fn handle_signal(signal: libc::c_int, services: &mut Services) {
 
         // Ctrl-Alt-Del, courtesy of disable_ctrl_alt_del turning the kernel's
         // immediate reset into a signal we can act on.
-        libc::SIGINT => shutdown::shutdown(shutdown::Action::Reboot, services),
+        libc::SIGINT => shutdown::shutdown(shutdown::Action::Reboot, services, desks),
 
-        libc::SIGUSR2 => shutdown::shutdown(shutdown::Action::Reboot, services),
+        libc::SIGUSR2 => shutdown::shutdown(shutdown::Action::Reboot, services, desks),
 
         // Orderly poweroff. SIGPWR is the kernel telling us the power supply is
         // about to fail, so it gets the same treatment with more urgency.
         libc::SIGTERM | libc::SIGUSR1 | libc::SIGPWR => {
-            shutdown::shutdown(shutdown::Action::PowerOff, services)
+            shutdown::shutdown(shutdown::Action::PowerOff, services, desks)
         }
 
         libc::SIGHUP => kinfo!("ignoring {}", signals::name(signal)),

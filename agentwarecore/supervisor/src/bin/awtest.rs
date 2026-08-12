@@ -9,12 +9,15 @@
 //!   awtest exit <code> [delay_ms]   run for a while, then exit with `code`
 //!   awtest abort                    die by SIGABRT, to test signal handling
 //!   awtest run                      stay up forever
+//!
+//! With no arguments it runs forever, so it can stand in for an app launched by
+//! name with no argv of its own.
 
 use std::time::Duration;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let mode = args.get(1).map(String::as_str).unwrap_or("");
+    let mode = args.get(1).map(String::as_str).unwrap_or("run");
 
     // Goes to whatever the supervisor handed us, which proves stdio was
     // inherited correctly all the way down to /dev/console.

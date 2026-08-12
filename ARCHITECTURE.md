@@ -74,12 +74,18 @@ Suspension is a memory optimization, not a persistence mechanism. The serialized
 ```
 CreateDesk { prompt: Option<text> } -> desk_id
 OpenApp    { desk_id, app }         -> forks an app process into that workspace
-SendPrompt { desk_id, text }        -> spawns a per-turn agent for that desk
+StartAgent { desk_id }              -> forks a per-turn agent for that desk
 Interrupt  { desk_id }              -> SIGTERM the desk's current agent
 CloseDesk  { desk_id }              -> tear down the desk and everything in it
 ```
 
-`CreateDesk` carries a prompt or nothing, matching the start menu's two buttons. Apps never enter a workspace at creation time; they arrive later through `OpenApp`, requested by the agentdesk's own launcher on behalf of either the human or the agent.
+`CreateDesk` carries a prompt or nothing, matching the start menu's two buttons. That opening prompt is the only piece of user text the Supervisor ever handles, and it exists solely because a brand new workspace has no other way to learn what it was created for. It is handed to the agentdesk, not to an agent.
+
+Creating a workspace does not start a turn. The agentdesk reads its opening prompt and asks for an agent itself. `StartAgent` therefore carries no text at all: the Supervisor is told *that* a turn should run, never what it is about. The agentdesk owns the conversation and hands the agent its context over a connection PID 1 is not part of, for the same reason telemetry does not cross this socket.
+
+There is one agent process per workspace at a time. This is a structural limit rather than a queueing policy: two agents doing computer use in one workspace would fight over the same cursor and the same DOM. A human message that arrives while a turn is running is queued by the agentdesk and delivered when the turn ends. It is never refused. To act on it sooner the human interrupts, which ends the turn and lets the queued message open the next one. All of this happens inside the agentdesk and is invisible to the Supervisor.
+
+Apps never enter a workspace at creation time; they arrive later through `OpenApp`, requested by the agentdesk's own launcher on behalf of either the human or the agent.
 
 Brokering through PID 1 rather than forking locally buys four things:
 
