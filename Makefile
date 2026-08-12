@@ -8,11 +8,18 @@ BIN_DIR := $(AW_CORE_DIR)/target/$(TARGET)/release
 
 .PHONY: all build buildcore pack run selftest clean
 
+# Guest display size. virtio-vga defaults to 1280x800 and the compositor takes
+# the driver's preferred mode, so these two numbers are the whole of it.
+#
+# Override per run: make run DISPLAY_W=2560 DISPLAY_H=1440
+DISPLAY_W ?= 1920
+DISPLAY_H ?= 1200
+
 # Shared QEMU invocation. virtio-vga is what gives the guest /dev/dri/card0,
 # which haimanager will render onto via DRM/KMS.
 QEMU := qemu-system-x86_64 -enable-kvm -m 4G -cpu host \
 	-kernel $(KERNEL) -initrd $(INITRAMFS_ARCHIVE) \
-	-device virtio-vga -no-reboot
+	-device virtio-vga,xres=$(DISPLAY_W),yres=$(DISPLAY_H) -no-reboot
 
 # ---------------------------------------------------------
 # Default Target
@@ -92,7 +99,7 @@ pack: build
 # and a stand-in agentdesk, and drops out the moment either is written.
 run: pack
 	@echo "==> Booting Agentware in QEMU..."
-	$(QEMU) -display gtk -serial stdio \
+	$(QEMU) -display gtk,zoom-to-fit=on -serial stdio \
 		-append "console=tty0 console=ttyS0,115200 agentware.demo"
 
 # Headless boot that exercises the supervisor end to end and powers itself off.

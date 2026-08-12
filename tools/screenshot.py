@@ -23,12 +23,15 @@ KERNEL = os.path.join(ROOT, "kernel-build/arch/x86/boot/bzImage")
 INITRAMFS = os.path.join(ROOT, "initramfs.cpio.gz")
 
 
-def qemu(monitor_path, serial_path, append):
+def qemu(monitor_path, serial_path, append, width, height):
     return subprocess.Popen(
         [
             "qemu-system-x86_64", "-enable-kvm", "-m", "4G", "-cpu", "host",
             "-kernel", KERNEL, "-initrd", INITRAMFS,
-            "-device", "virtio-vga", "-no-reboot",
+            # virtio-vga's preferred mode is the one the compositor picks, so
+            # these two numbers decide the whole guest display.
+            "-device", "virtio-vga,xres=%d,yres=%d" % (width, height),
+            "-no-reboot",
             "-display", "none",
             "-serial", "file:" + serial_path,
             "-monitor", "unix:%s,server,nowait" % monitor_path,
@@ -130,6 +133,10 @@ def main():
                         help="kernel command line")
     parser.add_argument("--serial", default=None,
                         help="where to write the serial log")
+    parser.add_argument("--width", type=int, default=1920,
+                        help="guest display width")
+    parser.add_argument("--height", type=int, default=1200,
+                        help="guest display height")
     parser.add_argument("--do", action="append", default=[], metavar="CMD",
                         help="a QEMU monitor command to run before capturing, "
                              "repeatable. e.g. --do 'sendkey a' "
@@ -144,7 +151,7 @@ def main():
     ppm_path = os.path.join(workdir, "screen.ppm")
     serial_path = args.serial or os.path.join(workdir, "serial.log")
 
-    guest = qemu(monitor_path, serial_path, args.append)
+    guest = qemu(monitor_path, serial_path, args.append, args.width, args.height)
     try:
         time.sleep(args.seconds)
         if guest.poll() is not None:

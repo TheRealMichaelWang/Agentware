@@ -90,10 +90,12 @@ fn main() {
         // offered.
         ("awapp", "type-text", "discard", "hello", "unsupported-action"),
         // Scrolled off the end of the draft list, so no human could have clicked
-        // it either.
-        ("awapp", "click", "draft-10", "", "not-visible"),
-        ("awapp", "scroll-into-view", "draft-10", "", "done"),
-        ("awapp", "click", "draft-10", "", "done"),
+        // it either. This is the one step in the script whose outcome depends on
+        // the size of the display: it is a rejection only while the list is
+        // longer than the window it is in.
+        ("awapp", "click", "draft-24", "", "not-visible"),
+        ("awapp", "scroll-into-view", "draft-24", "", "done"),
+        ("awapp", "click", "draft-24", "", "done"),
     ];
 
     let mut surprises = 0;

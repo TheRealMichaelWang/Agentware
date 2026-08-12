@@ -149,6 +149,25 @@ impl App {
                 Draft { id: "draft-8", label: "Invoice 0041", archived: true },
                 Draft { id: "draft-9", label: "Sunday", archived: false },
                 Draft { id: "draft-10", label: "Re: the thing", archived: false },
+                Draft { id: "draft-11", label: "Fwd: warranty", archived: false },
+                Draft { id: "draft-12", label: "Re: Thursday", archived: false },
+                Draft { id: "draft-13", label: "Bike parts", archived: false },
+                Draft { id: "draft-14", label: "Re: the quote", archived: true },
+                Draft { id: "draft-15", label: "Dentist", archived: false },
+                Draft { id: "draft-16", label: "Re: photos", archived: false },
+                Draft { id: "draft-17", label: "Insurance renewal", archived: false },
+                Draft { id: "draft-18", label: "Re: standup notes", archived: false },
+                Draft { id: "draft-19", label: "Recipe", archived: false },
+                Draft { id: "draft-20", label: "Re: the other thing", archived: false },
+                Draft { id: "draft-21", label: "Tickets", archived: false },
+                Draft { id: "draft-22", label: "Re: moving out", archived: true },
+                Draft { id: "draft-23", label: "Book club", archived: false },
+                // The last one is what an agent is sent to fetch, and the
+                // rejection it gets on the way only means anything if the list
+                // is longer than any window it can be shown in. Twenty-four
+                // overflows at 2560x1440, which is the largest display this has
+                // been run at.
+                Draft { id: "draft-24", label: "Re: the thing, again", archived: false },
             ],
             selected: Some(1),
             message: String::new(),
