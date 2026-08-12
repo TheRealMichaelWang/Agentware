@@ -57,12 +57,14 @@ const TOKEN_SIGNALS: u64 = 1;
 /// listening yet. Neither binary exists today, and the service table logs and
 /// skips what is not installed rather than crash looping against it.
 ///
-/// Ordering here is a stand-in for a real readiness protocol, which arrives with
-/// fd passing in milestone 4.
+/// `desktop-main` waits for `ui-manager` to register on the control socket
+/// rather than merely being forked. Registering proves the compositor is
+/// serving, which is what the desktop actually needs before it tries to draw.
 fn system_services() -> Vec<Service> {
     vec![
         Service::new("ui-manager", "/bin/ui-manager", &[], RestartPolicy::Always),
-        Service::new("desktop-main", "/bin/desktop-main", &[], RestartPolicy::Always),
+        Service::new("desktop-main", "/bin/desktop-main", &[], RestartPolicy::Always)
+            .requires("ui-manager"),
     ]
 }
 
@@ -201,7 +203,7 @@ fn main_loop(
         // sleeps until either an event arrives or a restart falls due.
         // Workspaces being torn down have deadlines of their own, so the loop
         // wakes for whichever comes first.
-        let deadline = soonest(services.tick(), desks.tick());
+        let deadline = soonest(services.tick(|role| control.is_ready(role)), desks.tick());
 
         if selftest && services.all_settled() && desks.is_empty() {
             kinfo!("selftest: every service settled and every workspace closed");

@@ -55,9 +55,17 @@ pub enum RestartPolicy {
     Never,
 }
 
+/// How long a service waits for its dependency to come up before giving up.
+///
+/// Without a ceiling, a compositor that never registers leaves `desktop-main`
+/// pending forever, which looks identical to a hang and tells nobody anything.
+const READY_TIMEOUT: Duration = Duration::from_secs(10);
+
 enum State {
     /// Defined but not started yet.
     Pending,
+    /// Started but waiting on another service to report itself ready.
+    Waiting { since: Instant },
     /// The executable does not exist on this system.
     Absent,
     Running { pid: i32, since: Instant },
@@ -74,6 +82,8 @@ pub struct Service {
     program: &'static str,
     args: &'static [&'static str],
     policy: RestartPolicy,
+    /// Another service that must be ready before this one starts.
+    requires: Option<&'static str>,
     state: State,
     /// Consecutive failures since the service was last healthy. Drives backoff.
     attempt: u32,
@@ -93,10 +103,23 @@ impl Service {
             program,
             args,
             policy,
+            requires: None,
             state: State::Pending,
             attempt: 0,
             restarts: 0,
         }
+    }
+
+    /// Hold this service back until the named one reports itself ready.
+    ///
+    /// Readiness is not "the process was forked", it is "the process said it is
+    /// serving". Starting `desktop-main` the instant `ui-manager` is forked
+    /// means it tries to connect to a compositor that is not listening yet and
+    /// fails, which shows up as an unexplained flicker at boot rather than as
+    /// the ordering bug it is.
+    pub const fn requires(mut self, service: &'static str) -> Self {
+        self.requires = Some(service);
+        self
     }
 
     /// True once the service has reached a state it will not leave on its own.
@@ -233,12 +256,31 @@ impl Services {
     /// `desktop-main` exist: it says so and carries on instead of crash looping
     /// against a binary that was never built.
     pub fn start_all(&mut self) {
+        // Services skipped because their binary is missing. Anything depending
+        // on one of them is skipped too rather than left waiting out the full
+        // timeout for something that is provably never coming.
+        let mut absent: Vec<&'static str> = Vec::new();
+
         for service in &mut self.entries {
             if !Path::new(service.program).exists() {
                 kwarn!("{}: {} not installed, skipping", service.name, service.program);
                 service.state = State::Absent;
+                absent.push(service.name);
                 continue;
             }
+
+            if let Some(required) = service.requires {
+                if absent.contains(&required) {
+                    kwarn!("{}: {required} is not installed, skipping", service.name);
+                    service.state = State::Absent;
+                    absent.push(service.name);
+                } else {
+                    kinfo!("{}: waiting for {required} to report ready", service.name);
+                    service.state = State::Waiting { since: Instant::now() };
+                }
+                continue;
+            }
+
             service.start();
         }
     }
@@ -248,19 +290,40 @@ impl Services {
     /// Returns the earliest deadline still outstanding, which the main loop uses
     /// as its `epoll` timeout. Returning `None` means nothing is waiting on a
     /// clock and the loop can block indefinitely.
-    pub fn tick(&mut self) -> Option<Instant> {
+    pub fn tick(&mut self, is_ready: impl Fn(&str) -> bool) -> Option<Instant> {
         let now = Instant::now();
         let mut next: Option<Instant> = None;
 
         for service in &mut self.entries {
-            let State::Backoff { until } = service.state else {
-                continue;
-            };
+            match service.state {
+                State::Backoff { until } => {
+                    if now >= until {
+                        service.start();
+                    } else {
+                        next = Some(next.map_or(until, |soonest: Instant| soonest.min(until)));
+                    }
+                }
 
-            if now >= until {
-                service.start();
-            } else {
-                next = Some(next.map_or(until, |soonest: Instant| soonest.min(until)));
+                State::Waiting { since } => {
+                    let required = service.requires.unwrap_or("");
+
+                    if is_ready(required) {
+                        kinfo!("{}: {required} is ready", service.name);
+                        service.start();
+                    } else if since.elapsed() >= READY_TIMEOUT {
+                        kerr!(
+                            "{}: {required} did not report ready within {}s, giving up",
+                            service.name,
+                            READY_TIMEOUT.as_secs()
+                        );
+                        service.state = State::Failed;
+                    } else {
+                        let deadline = since + READY_TIMEOUT;
+                        next = Some(next.map_or(deadline, |soonest: Instant| soonest.min(deadline)));
+                    }
+                }
+
+                _ => {}
             }
         }
 

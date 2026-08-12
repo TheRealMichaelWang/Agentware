@@ -17,17 +17,21 @@
 //! resurrecting an agent would silently re-run side effects the human did not
 //! ask for a second time.
 
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use rustix::net;
 use rustix::process::{Pid, Signal, kill_process};
 
 use crate::cgroup::{self, Cgroup};
 use crate::klog::{kerr, kinfo, kwarn};
 use crate::reaper::Exit;
 use crate::signals;
+
+/// Environment variable naming the descriptor a process was handed at spawn.
+pub const HANDOFF_ENV: &str = "AGENTWARE_UI_FD";
 
 /// How long a closing workspace gets between `SIGTERM` and `cgroup.kill`.
 const CLOSE_GRACE: Duration = Duration::from_secs(3);
@@ -129,11 +133,27 @@ impl Desks {
     /// opening prompt and asks for an agent itself, via `start-agent`. That
     /// keeps the decision about when to run a turn with the process that owns
     /// the conversation.
-    pub fn create(&mut self, prompt: Option<&str>) -> Result<u32, String> {
+    ///
+    /// Returns the workspace id and the compositor's end of a socket already
+    /// connected to the new agentdesk, which the caller hands to `ui-manager`.
+    pub fn create(&mut self, prompt: Option<&str>) -> Result<(u32, OwnedFd), String> {
         let id = self.next_id;
 
         let cgroup = Cgroup::create(&format!("desk-{id}"))
             .map_err(|err| format!("could not create cgroup for desk {id}: {err}"))?;
+
+        // The two halves of the agentdesk's connection to the compositor,
+        // created before either side knows the other exists. Neither process
+        // ever opens a path, so there is no socket to race against, no
+        // filesystem permission to get wrong, and nothing for a sandboxed
+        // workspace to reach that it was not explicitly handed.
+        let (desk_end, ui_end) = net::socketpair(
+            net::AddressFamily::UNIX,
+            net::SocketType::STREAM,
+            net::SocketFlags::CLOEXEC,
+            None,
+        )
+        .map_err(|err| format!("could not create the compositor socketpair: {err}"))?;
 
         let (program, base_args) = &self.programs.desk;
         let mut args = base_args.clone();
@@ -142,7 +162,7 @@ impl Desks {
             args.push(text.to_owned());
         }
 
-        let pid = spawn_in(&cgroup, program, &args)
+        let pid = spawn_in(&cgroup, program, &args, Some(desk_end))
             .map_err(|err| format!("could not start agentdesk: {err}"))?;
 
         self.next_id += 1;
@@ -156,7 +176,7 @@ impl Desks {
         });
         kinfo!("desk {id}: created as pid {pid}");
 
-        Ok(id)
+        Ok((id, ui_end))
     }
 
     /// Fork an app into an existing workspace.
@@ -173,7 +193,7 @@ impl Desks {
         let desk = self.open_desk_mut(id)?;
 
         let program = format!("{app_dir}/{app}");
-        let pid = spawn_in(&desk.cgroup, &program, &[])
+        let pid = spawn_in(&desk.cgroup, &program, &[], None)
             .map_err(|err| format!("could not start {program}: {err}"))?;
 
         desk.apps.push(App { name: app.to_owned(), pid });
@@ -207,7 +227,7 @@ impl Desks {
         let mut args = base_args;
         args.push(id.to_string());
 
-        let pid = spawn_in(&desk.cgroup, &program, &args)
+        let pid = spawn_in(&desk.cgroup, &program, &args, None)
             .map_err(|err| format!("could not start agent: {err}"))?;
 
         desk.agent_pid = Some(pid);
@@ -372,29 +392,62 @@ impl Desks {
     }
 }
 
-/// Fork a process directly into a workspace's cgroup.
+/// Fork a process directly into a workspace's cgroup, optionally handing it an
+/// already open file descriptor.
 ///
 /// The `cgroup.procs` handle is opened before the fork and the child enrols
 /// itself before `exec`, so there is no window in which the process exists
 /// outside the boundary meant to contain it.
-fn spawn_in(cgroup: &Cgroup, program: &str, args: &[String]) -> std::io::Result<i32> {
+///
+/// The handoff descriptor is passed by *number* rather than being duplicated
+/// onto a fixed slot such as fd 3. A fixed slot risks clobbering whatever the
+/// spawn machinery is already using there, and the number is identical either
+/// side of `fork` anyway, so telling the child which one to look at is both
+/// simpler and safer. All the child needs is for `CLOEXEC` to be cleared so the
+/// descriptor survives `exec`.
+fn spawn_in(
+    cgroup: &Cgroup,
+    program: &str,
+    args: &[String],
+    handoff: Option<OwnedFd>,
+) -> std::io::Result<i32> {
     let procs: OwnedFd = cgroup.open_procs()?;
 
     let mut command = Command::new(program);
     command.args(args);
 
+    let handoff_raw = handoff.as_ref().map(AsRawFd::as_raw_fd);
+    if let Some(raw) = handoff_raw {
+        command.env(HANDOFF_ENV, raw.to_string());
+    }
+
     // SAFETY: the closure runs in the forked child before exec and calls only
-    // sigprocmask, signal, setsid, getpid and write, all async-signal-safe.
+    // sigprocmask, signal, setsid, getpid, write and fcntl, all
+    // async-signal-safe.
     unsafe {
         command.pre_exec(move || {
             signals::reset_for_child()?;
             rustix::process::setsid().map_err(std::io::Error::from)?;
             cgroup::join_from_child(&procs)?;
+
+            if let Some(raw) = handoff_raw {
+                // Clearing close-on-exec so the descriptor survives the exec.
+                if libc::fcntl(raw, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+
             Ok(())
         });
     }
 
     let child = command.spawn()?;
+
+    // The parent's copy goes now that the child has one. Holding it would keep
+    // the socket alive after the workspace died, so the compositor would never
+    // see the hangup that tells it the workspace is gone.
+    drop(handoff);
+
     Ok(child.id() as i32)
 }
 

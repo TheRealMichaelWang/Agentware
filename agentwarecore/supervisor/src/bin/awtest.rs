@@ -33,6 +33,19 @@ fn main() {
             std::process::exit(code);
         }
 
+        // Stand in for an agentdesk: greet the compositor over the descriptor
+        // the supervisor handed us at spawn, then stay up like a workspace does.
+        "desk" => {
+            let id = args.get(2).cloned().unwrap_or_else(|| "?".to_owned());
+            match greet_compositor(&id) {
+                Ok(()) => eprintln!("awtest: desk {id} greeted the compositor"),
+                Err(err) => eprintln!("awtest: desk {id} could not reach the compositor: {err}"),
+            }
+            loop {
+                std::thread::sleep(Duration::from_secs(3600));
+            }
+        }
+
         "abort" => std::process::abort(),
 
         "run" => {
@@ -50,4 +63,31 @@ fn main() {
 
 fn parse_arg(args: &[String], index: usize, default: i32) -> i32 {
     args.get(index).and_then(|value| value.parse().ok()).unwrap_or(default)
+}
+
+/// Write to the descriptor the supervisor handed us at spawn.
+///
+/// The workspace never opens a socket by path and never learns where the
+/// compositor lives. It is simply born already connected to it.
+fn greet_compositor(id: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::net::UnixStream;
+
+    let raw: i32 = std::env::var("AGENTWARE_UI_FD")
+        .map_err(|_| "AGENTWARE_UI_FD is not set".to_owned())?
+        .parse()
+        .map_err(|_| "AGENTWARE_UI_FD is not a number".to_owned())?;
+
+    // SAFETY: the supervisor guarantees this descriptor is open, is ours, and
+    // is a connected stream socket.
+    let mut stream = unsafe { UnixStream::from_raw_fd(raw) };
+
+    write!(stream, "hello from desk {id}").map_err(|err| format!("write: {err}"))?;
+    stream.flush().map_err(|err| format!("flush: {err}"))?;
+
+    // Leaked deliberately: closing it would hang up on the compositor, and a
+    // real workspace keeps this connection for its whole life.
+    std::mem::forget(stream);
+    Ok(())
 }

@@ -12,11 +12,13 @@
 //! never wedge.
 
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
+use std::io::{self, IoSlice, Read, Write};
+use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 
 use rustix::event::epoll;
+use rustix::net::{self, SendAncillaryBuffer, SendAncillaryMessage};
 
 use crate::desk::Desks;
 use crate::klog::{kerr, kinfo, kwarn};
@@ -50,11 +52,18 @@ struct Conn {
     /// since replies are tiny, but a blocking write in PID 1 is not an option so
     /// the slow path has to exist.
     pending: Vec<u8>,
+    /// The role this connection claimed, if it registered as one.
+    role: Option<String>,
 }
 
 pub struct Control {
     listener: UnixListener,
     conns: HashMap<RawFd, Conn>,
+    /// Role name to the connection serving it. A service is "ready" exactly
+    /// when it appears here: registering proves it is connected and listening,
+    /// which is what dependents actually need to know. A separate readiness
+    /// pipe would prove only that a process had been forked.
+    roles: HashMap<String, RawFd>,
 }
 
 impl Control {
@@ -68,7 +77,12 @@ impl Control {
         listener.set_nonblocking(true)?;
 
         kinfo!("control socket listening on {SOCKET_PATH}");
-        Ok(Self { listener, conns: HashMap::new() })
+        Ok(Self { listener, conns: HashMap::new(), roles: HashMap::new() })
+    }
+
+    /// True if something has registered as this role and is still connected.
+    pub fn is_ready(&self, role: &str) -> bool {
+        self.roles.contains_key(role)
     }
 
     pub fn listener_fd(&self) -> BorrowedFd<'_> {
@@ -80,7 +94,7 @@ impl Control {
         loop {
             match self.listener.accept() {
                 Ok((stream, _)) => {
-                    if let Err(err) = self.register(stream, epoll) {
+                    if let Err(err) = self.attach(stream, epoll) {
                         kwarn!("could not register control connection: {err}");
                     }
                 }
@@ -94,7 +108,7 @@ impl Control {
         }
     }
 
-    fn register(&mut self, stream: UnixStream, epoll: &impl AsFd) -> io::Result<()> {
+    fn attach(&mut self, stream: UnixStream, epoll: &impl AsFd) -> io::Result<()> {
         stream.set_nonblocking(true)?;
         let fd = stream.as_raw_fd();
 
@@ -105,7 +119,61 @@ impl Control {
             epoll::EventFlags::IN,
         )?;
 
-        self.conns.insert(fd, Conn { stream, decoder: Decoder::default(), pending: Vec::new() });
+        self.conns.insert(
+            fd,
+            Conn { stream, decoder: Decoder::default(), pending: Vec::new(), role: None },
+        );
+        Ok(())
+    }
+
+    /// Claim a role for a connection.
+    ///
+    /// One connection per role. A second claimant is refused rather than
+    /// silently replacing the first, because a compositor quietly losing every
+    /// future workspace handoff to an impostor is not a failure anyone would
+    /// diagnose quickly.
+    fn register(&mut self, fd: RawFd, role: &str) -> Result<(), String> {
+        if let Some(existing) = self.roles.get(role) {
+            return Err(format!("role {role:?} is already held by connection {existing}"));
+        }
+
+        let Some(conn) = self.conns.get_mut(&fd) else {
+            return Err("connection has gone away".to_owned());
+        };
+
+        if let Some(held) = &conn.role {
+            return Err(format!("connection already registered as {held:?}"));
+        }
+
+        conn.role = Some(role.to_owned());
+        self.roles.insert(role.to_owned(), fd);
+        kinfo!("{role} registered and ready");
+        Ok(())
+    }
+
+    /// Hand an open file descriptor to a registered role.
+    ///
+    /// The descriptor is sent as ancillary data alongside a normal frame, so the
+    /// receiver learns what it has been given in the same message that gives it.
+    /// This is done as a single direct `sendmsg` rather than being queued: a
+    /// descriptor belongs to one specific message, and appending it to a pending
+    /// byte buffer would detach it from the frame that explains it.
+    pub fn hand_over(&mut self, role: &str, fields: &[&str], fd: BorrowedFd<'_>) -> Result<(), String> {
+        let target = *self.roles.get(role).ok_or_else(|| format!("no {role} is registered"))?;
+        let conn = self.conns.get(&target).ok_or_else(|| format!("{role} has gone away"))?;
+
+        let frame = proto::encode(fields);
+
+        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+        let mut control = SendAncillaryBuffer::new(&mut space);
+        let fds = [fd];
+        if !control.push(SendAncillaryMessage::ScmRights(&fds)) {
+            return Err("could not build the ancillary message".to_owned());
+        }
+
+        net::sendmsg(&conn.stream, &[IoSlice::new(&frame)], &mut control, net::SendFlags::empty())
+            .map_err(|err| format!("could not send descriptor to {role}: {err}"))?;
+
         Ok(())
     }
 
@@ -138,7 +206,7 @@ impl Control {
 
                 match conn.decoder.next_frame() {
                     Ok(Some(fields)) => {
-                        let reply = dispatch(&fields, desks);
+                        let reply = self.dispatch(fd, &fields, desks);
                         let borrowed: Vec<&str> = reply.iter().map(String::as_str).collect();
                         self.send(fd, &proto::encode(&borrowed), epoll);
                     }
@@ -199,15 +267,23 @@ impl Control {
     fn drop_conn(&mut self, fd: RawFd, epoll: &impl AsFd) {
         if let Some(conn) = self.conns.remove(&fd) {
             let _ = epoll::delete(epoll, &conn.stream);
+
+            // A role is only held for as long as its holder is connected.
+            // Leaving a dead compositor registered would make dependents believe
+            // a service is ready when nothing is behind it.
+            if let Some(role) = conn.role {
+                self.roles.remove(&role);
+                kwarn!("{role} disconnected and is no longer ready");
+            }
         }
     }
-}
+
 
 /// Turn one request into one reply.
 ///
 /// Every failure is an error frame rather than a panic or an exit. A malformed
 /// request from a confused client must never be able to take PID 1 down.
-fn dispatch(fields: &[String], desks: &mut Desks) -> Vec<String> {
+    fn dispatch(&mut self, from: RawFd, fields: &[String], desks: &mut Desks) -> Vec<String> {
     let verb = fields.first().map(String::as_str).unwrap_or("");
     let arg = |index: usize| fields.get(index).map(String::as_str);
 
@@ -219,9 +295,24 @@ fn dispatch(fields: &[String], desks: &mut Desks) -> Vec<String> {
     };
 
     let result: Result<Vec<String>, String> = match verb {
+        "register" => arg(1)
+            .ok_or_else(|| "missing role".to_owned())
+            .and_then(|role| self.register(from, role))
+            .map(|()| vec![]),
+
         "create-desk" => {
             let prompt = arg(1).filter(|text| !text.is_empty());
-            desks.create(prompt).map(|id| vec![id.to_string()])
+            desks.create(prompt).map(|(id, ui_end)| {
+                // Connect the new workspace to the compositor. Failing this is
+                // not fatal today, because there is no ui-manager yet and a
+                // workspace with no display is still better than no workspace.
+                if let Err(err) =
+                    self.hand_over("ui-manager", &["desk-attached", &id.to_string()], ui_end.as_fd())
+                {
+                    kwarn!("desk {id}: not attached to a compositor: {err}");
+                }
+                vec![id.to_string()]
+            })
         }
 
         "open-app" => {
@@ -255,4 +346,5 @@ fn dispatch(fields: &[String], desks: &mut Desks) -> Vec<String> {
             vec!["err".to_owned(), message]
         }
     }
+}
 }

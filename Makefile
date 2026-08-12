@@ -63,10 +63,12 @@ pack: build
 	#   awtest      a service that exits, crashes, or runs on demand
 	#   awstubborn  an app that ignores SIGTERM, to force the cgroup.kill path
 	#   awctl       the control socket client
+	#   awui        a stand-in compositor that receives passed descriptors
 	mkdir -p $(FS_DIR)/bin
 	cp $(AW_CORE_DIR)/supervisor/target/$(TARGET)/release/awtest $(FS_DIR)/bin/awtest
 	cp $(AW_CORE_DIR)/supervisor/target/$(TARGET)/release/awstubborn $(FS_DIR)/bin/awstubborn
 	cp $(AW_CORE_DIR)/supervisor/target/$(TARGET)/release/awctl $(FS_DIR)/bin/awctl
+	cp $(AW_CORE_DIR)/supervisor/target/$(TARGET)/release/awui $(FS_DIR)/bin/awui
 	
 	# 4. Pack the filesystem.
 	#

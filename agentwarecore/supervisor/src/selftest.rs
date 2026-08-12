@@ -14,6 +14,7 @@ use crate::service::{RestartPolicy, Service};
 
 const AWTEST: &str = "/bin/awtest";
 const AWCTL: &str = "/bin/awctl";
+const AWUI: &str = "/bin/awui";
 
 /// True if the kernel command line asked for the self-test.
 pub fn requested() -> bool {
@@ -28,7 +29,7 @@ pub fn requested() -> bool {
 /// like from the supervisor's side.
 pub fn programs() -> Programs {
     Programs {
-        desk: (AWTEST.into(), vec!["run".into()]),
+        desk: (AWTEST.into(), vec!["desk".into()]),
         agent: (AWTEST.into(), vec!["exit".into(), "0".into(), "200".into()]),
         app_dir: "/bin".into(),
     }
@@ -51,7 +52,17 @@ pub fn services() -> Vec<Service> {
         Service::new("crasher", AWTEST, &["abort"], RestartPolicy::Limited { max: 1 }),
         // Runs briefly and exits cleanly. Should be left alone, not restarted.
         Service::new("oneshot", AWTEST, &["exit", "0", "100"], RestartPolicy::Never),
-        // Drives a full workspace lifecycle over the control socket.
-        Service::new("control", AWCTL, &["selftest"], RestartPolicy::Never),
+        // Stands in for the compositor. It registers on the control socket,
+        // which is what marks it ready, then receives a descriptor per
+        // workspace. Two workspaces are created below, so it expects two.
+        //
+        // The real ui-manager restarts forever; this one exits when it has seen
+        // what it came for, so the self-test can finish.
+        Service::new("ui-manager", AWUI, &["2"], RestartPolicy::Never),
+        // Drives a full workspace lifecycle over the control socket. Held back
+        // until the compositor has registered, so the workspaces it creates have
+        // somewhere to be handed to.
+        Service::new("control", AWCTL, &["selftest"], RestartPolicy::Never)
+            .requires("ui-manager"),
     ]
 }
