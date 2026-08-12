@@ -4,15 +4,17 @@
 //! Agentware that touches any of them. Everything else describes what it wants
 //! shown as AWML and receives events back.
 //!
-//! Milestone 3: the display is up, there is a rasterizer, and input is read
-//! from evdev and drawn. What is shown is still generated here rather than by
-//! any client.
+//! Milestone 4: a markup document is parsed, laid out, painted and hit tested.
+//! The document is still held locally rather than arriving from a client, which
+//! is what the next milestone changes.
 
+mod awml;
 mod cursor;
 mod drm;
 mod input;
 mod paint;
 mod specimen;
+mod ui;
 
 use std::io::Write;
 use std::os::unix::net::UnixStream;
@@ -21,7 +23,7 @@ use awproto::{ROLE_HAIMANAGER, SOCKET_PATH, encode, read_frame};
 use rustix::event::epoll;
 
 use input::Input;
-use paint::Canvas;
+use paint::{Canvas, Rect};
 
 /// epoll tokens. Input devices take one each, offset by their index.
 const TOKEN_INPUT_BASE: u64 = 0x100;
@@ -51,13 +53,32 @@ fn main() {
     let mut input = Input::new(width as i32, height as i32);
 
     let mut canvas = Canvas::new(width, height);
-    let mut state = specimen::State::default();
+
+    // The status readout sits along the bottom, so the document gets the rest.
+    let area = Rect::new(0, 0, width as i32, height as i32 - 96);
+    let mut client = match specimen::Client::new(area) {
+        Ok(client) => client,
+        Err(err) => {
+            log(&format!("FATAL: could not parse the document: {err}"));
+            std::process::exit(1);
+        }
+    };
+    log(&format!("parsed {} nodes", client.node_count()));
+
+    // Printed once so the reduced schema can be read against the document that
+    // produced it. Both come from the same tree, which is the claim being made.
+    for line in client.agent_view().lines() {
+        log(&format!("agent view | {line}"));
+    }
+    if let Some(rect) = client.locate("send") {
+        log(&format!("locate send -> {},{} {}x{}", rect.x, rect.y, rect.w, rect.h));
+    }
 
     // Paint once before waiting, so a machine with no input at all still shows
     // something rather than a blank screen.
-    redraw(&mut display, &mut canvas, &input, &state);
+    redraw(&mut display, &mut canvas, &input, &client);
 
-    run(&mut display, &mut canvas, &mut input, &mut state);
+    run(&mut display, &mut canvas, &mut input, &mut client);
 }
 
 /// Wait for input and repaint when something changes.
@@ -69,7 +90,7 @@ fn run(
     display: &mut drm::Display,
     canvas: &mut Canvas,
     input: &mut Input,
-    state: &mut specimen::State,
+    client: &mut specimen::Client,
 ) -> ! {
     let epoll = match epoll::create(epoll::CreateFlags::CLOEXEC) {
         Ok(epoll) => epoll,
@@ -120,13 +141,13 @@ fn run(
 
             let index = (token - TOKEN_INPUT_BASE) as usize;
             for event in input.read_device(index) {
-                state.record(event);
+                client.handle(event);
                 dirty = true;
             }
         }
 
         if dirty {
-            redraw(display, canvas, input, state);
+            redraw(display, canvas, input, client);
         }
     }
 }
@@ -135,9 +156,9 @@ fn redraw(
     display: &mut drm::Display,
     canvas: &mut Canvas,
     input: &Input,
-    state: &specimen::State,
+    client: &specimen::Client,
 ) {
-    specimen::draw(canvas, state);
+    client.draw(canvas);
 
     let (x, y) = input.pointer();
     cursor::draw(canvas, x, y, cursor::Kind::Human);
