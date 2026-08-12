@@ -242,6 +242,25 @@ impl Desks {
         Ok((pid, ui_end, desk_end))
     }
 
+    /// Close one application, leaving the rest of the workspace alone.
+    ///
+    /// A window's close button is the human ending one app, not the workspace,
+    /// so this is a separate escalation from [`Desks::close`] and shares only
+    /// the signal. The process is named by pid because that is what the
+    /// compositor was told at handoff, and the pid is checked against this
+    /// workspace's own apps rather than trusted, so one workspace cannot ask PID
+    /// 1 to signal another's process.
+    pub fn close_app(&mut self, id: u32, pid: i32) -> Result<(), String> {
+        let desk = self.open_desk_mut(id)?;
+        if !desk.apps.iter().any(|app| app.pid == pid) {
+            return Err(format!("pid {pid} is not an app in desk {id}"));
+        }
+
+        signal(pid, Signal::TERM);
+        kinfo!("desk {id}: closing app pid {pid}");
+        Ok(())
+    }
+
     /// Stop the running turn.
     ///
     /// This is the whole implementation of the "interrupt at any exact moment"

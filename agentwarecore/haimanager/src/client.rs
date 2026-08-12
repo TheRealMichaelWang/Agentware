@@ -39,6 +39,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
+use std::time::{Duration, Instant};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::os::unix::net::UnixStream;
 
@@ -61,6 +62,12 @@ use crate::ui::{self, Focus, Frame, Layout};
 /// and holding its backlog forever would let one wedged application consume
 /// memory in the one process that owns the screen.
 const MAX_BACKLOG: usize = 256 * 1024;
+
+/// How long a control stays visibly pressed.
+///
+/// Long enough to be seen in a screenshot and by a human watching an agent
+/// work, short enough not to feel like lag when the human is the one clicking.
+const PRESS: Duration = Duration::from_millis(240);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -97,6 +104,11 @@ pub struct Client {
     /// The workspace this connection belongs to, as the supervisor stated it.
     pub desk: u32,
     pub name: String,
+    /// The process behind this connection, as the supervisor stated it.
+    ///
+    /// Needed to close one window without closing the workspace: lifetime
+    /// belongs to PID 1, so the compositor names the process and asks.
+    pub pid: i32,
     /// The last thing that happened, for the status strip.
     pub note: String,
 
@@ -121,6 +133,13 @@ pub struct Client {
     focus: Option<String>,
     editing: HashMap<String, Editing>,
     scroll: HashMap<String, i32>,
+    /// The control currently showing a press, and when it started.
+    ///
+    /// Ephemeral in the strictest sense: it lasts a sixth of a second and never
+    /// appears in any tree. It exists because an action with no visible moment
+    /// is indistinguishable from one that never happened, which matters most
+    /// when the thing acting is not the human.
+    press: Option<(String, Instant)>,
 }
 
 /// What happened when a client was read from.
@@ -135,12 +154,19 @@ pub struct Progress {
 }
 
 impl Client {
-    pub fn adopt(kind: Kind, desk: u32, name: String, stream: UnixStream) -> io::Result<Self> {
+    pub fn adopt(
+        kind: Kind,
+        desk: u32,
+        name: String,
+        pid: i32,
+        stream: UnixStream,
+    ) -> io::Result<Self> {
         stream.set_nonblocking(true)?;
         Ok(Client {
             kind,
             desk,
             name,
+            pid,
             note: "connected, nothing rendered yet".into(),
             stream,
             decoder: Decoder::with_limit(MAX_TREE),
@@ -152,6 +178,7 @@ impl Client {
             focus: None,
             editing: HashMap::new(),
             scroll: HashMap::new(),
+            press: None,
         })
     }
 
@@ -372,7 +399,20 @@ impl Client {
         let Some(key) = &self.focus else { return Focus::default() };
         let node = doc.index_of(key);
         let caret = self.editing.get(key).map_or(0, |state| state.caret);
-        Focus { node, caret }
+        let pressed = self
+            .press
+            .as_ref()
+            .filter(|(_, since)| since.elapsed() < PRESS)
+            .and_then(|(key, _)| doc.index_of(key));
+        Focus { node, caret, pressed }
+    }
+
+    /// True while something on this client is mid-animation, so the loop should
+    /// keep producing frames.
+    pub fn animating(&self) -> bool {
+        self.press
+            .as_ref()
+            .is_some_and(|(_, since)| since.elapsed() < PRESS)
     }
 
     pub fn draw(&self, canvas: &mut Canvas, fonts: &Fonts) {
@@ -512,6 +552,13 @@ impl Client {
         // Focus is the compositor's. An application is never told about it,
         // which is why it is not in the event vocabulary at all.
         self.focus = Some(key.clone());
+
+        // Anything that activates a control shows a press. Typing does not: the
+        // characters appearing is the feedback, and a field that flashed on
+        // every keystroke would be unreadable.
+        if !matches!(action, "focus" | "type-text" | "clear") {
+            self.press = Some((key.clone(), Instant::now()));
+        }
 
         match action {
             "focus" => {}

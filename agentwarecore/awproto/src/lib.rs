@@ -13,6 +13,7 @@
 //!   register     <role>
 //!   create-desk  [prompt]
 //!   open-app     <desk> <app>
+//!   close-app    <desk> <pid>
 //!   start-agent  <desk>
 //!   interrupt    <desk>
 //!   close-desk   <desk>

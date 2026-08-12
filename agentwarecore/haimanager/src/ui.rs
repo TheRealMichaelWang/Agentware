@@ -42,36 +42,50 @@ use crate::paint::{Canvas, Color, Rect, rgb};
 // The palette an application names colours out of. An app may also give a hex
 // value; these exist so the common cases stay consistent between applications
 // and follow the system theme if it ever changes.
-pub const BACKGROUND: Color = rgb(0x10, 0x12, 0x18);
-pub const SURFACE: Color = rgb(0x1c, 0x20, 0x2a);
-pub const RAISED: Color = rgb(0x26, 0x2c, 0x3a);
-pub const BORDER: Color = rgb(0x3a, 0x42, 0x54);
-pub const TEXT: Color = rgb(0xe6, 0xe9, 0xef);
-pub const MUTED: Color = rgb(0x8a, 0x93, 0xa6);
+pub const BACKGROUND: Color = rgb(0x0e, 0x10, 0x16);
+pub const SURFACE: Color = rgb(0x1a, 0x1e, 0x28);
+pub const RAISED: Color = rgb(0x25, 0x2b, 0x39);
+/// One step above RAISED, for a control under the pointer or being pressed.
+pub const PRESSED: Color = rgb(0x32, 0x3a, 0x4c);
+pub const BORDER: Color = rgb(0x2e, 0x35, 0x45);
+pub const TEXT: Color = rgb(0xe8, 0xeb, 0xf2);
+pub const MUTED: Color = rgb(0x94, 0x9d, 0xb2);
 pub const ACCENT: Color = rgb(0x4f, 0x9c, 0xf5);
+pub const ACCENT_DEEP: Color = rgb(0x2f, 0x77, 0xcc);
 pub const DANGER: Color = rgb(0xe0, 0x5a, 0x5a);
+pub const DANGER_DEEP: Color = rgb(0xb8, 0x42, 0x42);
 pub const OK: Color = rgb(0x5a, 0xc8, 0x8a);
 pub const SELECTED: Color = rgb(0x2b, 0x3f, 0x5e);
 
+/// Corner radii. Everything drawn gets one, because a hard corner at these
+/// sizes is what makes a surface look like a drawn rectangle rather than a
+/// panel, and one square element among rounded ones looks like a bug.
+pub const RADIUS_WINDOW: i32 = 11;
+pub const RADIUS_SURFACE: i32 = 9;
+pub const RADIUS_CONTROL: i32 = 7;
+pub const RADIUS_SMALL: i32 = 4;
+
 const BODY_SIZE: f32 = 15.0;
-const PADDING: i32 = 10;
+const PADDING: i32 = 14;
 /// Space above and below the text inside a control.
-const CONTROL_PAD: i32 = 8;
-const CHECKBOX_SIZE: i32 = 16;
+const CONTROL_PAD: i32 = 9;
+/// Space either side of the text inside a button.
+const BUTTON_PAD: i32 = 16;
+const CHECKBOX_SIZE: i32 = 17;
 const DIVIDER: i32 = 1;
 /// An editor is this many lines tall.
 const EDITOR_LINES: i32 = 4;
 /// Width of the indicator drawn beside overflowing scroll content.
-const SCROLLBAR: i32 = 4;
+const SCROLLBAR: i32 = 5;
 /// How far one notch of the wheel moves a scroll container.
 pub const WHEEL_STEP: i32 = 48;
 
 fn gap_of(node: &Node) -> i32 {
     match node.attr("gap") {
         Some("none") => 0,
-        Some("sm") => 4,
-        Some("lg") => 16,
-        _ => 8,
+        Some("sm") => 6,
+        Some("lg") => 18,
+        _ => 10,
     }
 }
 
@@ -270,6 +284,14 @@ pub struct Focus {
     pub node: Option<usize>,
     /// Position in characters within the focused control's value.
     pub caret: usize,
+    /// A control being pressed right now.
+    ///
+    /// Kept apart from focus because they answer different questions: focus is
+    /// where the next keystroke goes and lasts until it moves, a press is what
+    /// is happening at this instant and lasts a fraction of a second. An agent's
+    /// click has to produce the second one or its actions are invisible except
+    /// for their consequences.
+    pub pressed: Option<usize>,
 }
 
 pub struct Layout {
@@ -638,7 +660,7 @@ fn natural_width(fonts: &Fonts, tree: &Tree, index: usize) -> i32 {
 
     match node.tag {
         Tag::Text | Tag::Icon => fonts.measure(label_of(node), &style),
-        Tag::Button => fonts.measure(label_of(node), &style) + PADDING * 2,
+        Tag::Button => fonts.measure(label_of(node), &style) + BUTTON_PAD * 2,
         Tag::Checkbox => CHECKBOX_SIZE + 8 + fonts.measure(label_of(node), &style),
         _ => 160,
     }
@@ -710,6 +732,11 @@ fn paint_node(
     let disabled = node.disabled();
     let style = style_at(tree, index);
     let focused = focus.node == Some(index);
+    let pressed = focus.pressed == Some(index);
+
+    // A pressed control sinks by a pixel. Small enough not to reflow anything,
+    // large enough that a still frame shows which control was just acted on.
+    let rect = if pressed { Rect::new(rect.x, rect.y + 1, rect.w, rect.h) } else { rect };
 
     // Disabled always wins over a colour the application chose: a control that
     // cannot be used must not look like one that can.
@@ -744,22 +771,37 @@ fn paint_node(
         }
 
         Tag::Group | Tag::Dialog | Tag::List => {
-            canvas.fill_rect(rect, if node.tag == Tag::Dialog { RAISED } else { SURFACE });
-            canvas.stroke_rect(rect, 1, BORDER);
+            if node.tag == Tag::Dialog {
+                canvas.shadow(rect, RADIUS_SURFACE, 18, 120);
+            }
+            canvas.fill_round_rect(
+                rect,
+                RADIUS_SURFACE,
+                if node.tag == Tag::Dialog { RAISED } else { SURFACE },
+            );
+            canvas.stroke_round_rect(rect, RADIUS_SURFACE, 1, BORDER);
             if let Some(label) = node.attr("label") {
                 canvas.draw_text(fonts, label, rect.x + PADDING, rect.y + PADDING, &style, MUTED);
             }
         }
 
         Tag::Button => {
-            let fill = match (disabled, node.attr("emphasis")) {
-                (true, _) => SURFACE,
-                (_, Some("primary")) => ACCENT,
-                (_, Some("danger")) => DANGER,
+            let emphasis = node.attr("emphasis");
+            let fill = match (disabled, pressed, emphasis) {
+                (true, _, _) => SURFACE,
+                (_, true, Some("primary")) => ACCENT_DEEP,
+                (_, true, Some("danger")) => DANGER_DEEP,
+                (_, true, _) => PRESSED,
+                (_, _, Some("primary")) => ACCENT,
+                (_, _, Some("danger")) => DANGER,
                 _ => RAISED,
             };
-            canvas.fill_rect(rect, fill);
-            canvas.stroke_rect(rect, 1, if focused { TEXT } else { BORDER });
+            canvas.fill_round_rect(rect, RADIUS_CONTROL, fill);
+            if focused && !disabled {
+                canvas.stroke_round_rect(rect, RADIUS_CONTROL, 2, ACCENT);
+            } else if emphasis.is_none() {
+                canvas.stroke_round_rect(rect, RADIUS_CONTROL, 1, BORDER);
+            }
 
             let label = label_of(node);
             let x = rect.x + (rect.w - fonts.measure(label, &style)) / 2;
@@ -767,13 +809,13 @@ fn paint_node(
         }
 
         Tag::Field | Tag::Editor => {
-            canvas.fill_rect(rect, BACKGROUND);
+            canvas.fill_round_rect(rect, RADIUS_CONTROL, BACKGROUND);
             let edge = match (focused, node.flag("invalid")) {
                 (_, true) => DANGER,
                 (true, _) => ACCENT,
                 _ => BORDER,
             };
-            canvas.stroke_rect(rect, 1, edge);
+            canvas.stroke_round_rect(rect, RADIUS_CONTROL, if focused { 2 } else { 1 }, edge);
 
             let value = value_of(node);
             let empty = value.is_empty();
@@ -824,10 +866,25 @@ fn paint_node(
                 CHECKBOX_SIZE,
                 CHECKBOX_SIZE,
             );
-            canvas.fill_rect(box_rect, BACKGROUND);
-            canvas.stroke_rect(box_rect, 1, if focused { ACCENT } else { BORDER });
-            if node.flag("checked") {
-                canvas.fill_rect(box_rect.inset(4), if disabled { MUTED } else { ACCENT });
+            let checked = node.flag("checked");
+            canvas.fill_round_rect(
+                box_rect,
+                RADIUS_SMALL,
+                if checked && !disabled { ACCENT } else { BACKGROUND },
+            );
+            if !checked || disabled {
+                canvas.stroke_round_rect(box_rect, RADIUS_SMALL, 1, if focused { ACCENT } else { BORDER });
+            }
+            if checked && disabled {
+                canvas.fill_round_rect(box_rect.inset(4), 2, MUTED);
+            } else if checked {
+                // A tick rather than a filled square: at this size a square
+                // inside a square reads as a loading state.
+                let t = box_rect.inset(4);
+                canvas.fill_rect(Rect::new(t.x + 1, t.y + t.h / 2, 3, 3), BACKGROUND);
+                canvas.fill_rect(Rect::new(t.x + 3, t.y + t.h / 2 + 2, 3, 3), BACKGROUND);
+                canvas.fill_rect(Rect::new(t.x + 5, t.y + t.h / 2, 3, 3), BACKGROUND);
+                canvas.fill_rect(Rect::new(t.x + 7, t.y + 2, 3, 3), BACKGROUND);
             }
             canvas.draw_text(
                 fonts,

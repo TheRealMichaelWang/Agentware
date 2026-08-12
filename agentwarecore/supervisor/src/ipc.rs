@@ -367,6 +367,14 @@ impl Control {
             },
         ),
 
+        "close-app" => {
+            let id = parse_id(1);
+            let pid = arg(2)
+                .and_then(|text| text.parse::<i32>().ok())
+                .ok_or_else(|| "missing or malformed pid".to_owned());
+            id.and_then(|id| pid.and_then(|pid| desks.close_app(id, pid))).map(|()| vec![])
+        }
+
         "interrupt" => parse_id(1).and_then(|id| desks.interrupt(id)).map(|()| vec![]),
 
         "close-desk" => parse_id(1).and_then(|id| desks.close(id)).map(|()| vec![]),

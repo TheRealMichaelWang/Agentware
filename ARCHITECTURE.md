@@ -78,6 +78,7 @@ Suspension is a memory optimization, not a persistence mechanism. The serialized
 ```
 CreateDesk { prompt: Option<text> } -> desk_id
 OpenApp    { desk_id, app }         -> forks an app process into that workspace
+CloseApp   { desk_id, pid }         -> ends one app, leaving the workspace open
 StartAgent { desk_id }              -> forks a per-turn agent, returns a channel to it
 Interrupt  { desk_id }              -> SIGTERM the desk's current agent
 CloseDesk  { desk_id }              -> tear down the desk and everything in it
@@ -92,6 +93,8 @@ Instead it forks the agent with two pre-connected descriptors and returns the ag
 There is one agent process per workspace at a time. This is a structural limit rather than a queueing policy: two agents doing computer use in one workspace would fight over the same cursor and the same DOM. A human message that arrives while a turn is running is queued by the agentdesk and delivered when the turn ends. It is never refused. To act on it sooner the human interrupts, which ends the turn and lets the queued message open the next one. All of this happens inside the agentdesk and is invisible to the Supervisor.
 
 Apps never enter a workspace at creation time; they arrive later through `OpenApp`, requested by the agentdesk's own launcher on behalf of either the human or the agent.
+
+`CloseApp` exists because a window's close button is the human ending one application, not the workspace. It is a separate escalation from `CloseDesk` and shares only the signal. The request comes from the haimanager rather than from the agentdesk, since window chrome is drawn by the compositor and the agentdesk is never told that windows exist. The pid is checked against that workspace's own apps rather than trusted, so no workspace can ask PID 1 to signal another's process.
 
 Brokering through PID 1 rather than forking locally buys four things:
 

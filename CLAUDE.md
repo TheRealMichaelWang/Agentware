@@ -49,6 +49,7 @@ it and powers the machine off; QEMU exiting on its own is the pass signal.
 5. Client protocol, tree diffing, ephemeral state, versioned events
 6. Workspace compositing: regions, windows, the navigation bar, input routing
 7. The agent surface: scoped queries, intents, the fake cursor, rejections
+8. Window management, and making an agent's actions visible as they happen
 
 Milestone 5 in more detail, since the rest builds on it. Clients arrive as
 descriptors the supervisor pushes over the control socket, each tagged with the
@@ -62,6 +63,14 @@ A field's `value` is the application's and the caret in it is the compositor's,
 so typing is applied locally, painted immediately, and sent on. Values sent are
 remembered until a tree comes back carrying one, which is what stops a second
 keystroke being thrown away by the echo of the first.
+
+Milestone 8 was not on the original list. It exists because the result of 1 to 7
+was correct and looked like it: square boxes, windows that could not be moved,
+and an agent whose actions were visible only in their consequences. The
+rasterizer gained antialiased rounded rectangles and soft shadows, windows gained
+chrome that can be dragged, minimized, maximized and closed, and every action now
+has a visible moment: a control sinks and darkens for a fifth of a second, and
+text is typed rather than pasted.
 
 Milestone 7 is the other half of that. An agent sends intents, never events, and
 the compositor resolves each one: find the application in the agent's own
@@ -175,6 +184,11 @@ is the list so it does not get relitigated.
 * The stop button is drawn by the haimanager and routes to the supervisor, so it
   works even if the agentdesk is wedged.
 * Applications send the **whole tree** every time; the haimanager diffs it.
+* Window chrome is the **compositor's**: title bar, shadow, and the three dots.
+  They are the only controls that are not AWML, so no application decides
+  whether it is closable and no agent sees the button that destroys its window.
+* An agent's typed text goes in **one character at a time**, producing one event
+  per keystroke. A value set in one step is something no human could produce.
 * A human's click and an agent's intent end in **one function**. Nothing else may
   synthesize an event, or the two paths drift and the guarantee that an agent can
   only do what a human could have done stops being checkable.

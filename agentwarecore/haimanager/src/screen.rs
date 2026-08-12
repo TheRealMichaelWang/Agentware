@@ -55,7 +55,7 @@ use crate::cursor;
 use crate::document::Document;
 use crate::input::{Button, Event, Key};
 use crate::paint::font::{Family, Fonts, Style};
-use crate::paint::{Canvas, Rect};
+use crate::paint::{Canvas, Rect, rgb};
 use crate::ui::{self, Focus, Frame, Layout, Regions};
 
 /// Height of the navigation bar, which sits above every workspace.
@@ -63,10 +63,35 @@ pub const NAV_HEIGHT: i32 = 40;
 const TASKBAR_HEIGHT: i32 = 56;
 const PANE_WIDTH: i32 = 380;
 /// Height of the title bar the compositor draws around an application window.
-const WINDOW_TITLE: i32 = 28;
-/// How far each successive window is offset, so none is entirely hidden.
-const CASCADE: i32 = 34;
-const WINDOW_MARGIN: i32 = 22;
+const WINDOW_TITLE: i32 = 34;
+/// How far each successive window is offset, so none opens exactly on another.
+const CASCADE: i32 = 32;
+const WINDOW_MARGIN: i32 = 26;
+/// Radius of the close, minimize and maximize dots.
+const LIGHT: i32 = 6;
+/// Centre of the first dot, from the left edge of the title bar.
+const LIGHT_INSET: i32 = 17;
+/// Distance between dot centres.
+const LIGHT_STEP: i32 = 20;
+/// The strip along the bottom of the apps region holding minimized windows.
+const DOCK_HEIGHT: i32 = 42;
+
+/// What a point in a title bar means.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Title {
+    Close,
+    Minimize,
+    Maximize,
+    /// Anywhere else on the bar: pick the window up.
+    Drag,
+}
+
+/// A window being moved by the human.
+struct Drag {
+    fd: RawFd,
+    /// Where in the window the pointer took hold, so it does not jump.
+    grab: (i32, i32),
+}
 
 /// How long the fake cursor takes to travel to what an agent named.
 ///
@@ -75,6 +100,22 @@ const WINDOW_MARGIN: i32 = 22;
 /// shown its work, and the visible embodiment VISION.md promises would be a
 /// claim rather than something on screen.
 const FLIGHT: Duration = Duration::from_millis(600);
+
+/// Time between characters when an agent enters text.
+///
+/// An agent that set a field's value in one step would produce something no
+/// human could have produced, and the application would receive one event where
+/// a person types seventeen. Typing it out is both the honest synthesis and the
+/// only way a human watching can read what is being entered.
+const KEYSTROKE: Duration = Duration::from_millis(45);
+
+/// How far an accepted intent has got.
+enum Stage {
+    /// The cursor is on its way to the target.
+    Travelling,
+    /// Characters are going in one at a time.
+    Typing { done: usize, next: Instant },
+}
 
 /// An intent that has been accepted and is being performed.
 ///
@@ -92,6 +133,7 @@ struct Flight {
     from: (i32, i32),
     to: (i32, i32),
     started: Instant,
+    stage: Stage,
 }
 
 /// Where the keyboard is pointed.
@@ -102,12 +144,18 @@ enum Surface {
     App(RawFd),
 }
 
-/// One application window: a connection and the cascade position it was given.
+/// One application window.
+///
+/// The rectangle is the window's own, not derived from a slot, because the human
+/// can move and resize it and neither the compositor nor the application gets to
+/// put it back.
 struct Window {
     fd: RawFd,
-    /// Assigned when the window opens and never changed, so raising a window
-    /// brings it forward without also moving it.
-    slot: usize,
+    rect: Rect,
+    /// Where it returns to when it stops being maximized.
+    restored: Rect,
+    minimized: bool,
+    maximized: bool,
 }
 
 struct Workspace {
@@ -118,9 +166,9 @@ struct Workspace {
     /// The agent running a turn here, if there is one. Its presence is what
     /// freezes the `apps` region.
     agent: Option<RawFd>,
-    /// Slots handed out so far, so a closed window does not free its position
-    /// and shuffle everything else under the human's pointer.
-    next_slot: usize,
+    /// How many windows have ever opened here, so the next one cascades off the
+    /// last rather than landing exactly on it.
+    opened: usize,
 }
 
 pub struct Screen {
@@ -144,6 +192,7 @@ pub struct Screen {
     /// can block inside one.
     requests: Vec<Vec<String>>,
     notes: Vec<String>,
+    drag: Option<Drag>,
 
     /// The intent being performed, if any.
     flight: Option<Flight>,
@@ -154,6 +203,12 @@ pub struct Screen {
     /// Where the agent's pointer is, and whose workspace it is in. Kept after a
     /// flight lands, so the human can see what was just touched.
     agent_cursor: Option<(u32, i32, i32)>,
+    /// Whether anything was mid-animation on the previous pass.
+    ///
+    /// Only used to produce one final frame after the last one finishes. Without
+    /// it a pressed control stays pressed on screen forever, because the thing
+    /// that would have repainted it is the animation that has just stopped.
+    animated: bool,
 }
 
 impl Screen {
@@ -170,9 +225,11 @@ impl Screen {
             debug: false,
             requests: Vec::new(),
             notes: Vec::new(),
+            drag: None,
             flight: None,
             queued: VecDeque::new(),
             agent_cursor: None,
+            animated: false,
         }
     }
 
@@ -195,22 +252,97 @@ impl Screen {
         Regions::carve(self.workspace_area(), TASKBAR_HEIGHT, PANE_WIDTH)
     }
 
-    /// Where a window sits, given its slot and how many have been handed out.
+    /// Where windows may go: the apps region, less the dock if it is showing.
+    fn window_area(&self, at: usize) -> Rect {
+        let apps = self.regions().apps;
+        if self.docked(at).is_empty() {
+            return apps;
+        }
+        Rect::new(apps.x, apps.y, apps.w, apps.h - DOCK_HEIGHT)
+    }
+
+    /// Where a window opens, before the human has an opinion about it.
     ///
     /// A cascade rather than a tiling because overlap is the point: a window
     /// that is partly covered is the case that makes "is this node reachable"
     /// a real question rather than a formality, and that question is what an
     /// agent's intent is checked against.
-    fn window_rect(&self, slot: usize, slots: usize) -> Rect {
-        let apps = self.regions().apps;
-        let spread = CASCADE * slots.saturating_sub(1) as i32;
-        let offset = CASCADE * slot as i32;
+    fn opening_rect(&self, at: usize, opened: usize) -> Rect {
+        let area = self.window_area(at);
+        // Wraps after a few, so the tenth window is not off the bottom corner.
+        let step = CASCADE * (opened % 5) as i32;
         Rect::new(
-            apps.x + WINDOW_MARGIN + offset,
-            apps.y + WINDOW_MARGIN + offset,
-            (apps.w - WINDOW_MARGIN * 2 - spread).max(200),
-            (apps.h - WINDOW_MARGIN * 2 - spread).max(160),
+            area.x + WINDOW_MARGIN + step,
+            area.y + WINDOW_MARGIN + step,
+            (area.w - WINDOW_MARGIN * 2 - CASCADE).max(320),
+            (area.h - WINDOW_MARGIN * 2 - CASCADE).max(220),
         )
+    }
+
+    /// The strip of minimized windows along the bottom of the apps region.
+    ///
+    /// Drawn by the compositor rather than put in the agentdesk's taskbar,
+    /// because whether a window is minimized is compositor state and the
+    /// agentdesk is never told that windows exist at all.
+    fn dock_rect(&self) -> Rect {
+        let apps = self.regions().apps;
+        Rect::new(
+            apps.x,
+            apps.y + apps.h - DOCK_HEIGHT,
+            apps.w,
+            DOCK_HEIGHT,
+        )
+    }
+
+    fn docked(&self, at: usize) -> Vec<RawFd> {
+        self.workspaces
+            .get(at)
+            .map(|workspace| {
+                workspace
+                    .windows
+                    .iter()
+                    .filter(|window| window.minimized)
+                    .map(|window| window.fd)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Where each minimized window's pill sits.
+    fn dock_pills(&self, at: usize) -> Vec<(RawFd, Rect)> {
+        let dock = self.dock_rect();
+        let mut x = dock.x + 14;
+        self.docked(at)
+            .into_iter()
+            .map(|fd| {
+                let width = 150;
+                let pill = Rect::new(x, dock.y + 7, width, DOCK_HEIGHT - 14);
+                x += width + 8;
+                (fd, pill)
+            })
+            .collect()
+    }
+
+    /// What part of a window's title bar a point is on.
+    fn title_hit(rect: Rect, x: i32, y: i32) -> Option<Title> {
+        let bar = Rect::new(rect.x, rect.y, rect.w, WINDOW_TITLE);
+        if !bar.contains(x, y) {
+            return None;
+        }
+
+        let cy = bar.y + bar.h / 2;
+        for (index, action) in
+            [Title::Close, Title::Minimize, Title::Maximize].into_iter().enumerate()
+        {
+            let cx = bar.x + LIGHT_INSET + LIGHT_STEP * index as i32;
+            let (dx, dy) = (x - cx, y - cy);
+            // A little larger than the dot is drawn. A six pixel target is not
+            // a target.
+            if dx * dx + dy * dy <= (LIGHT + 4) * (LIGHT + 4) {
+                return Some(action);
+            }
+        }
+        Some(Title::Drag)
     }
 
     // ---- connections -------------------------------------------------------
@@ -232,7 +364,12 @@ impl Screen {
             other => return Err(format!("unknown handoff {other:?}")),
         };
 
-        let client = Client::adopt(kind, desk, name, UnixStream::from(fd))
+        let pid: i32 = match kind {
+            Kind::App => field(3).parse().unwrap_or(0),
+            _ => field(2).parse().unwrap_or(0),
+        };
+
+        let client = Client::adopt(kind, desk, name, pid, UnixStream::from(fd))
             .map_err(|err| format!("could not adopt the descriptor: {err}"))?;
         let label = client.label();
         let fd = client.fd();
@@ -248,9 +385,16 @@ impl Screen {
                 self.focus = Surface::Desk;
             }
             Kind::App => {
-                let slot = self.workspaces[at].next_slot;
-                self.workspaces[at].next_slot += 1;
-                self.workspaces[at].windows.push(Window { fd, slot });
+                let opened = self.workspaces[at].opened;
+                let rect = self.opening_rect(at, opened);
+                self.workspaces[at].opened += 1;
+                self.workspaces[at].windows.push(Window {
+                    fd,
+                    rect,
+                    restored: rect,
+                    minimized: false,
+                    maximized: false,
+                });
                 self.current = at;
                 self.focus = Surface::App(fd);
             }
@@ -354,7 +498,7 @@ impl Screen {
             desk: None,
             windows: Vec::new(),
             agent: None,
-            next_slot: 0,
+            opened: 0,
         });
         self.workspaces.len() - 1
     }
@@ -368,18 +512,8 @@ impl Screen {
             if let Some(fd) = workspace.desk {
                 frames.push((fd, Frame::Regions(regions)));
             }
-            let slots = workspace.next_slot;
             for window in &workspace.windows {
-                let rect = self.window_rect(window.slot, slots);
-                frames.push((
-                    window.fd,
-                    Frame::Whole(Rect::new(
-                        rect.x,
-                        rect.y + WINDOW_TITLE,
-                        rect.w,
-                        rect.h - WINDOW_TITLE,
-                    )),
-                ));
+                frames.push((window.fd, Frame::Whole(content_of(window.rect))));
             }
         }
 
@@ -395,8 +529,16 @@ impl Screen {
     pub fn handle(&mut self, fonts: &Fonts, event: Event) -> bool {
         match event {
             // The cursor is the compositor's, so a move is a repaint and nothing
-            // else. No client is told the pointer went past it.
-            Event::PointerMoved { .. } => true,
+            // else, unless a window is being carried.
+            Event::PointerMoved { x, y } => {
+                self.drag_to(fonts, x, y);
+                true
+            }
+
+            Event::ButtonReleased { button: Button::Left, .. } => {
+                self.drag = None;
+                false
+            }
 
             Event::ButtonPressed { button: Button::Left, x, y } => self.click(fonts, x, y),
 
@@ -425,15 +567,10 @@ impl Screen {
             return Some(Surface::Nav);
         }
 
-        let workspace = self.workspaces.get(self.current)?;
-        if self.regions().apps.contains(x, y) {
-            let slots = workspace.next_slot;
-            // Front to back, so the window on top wins.
-            for window in workspace.windows.iter().rev() {
-                if self.window_rect(window.slot, slots).contains(x, y) {
-                    return Some(Surface::App(window.fd));
-                }
-            }
+        if self.regions().apps.contains(x, y)
+            && let Some(fd) = self.topmost_at(self.current, x, y)
+        {
+            return Some(Surface::App(fd));
         }
 
         // Everything the windows did not take is the workspace's own: the
@@ -463,6 +600,19 @@ impl Screen {
             }
 
             Surface::App(fd) => {
+                // Window management stays live during a turn. The freeze is
+                // about not fighting an agent for the same tree, and moving a
+                // window out of the way to watch what it is doing is not that.
+                let title = self
+                    .window(self.current, fd)
+                    .and_then(|window| Self::title_hit(window.rect, x, y));
+
+                if let Some(action) = title {
+                    self.raise(self.current, fd);
+                    self.focus = Surface::App(fd);
+                    return self.title_action(fonts, fd, action, x, y);
+                }
+
                 if self.agent_running() {
                     // Not an error and not silent. The human is being told the
                     // workspace is being driven, not that their click was lost.
@@ -478,10 +628,114 @@ impl Screen {
             }
 
             Surface::Desk => {
+                // A minimized window's pill sits over the wallpaper, so it is
+                // checked before the click is handed to the workspace.
+                if let Some((fd, _)) = self
+                    .dock_pills(self.current)
+                    .into_iter()
+                    .find(|(_, pill)| pill.contains(x, y))
+                {
+                    self.raise(self.current, fd);
+                    self.focus = Surface::App(fd);
+                    self.reframe(fonts);
+                    return true;
+                }
+
                 self.focus = Surface::Desk;
                 self.route_desk(fonts, Event::ButtonPressed { button: Button::Left, x, y })
             }
         }
+    }
+
+    /// Close, minimize, maximize, or pick the window up.
+    fn title_action(&mut self, fonts: &Fonts, fd: RawFd, action: Title, x: i32, y: i32) -> bool {
+        let at = self.current;
+        let area = self.window_area(at);
+        let Some(index) = self
+            .workspaces
+            .get(at)
+            .and_then(|w| w.windows.iter().position(|window| window.fd == fd))
+        else {
+            return false;
+        };
+
+        match action {
+            Title::Drag => {
+                let rect = self.workspaces[at].windows[index].rect;
+                self.drag = Some(Drag { fd, grab: (x - rect.x, y - rect.y) });
+                true
+            }
+
+            Title::Minimize => {
+                self.workspaces[at].windows[index].minimized = true;
+                // Whatever was underneath comes forward. Leaving focus on a
+                // window that is no longer on screen would send the next
+                // keystroke somewhere the human cannot see.
+                self.focus = self.workspaces[at]
+                    .windows
+                    .iter()
+                    .rev()
+                    .find(|window| !window.minimized)
+                    .map(|window| Surface::App(window.fd))
+                    .unwrap_or(Surface::Desk);
+                // The dock appearing takes room from the windows above it.
+                self.reframe(fonts);
+                true
+            }
+
+            Title::Maximize => {
+                let window = &mut self.workspaces[at].windows[index];
+                if window.maximized {
+                    window.rect = window.restored;
+                    window.maximized = false;
+                } else {
+                    window.restored = window.rect;
+                    window.rect = area.inset(8);
+                    window.maximized = true;
+                }
+                self.reframe(fonts);
+                true
+            }
+
+            // Lifetime belongs to PID 1, so closing a window is a request rather
+            // than a socket the compositor drops. Dropping it would leave a
+            // process alive with nothing to draw on and nobody tracking it.
+            Title::Close => {
+                let desk = self.workspaces[at].id;
+                let pid = self.client(fd).map(|client| client.pid).unwrap_or(0);
+                self.requests
+                    .push(vec!["close-app".into(), desk.to_string(), pid.to_string()]);
+                self.notes.push(format!("workspace {desk}: closing pid {pid}"));
+                true
+            }
+        }
+    }
+
+    /// Carry a window with the pointer.
+    ///
+    /// Clamped so the title bar can always be reached again. A window dragged
+    /// entirely off the bottom of its region is a window the human has lost.
+    fn drag_to(&mut self, fonts: &Fonts, x: i32, y: i32) {
+        let Some(drag) = &self.drag else { return };
+        let (fd, grab) = (drag.fd, drag.grab);
+        let at = self.current;
+        let area = self.window_area(at);
+
+        let Some(window) = self
+            .workspaces
+            .get_mut(at)
+            .and_then(|w| w.windows.iter_mut().find(|window| window.fd == fd))
+        else {
+            self.drag = None;
+            return;
+        };
+
+        window.rect.x = (x - grab.0).clamp(area.x - window.rect.w + 120, area.x + area.w - 120);
+        window.rect.y = (y - grab.1).clamp(area.y, area.y + area.h - WINDOW_TITLE);
+        // Dragging a maximized window makes it a normal one again, which is what
+        // grabbing hold of something ought to mean.
+        window.maximized = false;
+        self.reframe(fonts);
     }
 
     fn route_to(&mut self, fd: RawFd, fonts: &Fonts, event: Event) -> bool {
@@ -499,14 +753,16 @@ impl Screen {
 
     fn raise(&mut self, at: usize, fd: RawFd) {
         let Some(workspace) = self.workspaces.get_mut(at) else { return };
-        let Some(at) = workspace.windows.iter().position(|w| w.fd == fd) else { return };
-        if at + 1 == workspace.windows.len() {
+        let Some(index) = workspace.windows.iter().position(|w| w.fd == fd) else { return };
+        // Raising a minimized window is what bringing it back means.
+        workspace.windows[index].minimized = false;
+        if index + 1 == workspace.windows.len() {
             return;
         }
-        let window = workspace.windows.remove(at);
+        let window = workspace.windows.remove(index);
         workspace.windows.push(window);
-        // No reframing: a window keeps the slot it was given when it opened, so
-        // raising it changes only what paints last and what a point resolves to.
+        // No reframing: raising changes what paints last and what a point
+        // resolves to, not where anything is.
     }
 
     fn agent_running(&self) -> bool {
@@ -665,13 +921,16 @@ impl Screen {
     /// question, and answering it twice would let them drift.
     fn topmost_at(&self, at: usize, x: i32, y: i32) -> Option<RawFd> {
         let workspace = self.workspaces.get(at)?;
-        let slots = workspace.next_slot;
         workspace
             .windows
             .iter()
             .rev()
-            .find(|window| self.window_rect(window.slot, slots).contains(x, y))
+            .find(|window| !window.minimized && window.rect.contains(x, y))
             .map(|window| window.fd)
+    }
+
+    fn window(&self, at: usize, fd: RawFd) -> Option<&Window> {
+        self.workspaces.get(at)?.windows.iter().find(|w| w.fd == fd)
     }
 
     /// Check an intent and start the cursor moving, or say why not.
@@ -757,50 +1016,126 @@ impl Screen {
             from: from_point,
             to,
             started: Instant::now(),
+            stage: Stage::Travelling,
         });
         true
     }
 
-    /// True while the fake cursor is moving, so the loop should wake for frames.
+    /// True while something is mid-animation, so the loop should wake for
+    /// frames rather than sleeping until the next event.
     pub fn wants_frame(&self) -> bool {
-        self.flight.is_some()
+        self.flight.is_some() || self.clients.iter().any(Client::animating)
     }
 
-    /// Advance the fake cursor, and act when it arrives.
+    /// Advance whatever is moving.
     pub fn tick(&mut self, fonts: &Fonts) -> bool {
-        let Some(flight) = &self.flight else { return false };
+        let busy = self.wants_frame();
+        // One frame after the last animation ends, so a pressed control is
+        // repainted unpressed rather than staying that way until the next time
+        // something happens to redraw the screen.
+        let settling = self.animated && !busy;
+        self.animated = busy;
 
-        let elapsed = flight.started.elapsed();
-        if elapsed >= FLIGHT {
-            return self.land(fonts);
+        let Some(flight) = &self.flight else { return busy || settling };
+
+        match flight.stage {
+            Stage::Travelling => {
+                let elapsed = flight.started.elapsed();
+                if elapsed >= FLIGHT {
+                    self.land(fonts);
+                    return true;
+                }
+
+                // Eased, because a pointer that moves at a constant speed and
+                // stops dead does not read as a pointer.
+                let t = elapsed.as_secs_f32() / FLIGHT.as_secs_f32();
+                let eased = 1.0 - (1.0 - t).powi(3);
+                let x = flight.from.0 + ((flight.to.0 - flight.from.0) as f32 * eased) as i32;
+                let y = flight.from.1 + ((flight.to.1 - flight.from.1) as f32 * eased) as i32;
+                self.agent_cursor = Some((flight.desk, x, y));
+                true
+            }
+
+            Stage::Typing { done, next } => {
+                if Instant::now() >= next {
+                    self.type_one(fonts, done);
+                }
+                true
+            }
+        }
+    }
+
+    /// The cursor has arrived. Start typing, or synthesize the event.
+    fn land(&mut self, fonts: &Fonts) -> bool {
+        let Some(flight) = &mut self.flight else { return false };
+        self.agent_cursor = Some((flight.desk, flight.to.0, flight.to.1));
+
+        // Text is entered a character at a time, from here on. Every other
+        // action happens at the moment the cursor arrives, as a click does.
+        if flight.action == "type-text" && !flight.value.is_empty() {
+            flight.stage = Stage::Typing { done: 0, next: Instant::now() };
+            return true;
         }
 
-        // Eased, because a pointer that moves at a constant speed and stops dead
-        // does not read as a pointer.
-        let t = elapsed.as_secs_f32() / FLIGHT.as_secs_f32();
-        let eased = 1.0 - (1.0 - t).powi(3);
-        let x = flight.from.0 + ((flight.to.0 - flight.from.0) as f32 * eased) as i32;
-        let y = flight.from.1 + ((flight.to.1 - flight.from.1) as f32 * eased) as i32;
-        self.agent_cursor = Some((flight.desk, x, y));
+        let Some(flight) = self.flight.take() else { return false };
+        let outcome = self.apply(fonts, flight.app, &flight.target, &flight.action, &flight.value);
+        self.settle(fonts, flight, outcome);
         true
     }
 
-    /// The cursor has arrived. Synthesize the event, or refuse.
-    fn land(&mut self, fonts: &Fonts) -> bool {
-        let Some(flight) = self.flight.take() else { return false };
-        self.agent_cursor = Some((flight.desk, flight.to.0, flight.to.1));
+    /// Put in one more character.
+    fn type_one(&mut self, fonts: &Fonts, done: usize) -> bool {
+        let (app, target, action, total, prefix) = {
+            let Some(flight) = &self.flight else { return false };
+            (
+                flight.app,
+                flight.target.clone(),
+                flight.action.clone(),
+                flight.value.chars().count(),
+                flight.value.chars().take(done + 1).collect::<String>(),
+            )
+        };
 
-        // The tree may have changed while the cursor was travelling. A human
-        // takes the same risk, and the difference is that the compositor can
-        // notice: refusing beats acting on whatever moved into that place.
-        let outcome = match self.client_mut(flight.app) {
-            Some(client) => match client.node_by_id(&flight.target) {
-                Some(index) => client.act(fonts, index, &flight.action, &flight.value).err(),
+        // Every keystroke is its own event, exactly as a human's would be, so an
+        // application sees a value growing rather than one appearing.
+        let outcome = self.apply(fonts, app, &target, &action, &prefix);
+        if outcome.is_some() || done + 1 >= total {
+            let Some(flight) = self.flight.take() else { return false };
+            self.settle(fonts, flight, outcome);
+            return true;
+        }
+
+        if let Some(flight) = &mut self.flight {
+            flight.stage = Stage::Typing { done: done + 1, next: Instant::now() + KEYSTROKE };
+        }
+        true
+    }
+
+    /// Apply one action, re-resolving the target first.
+    ///
+    /// The tree may have changed while the cursor was travelling or while the
+    /// text was going in. A human takes the same risk, and the difference is
+    /// that the compositor can notice: refusing beats acting on whatever moved
+    /// into that place.
+    fn apply(
+        &mut self,
+        fonts: &Fonts,
+        app: RawFd,
+        target: &str,
+        action: &str,
+        value: &str,
+    ) -> Option<&'static str> {
+        match self.client_mut(app) {
+            Some(client) => match client.node_by_id(target) {
+                Some(index) => client.act(fonts, index, action, value).err(),
                 None => Some(agent::REASON_NO_SUCH_NODE),
             },
             None => Some(agent::REASON_NO_SUCH_APP),
-        };
+        }
+    }
 
+    /// Answer the agent, and start whatever was waiting behind this.
+    fn settle(&mut self, fonts: &Fonts, flight: Flight, outcome: Option<&'static str>) {
         match outcome {
             None => {
                 self.notes.push(format!(
@@ -817,7 +1152,6 @@ impl Screen {
         if let Some((from, fields)) = self.queued.pop_front() {
             self.begin(fonts, from, &fields);
         }
-        true
     }
 
     fn confirm(&mut self, to: RawFd, app: &str, target: &str, action: &str) {
@@ -970,15 +1304,18 @@ impl Screen {
         // No fill for the apps region: the wallpaper behind it is the
         // workspace's, and painting over it would mean an agentdesk could never
         // put anything behind its own windows.
-        let slots = workspace.next_slot;
         for window in &workspace.windows {
+            if window.minimized {
+                continue;
+            }
             let focused = self.focus == Surface::App(window.fd);
-            let rect = self.window_rect(window.slot, slots);
             let Some(client) = self.client(window.fd) else { continue };
             canvas.clipped(regions.apps, |canvas| {
-                draw_window(canvas, fonts, client, rect, focused)
+                draw_window(canvas, fonts, client, window.rect, focused)
             });
         }
+
+        self.draw_dock(canvas, fonts);
 
         for region in ["pane", "taskbar"] {
             let rect = if region == "pane" { regions.pane } else { regions.taskbar };
@@ -987,6 +1324,31 @@ impl Screen {
             if let Some(desk) = desk {
                 canvas.clipped(rect, |canvas| desk.draw_region(canvas, fonts, region));
             }
+        }
+    }
+
+    /// The minimized windows, as pills along the bottom of the apps region.
+    fn draw_dock(&self, canvas: &mut Canvas, fonts: &Fonts) {
+        let pills = self.dock_pills(self.current);
+        if pills.is_empty() {
+            return;
+        }
+
+        let dock = self.dock_rect();
+        canvas.fill_round_rect(
+            Rect::new(dock.x + 8, dock.y, dock.w - 16, dock.h - 6),
+            ui::RADIUS_SURFACE,
+            ui::SURFACE,
+        );
+
+        let style = Style { size: 13.0, ..Style::default() };
+        for (fd, pill) in pills {
+            let Some(client) = self.client(fd) else { continue };
+            canvas.fill_round_rect(pill, ui::RADIUS_CONTROL, ui::RAISED);
+            canvas.stroke_round_rect(pill, ui::RADIUS_CONTROL, 1, ui::BORDER);
+            canvas.clipped(pill.inset(2), |canvas| {
+                canvas.draw_text(fonts, client.title(), pill.x + 12, pill.y + 8, &style, ui::MUTED);
+            });
         }
     }
 
@@ -1054,26 +1416,62 @@ impl Screen {
     }
 }
 
+/// Where an application's own tree goes inside its window.
+fn content_of(rect: Rect) -> Rect {
+    Rect::new(rect.x, rect.y + WINDOW_TITLE, rect.w, rect.h - WINDOW_TITLE)
+}
+
 /// The chrome around an application window.
 ///
-/// Drawn by the compositor, from the `title` the application declared. An app
-/// names its window; it does not draw one, and it cannot draw outside the one it
-/// was given.
+/// Drawn by the compositor from the `title` the application declared. An app
+/// names its window; it does not draw one, does not know where it is, and
+/// cannot draw outside it.
+///
+/// The three dots are the only controls in Agentware that are not AWML. They
+/// are compositor affordances over a client rather than part of any client's
+/// interface, and putting them in the tree would mean every application could
+/// decide whether it was closable.
 fn draw_window(canvas: &mut Canvas, fonts: &Fonts, client: &Client, rect: Rect, focused: bool) {
     let bar = Rect::new(rect.x, rect.y, rect.w, WINDOW_TITLE);
-    let edge = if focused { ui::ACCENT } else { ui::BORDER };
 
-    canvas.fill_rect(rect, ui::BACKGROUND);
-    canvas.fill_rect(bar, if focused { ui::RAISED } else { ui::SURFACE });
+    // Depth rather than a heavy outline. A focused window sits higher.
+    canvas.shadow(rect, ui::RADIUS_WINDOW, if focused { 22 } else { 12 }, 130);
+    canvas.fill_round_rect(rect, ui::RADIUS_WINDOW, ui::BACKGROUND);
+
+    // The bar is the top of the same rounded shape, clipped to its own height so
+    // the two lower corners stay square against the content below.
+    canvas.clipped(bar, |canvas| {
+        canvas.fill_round_rect(
+            Rect::new(bar.x, bar.y, bar.w, bar.h + ui::RADIUS_WINDOW),
+            ui::RADIUS_WINDOW,
+            if focused { ui::RAISED } else { ui::SURFACE },
+        );
+    });
+
+    let cy = bar.y + bar.h / 2;
+    for (index, colour) in [rgb(0xff, 0x5f, 0x57), rgb(0xfe, 0xbc, 0x2e), rgb(0x28, 0xc8, 0x40)]
+        .into_iter()
+        .enumerate()
+    {
+        let cx = bar.x + LIGHT_INSET + LIGHT_STEP * index as i32;
+        let dot = Rect::new(cx - LIGHT, cy - LIGHT, LIGHT * 2, LIGHT * 2);
+        // Unfocused windows keep the dots but drain them, the way every desktop
+        // does, so the focused window is obvious without a coloured border.
+        canvas.fill_round_rect(dot, LIGHT, if focused { colour } else { ui::BORDER });
+    }
 
     let style = Style { size: 13.0, ..Style::default() };
     let ink = if focused { ui::TEXT } else { ui::MUTED };
-    canvas.draw_text(fonts, client.title(), bar.x + 10, bar.y + 6, &style, ink);
+    let title = client.title();
+    let x = bar.x + (bar.w - fonts.measure(title, &style)) / 2;
+    let x = x.max(bar.x + LIGHT_INSET + LIGHT_STEP * 3);
+    canvas.draw_text(fonts, title, x, cy - fonts.line_height(&style) / 2, &style, ink);
 
-    let content = Rect::new(rect.x, rect.y + WINDOW_TITLE, rect.w, rect.h - WINDOW_TITLE);
+    let content = content_of(rect);
     canvas.clipped(content, |canvas| client.draw(canvas, fonts));
 
-    canvas.stroke_rect(rect, 1, edge);
+    canvas.fill_rect(Rect::new(bar.x, bar.y + bar.h - 1, bar.w, 1), ui::BORDER);
+    canvas.stroke_round_rect(rect, ui::RADIUS_WINDOW, 1, ui::BORDER);
 }
 
 /// Keys the compositor keeps for itself, before anything is routed.

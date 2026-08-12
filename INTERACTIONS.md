@@ -80,6 +80,8 @@ They are different schemas and the agent may only produce the first. The haimana
 3. Animate the fake cursor to it, so the human sees what is about to happen.
 4. Synthesize exactly the event a human click would have produced.
 
+Step 4 is more literal than it sounds. Text is entered one character at a time, at roughly a keystroke's interval, so an application receives seventeen events for a seventeen character address exactly as it would from a person. Setting the value in one step would produce something no human could have produced, and would also be unreadable to a human watching. `check` and `uncheck` become a `toggle` only when the state actually has to move, for the same reason: that is the event a person pressing the box would have generated.
+
 If the agent could emit the event directly, every one of those steps would be skippable. An agent could "click" a disabled button, or one scrolled off screen, or one behind a dialog, and the app would receive something no human could have produced. The visible embodiment VISION.md promises would quietly stop being true.
 
 Because the steps can fail, **intents are rejectable**: `no such node`, `node is disabled`, `node is not visible`, `the human has taken over`. An agent that cannot be told no acts blind and retries forever.
@@ -100,6 +102,10 @@ It speaks the same AWML over the same kind of connection, and the haimanager run
 | `apps` | app processes | application windows |
 
 Above all workspaces sits the navigation bar, drawn by the haimanager itself because it belongs to no workspace.
+
+**Window chrome is the compositor's, not the application's.** The title bar, the shadow, and the close, minimize and maximize controls are drawn by the haimanager around a client, from the `title` the application declared. They are the only controls in the system that are not AWML, and that is the point: putting them in the tree would let every application decide whether it was closable, and would make an agent's view of a window include the button that destroys it.
+
+Minimized windows appear in a strip along the bottom of the `apps` region, drawn by the compositor. Not in the agentdesk's taskbar, even though a taskbar is where one would expect them, because whether a window is minimized is compositor state and the agentdesk is never told that windows exist at all.
 
 **Invisibility to agents is a property of the connection, not an attribute.** Trees arriving on a desk connection are chrome. They are excluded from every agent-facing query by construction, and intents naming their node IDs are rejected. Nothing is marked; nothing can be marked wrongly or forgotten. A useful consequence: an agent cannot read the chat pane containing its own streamed thoughts, which would otherwise be a feedback loop.
 
