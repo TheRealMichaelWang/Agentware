@@ -68,7 +68,7 @@ keystroke being thrown away by the echo of the first.
    resolution with visibility and enabled checks, fake cursor animation,
    rejections.
 
-Nothing else exists yet: no `agentdesk`, no `agent`, no `desktop-main`, no real
+Nothing else exists yet: no `agentdesk`, no `agent`, no `startmenu`, no real
 apps. `awapp` stands in for the first and the last of those, and is the reference
 client for the display protocol rather than a product. The supervisor logs and
 skips what is not installed rather than crash looping against it, so the system
@@ -82,7 +82,7 @@ make run         # boot in a QEMU window
 make pack        # build and pack the initramfs without booting
 ```
 
-`make run` passes `agentware.demo` on the kernel command line. `desktop-main`
+`make run` passes `agentware.demo` on the kernel command line. `startmenu`
 does not exist, so nothing would otherwise ask the broker for a workspace and
 the compositor would come up with no clients at all. The flag substitutes two
 stand-ins and nothing else: `awapp desk` as the agentdesk, and `awctl demo` as

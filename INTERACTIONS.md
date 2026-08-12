@@ -126,7 +126,7 @@ The freeze is scoped to that one region, and specifically **not** to the screen:
 
 The Supervisor is the only path by which a process comes into existence.
 
-**A workspace.** `desktop-main` sends `CreateDesk`, with the prompt the human typed or with nothing. The Supervisor forks the agentdesk, handing it a descriptor to the haimanager, and passes the opening prompt as an argument. That prompt is the only user text the Supervisor ever handles; it exists because a brand new workspace has no other way to learn what it was created for.
+**A workspace.** `startmenu` sends `CreateDesk`, with the prompt the human typed or with nothing. The Supervisor forks the agentdesk, handing it a descriptor to the haimanager, and passes the opening prompt as an argument. That prompt is the only user text the Supervisor ever handles; it exists because a brand new workspace has no other way to learn what it was created for.
 
 Creating a workspace does not start a turn. The agentdesk reads its opening prompt and asks for an agent itself.
 

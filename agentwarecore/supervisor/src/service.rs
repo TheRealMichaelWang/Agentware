@@ -4,7 +4,7 @@
 //! about. That opinion is its [`RestartPolicy`], and the policies differ by kind
 //! for reasons that come straight out of what Agentware is:
 //!
-//! * `haimanager` and `desktop-main` restart forever. If the compositor dies,
+//! * `haimanager` and `startmenu` restart forever. If the compositor dies,
 //!   the machine is a brick until it comes back, so giving up is never the right
 //!   answer.
 //! * An `agentdesk` restarts a bounded number of times. It is one workspace
@@ -57,7 +57,7 @@ pub enum RestartPolicy {
 
 /// How long a service waits for its dependency to come up before giving up.
 ///
-/// Without a ceiling, a compositor that never registers leaves `desktop-main`
+/// Without a ceiling, a compositor that never registers leaves `startmenu`
 /// pending forever, which looks identical to a hang and tells nobody anything.
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -113,7 +113,7 @@ impl Service {
     /// Hold this service back until the named one reports itself ready.
     ///
     /// Readiness is not "the process was forked", it is "the process said it is
-    /// serving". Starting `desktop-main` the instant `haimanager` is forked
+    /// serving". Starting `startmenu` the instant `haimanager` is forked
     /// means it tries to connect to a compositor that is not listening yet and
     /// fails, which shows up as an unexplained flicker at boot rather than as
     /// the ordering bug it is.
@@ -253,7 +253,7 @@ impl Services {
     ///
     /// Services whose executable is missing are skipped rather than retried.
     /// That is what lets the supervisor boot today, before `haimanager` and
-    /// `desktop-main` exist: it says so and carries on instead of crash looping
+    /// `startmenu` exist: it says so and carries on instead of crash looping
     /// against a binary that was never built.
     pub fn start_all(&mut self) {
         // Services skipped because their binary is missing. Anything depending
@@ -358,7 +358,7 @@ impl Services {
 
     /// Ask every running service to stop, in reverse table order.
     ///
-    /// Reverse order matters: `desktop-main` should go down before the
+    /// Reverse order matters: `startmenu` should go down before the
     /// `haimanager` it draws through, so it is not writing to a socket that has
     /// just been closed. This only sends the signal; the caller waits.
     pub fn stop_all(&mut self) {

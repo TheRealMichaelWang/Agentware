@@ -8,7 +8,7 @@ This document covers what the processes are and how long they live. INTERACTIONS
 The `agentwarecore` repository is structured to separate the boot-critical supervisor from the graphical and application subsystems:
 * `supervisor/` - The PID 1 bare-metal init system and spawn broker.
 * `haimanager/` - The Human-Agent Interface Manager: the window manager, markup parser, and renderer.
-* `desktop-main/` - The start menu: a prompt bar, a button for creating an empty agentdesk, and the list of open ones. It launches workspaces, never apps.
+* `startmenu/` - The home screen: a prompt bar, a button for creating an empty agentdesk, and the list of open ones. It launches workspaces, never apps, and holds no workspace of its own.
 * `agentdesk/` - The workspace process. One per open agentdesk, owning that workspace's apps, conversation history, and UI state.
 * `agent/` - The per-turn worker. Spawned to execute one prompt and gone when that prompt is finished.
 * `apps/` - First-party system applications natively compatible with the UI markup language.
@@ -16,7 +16,7 @@ The `agentwarecore` repository is structured to separate the boot-critical super
 ## The Supervisor (PID 1)
 The Supervisor is the absolute root of the userland.
 * Runs as process ID 1 immediately after the Linux kernel finishes booting.
-* Responsible for hardware initialization, mounting virtual filesystems (`/dev`, `/proc`, `/sys`), and bootstrapping the `haimanager` and `desktop-main` processes.
+* Responsible for hardware initialization, mounting virtual filesystems (`/dev`, `/proc`, `/sys`), and bootstrapping the `haimanager` and `startmenu` processes.
 * Monitors the health of all sub-processes and acts as the grim reaper for zombie processes to prevent resource leaks.
 * Acts as the **spawn broker**: every agentdesk and every agent in the system is forked by the Supervisor, on request, and is therefore a direct child of PID 1.
 
@@ -73,7 +73,7 @@ Open agentdesks accumulate the way browser tabs do. An agentdesk that has not be
 Suspension is a memory optimization, not a persistence mechanism. The serialized tree and the conversation history stay in RAM for as long as the machine is on, and die with it like everything else. The win is still large: a markup tree costs a fraction of the app processes and agent context it replaces, which is what lets a machine hold many more open agentdesks than it could hold live ones.
 
 ## The Spawn Broker
-`desktop-main` and the agentdesks do not fork processes themselves. They ask the Supervisor over a control socket at `/run/agentware/sup.sock`:
+`startmenu` and the agentdesks do not fork processes themselves. They ask the Supervisor over a control socket at `/run/agentware/sup.sock`:
 
 ```
 CreateDesk { prompt: Option<text> } -> desk_id
@@ -95,8 +95,8 @@ Apps never enter a workspace at creation time; they arrive later through `OpenAp
 
 Brokering through PID 1 rather than forking locally buys four things:
 
-* **Process tree ownership.** If `desktop-main` forked agentdesks, a crash of `desktop-main` would orphan every open workspace to PID 1 with no record attached, leaving them unnameable and unmanageable. As children of the Supervisor they are first-class entries in its service table from the start.
-* **Privilege separation.** Sandboxing an agent requires namespaces and cgroups, which require privilege. With the broker at PID 1, `desktop-main` needs none.
+* **Process tree ownership.** If `startmenu` forked agentdesks, a crash of `startmenu` would orphan every open workspace to PID 1 with no record attached, leaving them unnameable and unmanageable. As children of the Supervisor they are first-class entries in its service table from the start.
+* **Privilege separation.** Sandboxing an agent requires namespaces and cgroups, which require privilege. With the broker at PID 1, `startmenu` needs none.
 * **File descriptor passing.** Every agentdesk, app and agent is forked already holding a `socketpair` to the haimanager, and agents hold a second one to their agentdesk. Nothing opens a socket by path. This removes the startup race, keeps a sandboxed process from reaching anything it was not explicitly handed, and turns identity into a capability rather than a claim: the haimanager knows which workspace a connection belongs to because the Supervisor told it at handoff, which is what scopes an agent to its own desk and keeps the agentdesk's own chrome invisible to it.
 * **One owner of lifetime.** The Supervisor already reaps and already tracks process state. A second spawner would mean two components tracking lifetime, and they would drift apart.
 
@@ -104,8 +104,8 @@ What deliberately does **not** cross this socket is agent telemetry. The stream 
 
 ## Process Isolation & Lifecycle
 Every major component in Agentware is strictly isolated in its own process space to guarantee system stability.
-* **Home Screen Process:** `desktop-main` runs as a persistent, standalone process directly under the Supervisor. It is a launcher, so it holds no user work and losing it costs nothing but the menu.
+* **Home Screen Process:** `startmenu` runs as a persistent, standalone process directly under the Supervisor. It is a launcher, so it holds no user work and losing it costs nothing but the menu.
 * **Agentdesk Processes:** Each open workspace is its own process, forked by the Supervisor on request and placed in its own cgroup along with its apps. If one crashes, gets stuck, or is closed, no other workspace is affected.
 * **App Processes:** One per app *per workspace*. The same app open in several agentdesks is several independent processes, each owned by exactly one workspace and torn down with it.
 * **Agent Processes:** Short-lived and frequent, one per turn. Because they perform computer use on a live workspace, they are the correct place to apply sandboxing (`CLONE_NEWPID`, `CLONE_NEWNS`, cgroup limits) as the isolation model matures. Nothing they need arrives by path, so a mount namespace costs them no capability they actually use.
-* **Restart Policy by Kind:** `haimanager` and `desktop-main` restart forever with exponential backoff, since the machine is unusable without them. Agentdesks and agents do not silently restart, because doing so would destroy conversation state or repeat work the human did not ask for twice.
+* **Restart Policy by Kind:** `haimanager` and `startmenu` restart forever with exponential backoff, since the machine is unusable without them. Agentdesks and agents do not silently restart, because doing so would destroy conversation state or repeat work the human did not ask for twice.

@@ -41,7 +41,7 @@ impl Action {
 /// Shut the system down. Never returns.
 ///
 /// Named services are stopped first, in reverse table order, so each gets a
-/// chance to save state and so `desktop-main` goes down before the `haimanager`
+/// chance to save state and so `startmenu` goes down before the `haimanager`
 /// it draws through. The blanket signal that follows catches everything else:
 /// orphans, agent processes, anything the table does not know about.
 pub fn shutdown(action: Action, services: &mut Services, desks: &mut Desks) -> ! {

@@ -1,7 +1,7 @@
 //! Boot-time demonstration, enabled with `agentware.demo` on the kernel command
 //! line.
 //!
-//! `desktop-main` does not exist, so nothing asks the broker to create a
+//! `startmenu` does not exist, so nothing asks the broker to create a
 //! workspace, so the haimanager comes up owning a display with no clients on it.
 //! The whole graphical half of the system would then be unobservable, and
 //! graphics cannot be checked from a serial log.
@@ -14,7 +14,7 @@
 //! each a socketpair to the compositor, and pushes the other end over the control
 //! socket tagged with the workspace it belongs to.
 //!
-//! It goes away when `desktop-main` and a real agentdesk exist.
+//! It goes away when `startmenu` and a real agentdesk exist.
 
 use awproto::ROLE_HAIMANAGER;
 

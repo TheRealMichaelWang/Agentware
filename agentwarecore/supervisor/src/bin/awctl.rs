@@ -5,7 +5,7 @@
 //! shell. `awctl selftest` runs a scripted sequence and exits non-zero if any
 //! step misbehaves, which is what the boot-time self-test runs. `awctl demo`
 //! opens one workspace with one application in it, which is what puts something
-//! on screen while `desktop-main` does not exist.
+//! on screen while `startmenu` does not exist.
 //!
 //! It speaks the protocol over a real socket rather than calling into the
 //! supervisor, so the framing, the partial-read handling and the dispatch all
@@ -136,7 +136,7 @@ fn selftest() -> i32 {
 
 /// Put a workspace and an application on screen.
 ///
-/// `desktop-main` is what will do this, and it does not exist. Until it does,
+/// `startmenu` is what will do this, and it does not exist. Until it does,
 /// the compositor has nothing to render and the display half of the system
 /// cannot be looked at. This is the smallest thing that fills that gap, and it
 /// goes through the real broker: the workspace and the app are forked by PID 1,

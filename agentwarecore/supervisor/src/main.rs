@@ -51,7 +51,7 @@ const TOKEN_SIGNALS: u64 = 1;
 
 /// The services that make up the Agentware userland.
 ///
-/// `desktop-main` draws through `haimanager`, so it waits for the compositor to
+/// `startmenu` draws through `haimanager`, so it waits for the compositor to
 /// register on the control socket rather than merely to be forked. Table order
 /// alone would not be enough: a forked process is not a listening one.
 ///
@@ -61,7 +61,7 @@ const TOKEN_SIGNALS: u64 = 1;
 fn system_services() -> Vec<Service> {
     vec![
         Service::new(ROLE_HAIMANAGER, "/bin/haimanager", &[], RestartPolicy::Always),
-        Service::new("desktop-main", "/bin/desktop-main", &[], RestartPolicy::Always)
+        Service::new("startmenu", "/bin/startmenu", &[], RestartPolicy::Always)
             .requires(ROLE_HAIMANAGER),
     ]
 }

@@ -136,7 +136,7 @@ pub fn mount_virtual_filesystems() -> io::Result<()> {
         }
     }
 
-    // Holds the control socket that desktop-main and the agentdesks use to ask
+    // Holds the control socket that startmenu and the agentdesks use to ask
     // the supervisor to fork things.
     if let Err(err) = fs::create_dir_all("/run/agentware") {
         kwarn!("could not create /run/agentware: {err}");

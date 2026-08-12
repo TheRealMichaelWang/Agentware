@@ -81,7 +81,7 @@ pack: build
 
 # Boot QEMU (depends on 'pack' being finished)
 #
-# agentware.demo is on the command line because desktop-main does not exist yet,
+# agentware.demo is on the command line because startmenu does not exist yet,
 # so without it nothing would ever ask the broker for a workspace and the
 # compositor would come up with no clients. It substitutes a stand-in start menu
 # and a stand-in agentdesk, and drops out the moment either is written.
