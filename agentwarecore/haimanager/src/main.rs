@@ -23,6 +23,7 @@ use awproto::{ROLE_HAIMANAGER, SOCKET_PATH, encode, read_frame};
 use rustix::event::epoll;
 
 use input::Input;
+use paint::font::Fonts;
 use paint::{Canvas, Rect};
 
 /// epoll tokens. Input devices take one each, offset by their index.
@@ -52,11 +53,19 @@ fn main() {
 
     let mut input = Input::new(width as i32, height as i32);
 
+    let fonts = match Fonts::load() {
+        Ok(fonts) => fonts,
+        Err(err) => {
+            log(&format!("FATAL: could not load fonts: {err}"));
+            std::process::exit(1);
+        }
+    };
+
     let mut canvas = Canvas::new(width, height);
 
     // The status readout sits along the bottom, so the document gets the rest.
     let area = Rect::new(0, 0, width as i32, height as i32 - 96);
-    let mut client = match specimen::Client::new(area) {
+    let mut client = match specimen::Client::new(&fonts, area) {
         Ok(client) => client,
         Err(err) => {
             log(&format!("FATAL: could not parse the document: {err}"));
@@ -76,9 +85,10 @@ fn main() {
 
     // Paint once before waiting, so a machine with no input at all still shows
     // something rather than a blank screen.
-    redraw(&mut display, &mut canvas, &input, &client);
+    redraw(&mut display, &mut canvas, &fonts, &input, &client);
+    log(&format!("{} glyphs rasterized for the first frame", fonts.glyph_count()));
 
-    run(&mut display, &mut canvas, &mut input, &mut client);
+    run(&mut display, &mut canvas, &fonts, &mut input, &mut client);
 }
 
 /// Wait for input and repaint when something changes.
@@ -89,6 +99,7 @@ fn main() {
 fn run(
     display: &mut drm::Display,
     canvas: &mut Canvas,
+    fonts: &Fonts,
     input: &mut Input,
     client: &mut specimen::Client,
 ) -> ! {
@@ -141,13 +152,13 @@ fn run(
 
             let index = (token - TOKEN_INPUT_BASE) as usize;
             for event in input.read_device(index) {
-                client.handle(event);
+                client.handle(fonts, event);
                 dirty = true;
             }
         }
 
         if dirty {
-            redraw(display, canvas, input, client);
+            redraw(display, canvas, fonts, input, client);
         }
     }
 }
@@ -155,10 +166,11 @@ fn run(
 fn redraw(
     display: &mut drm::Display,
     canvas: &mut Canvas,
+    fonts: &Fonts,
     input: &Input,
     client: &specimen::Client,
 ) {
-    client.draw(canvas);
+    client.draw(canvas, fonts);
 
     let (x, y) = input.pointer();
     cursor::draw(canvas, x, y, cursor::Kind::Human);

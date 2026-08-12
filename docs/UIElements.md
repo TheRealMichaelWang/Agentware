@@ -2,7 +2,9 @@
 
 The Agentware Markup Language. This is the complete set of elements an application may emit, the state each carries, and the actions each accepts.
 
-The governing rule is that **markup describes affordances, not appearance**. An app never says "blue rectangle, 120x40, centered text". It says "a button, id `send`, enabled, which sends the composed message". The haimanager decides what that looks like.
+The governing rule is that **markup describes affordances, not arrangement**. An app never says "a rectangle 120x40 at these coordinates". It says "a button, id `send`, enabled, which sends the composed message". The haimanager decides where it goes and how big it is.
+
+Applications *do* choose type and colour. That is safe rather than a compromise: appearance can never carry meaning here, because every control is required to have a description and its actions are derived from its type and state. An agent is never asked to infer anything from how something looks, so styling can be as expressive as an app likes.
 
 The consequence is the reason for the whole design: the human's rendered view and the agent's semantic view are generated from *the same tree*. There is no derivation step between them and therefore no way for them to drift. Every other system builds a render tree and derives an accessibility tree from it, which is why accessibility trees are perpetually stale and wrong.
 
@@ -52,6 +54,24 @@ Declares that an agent may not act on this control without explicit human approv
 It is left `false` throughout for now; the enforcement path is not built.
 
 One thing worth not painting into a corner: an app declaring its own permissions is a starting point, not a security model. An app can mark a destructive action `false`, whether through carelessness or design. The human and the OS should eventually be able to raise a requirement the app did not ask for. Nothing here should assume the app's declaration is the final word.
+
+## Styling
+
+Five attributes, all of which **inherit**, so a window sets them once and any element can override:
+
+| Attribute | Values |
+| --- | --- |
+| `font` | `sans`, `mono` |
+| `size` | a number of pixels, or `xs` `sm` `md` `lg` `xl` |
+| `weight` | `normal`, `bold` |
+| `italic` | present or absent |
+| `color` | `text` `muted` `accent` `danger` `ok`, or `#rrggbb` / `#rgb` |
+
+Type is rendered from outline fonts, so a size is a real size rather than a multiple of a bitmap cell. `role` still sets sensible defaults: a `heading` is large and bold without being told to be.
+
+**None of this reaches an agent.** Every styling attribute is dropped from the agent's view, along with `gap` and `placeholder`. The agent sees what a control is, what it says, what state it is in, and what it can do.
+
+One thing styling cannot override: `disabled` always renders muted. A control that cannot be used must never look like one that can, and that is not the application's call to make.
 
 ## Layout Elements
 
@@ -231,7 +251,7 @@ The same interface, as the app writes it and as the agent receives it.
 Four things happened:
 
 * **Both stacks are gone.** Layout is not semantics. Their children flattened upward.
-* **Appearance is gone.** `label`, `placeholder`, `emphasis` are for the human's eyes.
+* **Appearance is gone.** `label` survives because it is what the control *says*; `placeholder`, `emphasis`, `font`, `size`, `weight`, `italic` and `color` do not.
 * **Actions appeared.** Derived from type and state, not copied from the app.
 * **The disabled button kept its entry but has no actions.** The agent can see it exists and why it might matter, and can see it cannot be used yet. Removing it entirely would leave the agent unable to reason about what it is waiting for.
 

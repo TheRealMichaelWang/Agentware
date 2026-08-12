@@ -12,3 +12,4 @@ edition = "2024"
 libc = "0.2"
 rustix = { version = "1.1.4", features = ["event", "fs", "net", "process"] }
 awproto = { path = "../awproto" }
+fontdue = "0.9.4"

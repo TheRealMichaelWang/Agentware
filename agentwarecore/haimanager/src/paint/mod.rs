@@ -142,58 +142,83 @@ impl Canvas {
         );
     }
 
-    /// Draw one glyph with its top-left corner at `x, y`.
+    /// Blend one pixel, weighted by coverage.
     ///
-    /// `scale` multiplies both axes, so each source pixel becomes a solid
-    /// `scale` by `scale` block. Integer scaling keeps a bitmap font crisp; any
-    /// filtering would turn it to mush at these sizes.
-    fn draw_glyph(&mut self, character: char, x: i32, y: i32, scale: i32, color: Color) {
-        let bitmap = font::glyph(character);
-
-        for (row, bits) in bitmap.iter().enumerate() {
-            for column in 0..font::WIDTH {
-                // Bit `WIDTH - 1` is the leftmost pixel, which is what makes
-                // the literals in font.rs read as pictures.
-                let lit = bits & (1 << (font::WIDTH - 1 - column)) != 0;
-                if !lit {
-                    continue;
-                }
-                self.fill_rect(
-                    Rect::new(
-                        x + column as i32 * scale,
-                        y + row as i32 * scale,
-                        scale,
-                        scale,
-                    ),
-                    color,
-                );
-            }
+    /// Antialiased text is the reason this exists: a glyph edge is partly
+    /// covered, and plotting it as either on or off is what makes bitmap fonts
+    /// look like bitmap fonts.
+    fn blend(&mut self, x: i32, y: i32, color: Color, coverage: u8) {
+        if coverage == 0 || !self.clip.contains(x, y) {
+            return;
         }
+
+        let index = (y * self.width + x) as usize;
+        if coverage == 255 {
+            self.pixels[index] = color;
+            return;
+        }
+
+        let under = self.pixels[index];
+        let alpha = coverage as u32;
+        let mix = |shift: u32| {
+            let a = (under >> shift) & 0xff;
+            let b = (color >> shift) & 0xff;
+            // Rounded rather than truncated, so a run of blends does not drift
+            // steadily darker than it should.
+            ((a * (255 - alpha) + b * alpha + 127) / 255) << shift
+        };
+        self.pixels[index] = mix(16) | mix(8) | mix(0);
     }
 
-    /// Draw a line of text, returning the x coordinate just past it.
-    pub fn draw_text(&mut self, text: &str, x: i32, y: i32, scale: i32, color: Color) -> i32 {
-        let advance = (font::WIDTH as i32 + 1) * scale;
-        let mut pen = x;
+    /// Draw a line of text with its *top* at `y`, returning the x just past it.
+    ///
+    /// Taking the top rather than the baseline means callers place text the way
+    /// they place everything else, and only this function needs to know where
+    /// the baseline sits inside a line box.
+    pub fn draw_text(
+        &mut self,
+        fonts: &font::Fonts,
+        text: &str,
+        x: i32,
+        y: i32,
+        style: &font::Style,
+        color: Color,
+    ) -> i32 {
+        let baseline = y as f32 + fonts.line_metrics(style).ascent;
+        let embolden = style.weight == font::Weight::Bold && style.family == font::Family::Mono;
+        let mut pen = x as f32;
 
         for character in text.chars() {
-            self.draw_glyph(character, pen, y, scale, color);
-            pen += advance;
+            fonts.with_glyph(style, character, |glyph| {
+                let origin_x = pen.round() as i32 + glyph.left;
+                let origin_y = baseline.round() as i32 - glyph.top;
+
+                for row in 0..glyph.height {
+                    // Synthetic obliquing: shift each row by a fraction of its
+                    // distance above the baseline. Cheaper than shipping an
+                    // italic face and, at interface sizes, hard to tell apart.
+                    let slant = if style.italic {
+                        ((glyph.height - row) as f32 * 0.21) as i32
+                    } else {
+                        0
+                    };
+
+                    for column in 0..glyph.width {
+                        let coverage = glyph.coverage[row * glyph.width + column];
+                        let px = origin_x + column as i32 + slant;
+                        let py = origin_y + row as i32;
+                        self.blend(px, py, color, coverage);
+                        if embolden {
+                            self.blend(px + 1, py, color, coverage);
+                        }
+                    }
+                }
+
+                pen += glyph.advance + if embolden { 1.0 } else { 0.0 };
+            });
         }
-        pen
-    }
 
-    /// How wide [`Canvas::draw_text`] would draw this string.
-    ///
-    /// Includes the gap after the final glyph, matching what `draw_text`
-    /// returns, so laying out text by measuring and then drawing agrees with
-    /// itself.
-    pub fn text_width(text: &str, scale: i32) -> i32 {
-        text.chars().count() as i32 * (font::WIDTH as i32 + 1) * scale
-    }
-
-    pub fn text_height(scale: i32) -> i32 {
-        font::HEIGHT as i32 * scale
+        pen.ceil() as i32
     }
 
     /// The finished frame, row by row, for copying to a scanout buffer.

@@ -125,6 +125,10 @@ pub struct Node {
     /// Text content, with surrounding whitespace collapsed.
     pub text: String,
     pub children: Vec<usize>,
+    /// The enclosing element, or `None` for the root. Styling inherits, so
+    /// resolving how a node is drawn means walking up until an ancestor has an
+    /// opinion.
+    pub parent: Option<usize>,
 }
 
 impl Node {
@@ -163,6 +167,20 @@ impl Tree {
 
     pub fn node(&self, index: usize) -> &Node {
         &self.nodes[index]
+    }
+
+    /// The nearest value of an inheriting attribute, searching up the tree.
+    ///
+    /// Styling inherits so a window can set a font once rather than every
+    /// element repeating it. The nearest ancestor wins, which is what makes a
+    /// local override work.
+    pub fn inherited(&self, mut index: usize, name: &str) -> Option<&str> {
+        loop {
+            if let Some(value) = self.nodes[index].attr(name) {
+                return Some(value);
+            }
+            index = self.nodes[index].parent?;
+        }
     }
 
     /// Find a node by its id.
@@ -249,7 +267,13 @@ impl<'a> Parser<'a> {
 
         let attrs = self.attributes()?;
         let index = self.nodes.len();
-        self.nodes.push(Node { tag, attrs, text: String::new(), children: Vec::new() });
+        self.nodes.push(Node {
+            tag,
+            attrs,
+            text: String::new(),
+            children: Vec::new(),
+            parent: None,
+        });
 
         self.skip_space();
         if self.peek() == Some(b'/') {
@@ -313,6 +337,7 @@ impl<'a> Parser<'a> {
             }
 
             let child = self.element()?;
+            self.nodes[child].parent = Some(index);
             self.nodes[index].children.push(child);
         }
     }

@@ -11,21 +11,24 @@
 
 use crate::awml::{self, Tag, Tree};
 use crate::input::{Button, Event, Key};
+use crate::paint::font::{Fonts, Style};
 use crate::paint::{Canvas, Rect};
 use crate::ui::{self, Layout};
 
 /// What an application would send. Everything here is an affordance: an id, a
 /// description of what it does, and its state. Nothing describes appearance.
-const DOCUMENT: &str = r#"
-<window title="Messages">
+const DOCUMENT: &str = r##"
+<window title="Messages" font="sans">
   <vstack gap="lg">
     <text role="heading">Compose</text>
+    <text role="caption" color="muted" italic="true">real outline type, styled by the application</text>
 
     <group label="Recipient">
       <field id="to" placeholder="name@example.com"
              description="Address the message will be sent to" value=""/>
       <checkbox id="copy-self" label="Send me a copy"
                 description="Also deliver this message to your own inbox"/>
+      <text font="mono" size="sm" color="#7fd6a0">mono 12px  #7fd6a0  0123456789</text>
     </group>
 
     <group label="Message">
@@ -38,7 +41,7 @@ const DOCUMENT: &str = r#"
               description="Sends the composed message to its recipient"/>
       <button id="discard" label="Discard" emphasis="danger"
               description="Throws away the draft without sending it"/>
-      <text grow="true" emphasis="muted">click a control to focus it</text>
+      <text grow="true" color="muted">click a control to focus it</text>
       <button id="help" label="Help"
               description="Explains what this window is for"/>
     </hstack>
@@ -55,7 +58,7 @@ const DOCUMENT: &str = r#"
     </list>
   </vstack>
 </window>
-"#;
+"##;
 
 pub struct Client {
     tree: Tree,
@@ -67,9 +70,9 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(area: Rect) -> Result<Self, awml::Error> {
+    pub fn new(fonts: &Fonts, area: Rect) -> Result<Self, awml::Error> {
         let tree = awml::parse(DOCUMENT)?;
-        let layout = ui::layout(&tree, area);
+        let layout = ui::layout(fonts, &tree, area);
         Ok(Self { tree, layout, focus: None, last: "nothing yet".into() })
     }
 
@@ -91,9 +94,9 @@ impl Client {
         self.tree.by_id(id).map(|index| self.layout.rect_of(index))
     }
 
-    pub fn handle(&mut self, event: Event) {
+    pub fn handle(&mut self, fonts: &Fonts, event: Event) {
         match event {
-            Event::ButtonPressed { button: Button::Left, x, y } => self.click(x, y),
+            Event::ButtonPressed { button: Button::Left, x, y } => self.click(fonts, x, y),
 
             Event::KeyPressed(key) => {
                 let Some(index) = self.focus else { return };
@@ -126,7 +129,7 @@ impl Client {
     /// This is the same sequence an agent's intent will follow: find the node,
     /// refuse if it is disabled, then act. Doing it this way now means the
     /// agent path is not a second implementation that can disagree.
-    fn click(&mut self, x: i32, y: i32) {
+    fn click(&mut self, fonts: &Fonts, x: i32, y: i32) {
         let Some(index) = self.layout.hit(&self.tree, x, y) else {
             self.focus = None;
             self.last = format!("clicked nothing at {x}, {y}");
@@ -166,7 +169,7 @@ impl Client {
 
         // A control changing state can change how much room it needs, so the
         // tree is laid out again rather than patched.
-        self.relayout();
+        self.relayout(fonts);
     }
 
     fn id_of(&self, index: usize) -> String {
@@ -181,15 +184,15 @@ impl Client {
         }
     }
 
-    fn relayout(&mut self) {
+    fn relayout(&mut self, fonts: &Fonts) {
         let area = self.layout.rect_of(Tree::ROOT);
-        self.layout = ui::layout(&self.tree, area);
+        self.layout = ui::layout(fonts, &self.tree, area);
     }
 
-    pub fn draw(&self, canvas: &mut Canvas) {
+    pub fn draw(&self, canvas: &mut Canvas, fonts: &Fonts) {
         canvas.clear(ui::BACKGROUND);
-        ui::paint(canvas, &self.tree, &self.layout, self.focus);
-        self.draw_status(canvas);
+        ui::paint(canvas, fonts, &self.tree, &self.layout, self.focus);
+        self.draw_status(canvas, fonts);
     }
 
     /// A readout of the agent-facing view of whatever has focus.
@@ -197,7 +200,7 @@ impl Client {
     /// Drawn here because it is the thing worth checking: that layout produced
     /// a usable rectangle, that hit testing found the node under the pointer,
     /// and that the actions offered match the element's state.
-    fn draw_status(&self, canvas: &mut Canvas) {
+    fn draw_status(&self, canvas: &mut Canvas, fonts: &Fonts) {
         let height = 96;
         let panel = Rect::new(0, canvas.height() - height, canvas.width(), height);
         canvas.fill_rect(panel, ui::SURFACE);
@@ -206,17 +209,19 @@ impl Client {
         let x = 16;
         let mut y = panel.y + 12;
 
-        canvas.draw_text(&format!("last: {}", self.last), x, y, 2, ui::TEXT);
+        let mono = Style { family: crate::paint::font::Family::Mono, size: 14.0, ..Style::default() };
+        canvas.draw_text(fonts, &format!("last: {}", self.last), x, y, &mono, ui::TEXT);
         y += 22;
 
         let Some(index) = self.focus else {
-            canvas.draw_text("focus: none", x, y, 2, ui::MUTED);
+            canvas.draw_text(fonts, "focus: none", x, y, &mono, ui::MUTED);
             return;
         };
 
         let node = self.tree.node(index);
         let rect = self.layout.rect_of(index);
         canvas.draw_text(
+            fonts,
             &format!(
                 "focus: <{}> id={} at {},{} {}x{}",
                 node.tag.name(),
@@ -228,17 +233,18 @@ impl Client {
             ),
             x,
             y,
-            2,
+            &mono,
             ui::TEXT,
         );
         y += 22;
 
         let actions = node.tag.actions(node.disabled()).join(" ");
         canvas.draw_text(
+            fonts,
             &format!("actions: {}", if actions.is_empty() { "none" } else { &actions }),
             x,
             y,
-            2,
+            &mono,
             ui::ACCENT,
         );
     }
