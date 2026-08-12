@@ -14,17 +14,16 @@
 use std::collections::HashMap;
 use std::io::{self, IoSlice, Read, Write};
 use std::mem::MaybeUninit;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 
 use rustix::event::epoll;
 use rustix::net::{self, SendAncillaryBuffer, SendAncillaryMessage};
 
+use awproto::{self as proto, Decoder, ROLE_HAIMANAGER, SOCKET_PATH};
+
 use crate::desk::Desks;
 use crate::klog::{kerr, kinfo, kwarn};
-use crate::proto::{self, Decoder};
-
-pub const SOCKET_PATH: &str = "/run/agentware/sup.sock";
 
 /// epoll token for the listener. Connections use their own fd as their token,
 /// which is unique for as long as the fd is open.
@@ -160,7 +159,17 @@ impl Control {
     /// byte buffer would detach it from the frame that explains it.
     pub fn hand_over(&mut self, role: &str, fields: &[&str], fd: BorrowedFd<'_>) -> Result<(), String> {
         let target = *self.roles.get(role).ok_or_else(|| format!("no {role} is registered"))?;
-        let conn = self.conns.get(&target).ok_or_else(|| format!("{role} has gone away"))?;
+        self.send_with_fd(target, fields, fd)
+    }
+
+    /// Send one frame with a descriptor attached to a specific connection.
+    fn send_with_fd(
+        &mut self,
+        target: RawFd,
+        fields: &[&str],
+        fd: BorrowedFd<'_>,
+    ) -> Result<(), String> {
+        let conn = self.conns.get(&target).ok_or_else(|| "connection has gone away".to_owned())?;
 
         let frame = proto::encode(fields);
 
@@ -172,7 +181,7 @@ impl Control {
         }
 
         net::sendmsg(&conn.stream, &[IoSlice::new(&frame)], &mut control, net::SendFlags::empty())
-            .map_err(|err| format!("could not send descriptor to {role}: {err}"))?;
+            .map_err(|err| format!("could not send descriptor: {err}"))?;
 
         Ok(())
     }
@@ -206,9 +215,22 @@ impl Control {
 
                 match conn.decoder.next_frame() {
                     Ok(Some(fields)) => {
-                        let reply = self.dispatch(fd, &fields, desks);
+                        let (reply, attached) = self.dispatch(fd, &fields, desks);
                         let borrowed: Vec<&str> = reply.iter().map(String::as_str).collect();
-                        self.send(fd, &proto::encode(&borrowed), epoll);
+
+                        match attached {
+                            // A descriptor belongs to one specific frame, so a
+                            // reply carrying one is sent directly rather than
+                            // appended to the pending byte buffer.
+                            Some(handed) => {
+                                if let Err(err) =
+                                    self.send_with_fd(fd, &borrowed, handed.as_fd())
+                                {
+                                    kwarn!("could not deliver reply descriptor: {err}");
+                                }
+                            }
+                            None => self.send(fd, &proto::encode(&borrowed), epoll),
+                        }
                     }
                     Ok(None) => break,
                     Err(err) => {
@@ -283,7 +305,14 @@ impl Control {
 ///
 /// Every failure is an error frame rather than a panic or an exit. A malformed
 /// request from a confused client must never be able to take PID 1 down.
-    fn dispatch(&mut self, from: RawFd, fields: &[String], desks: &mut Desks) -> Vec<String> {
+    fn dispatch(
+        &mut self,
+        from: RawFd,
+        fields: &[String],
+        desks: &mut Desks,
+    ) -> (Vec<String>, Option<OwnedFd>) {
+        let mut attach: Option<OwnedFd> = None;
+
     let verb = fields.first().map(String::as_str).unwrap_or("");
     let arg = |index: usize| fields.get(index).map(String::as_str);
 
@@ -303,14 +332,7 @@ impl Control {
         "create-desk" => {
             let prompt = arg(1).filter(|text| !text.is_empty());
             desks.create(prompt).map(|(id, ui_end)| {
-                // Connect the new workspace to the compositor. Failing this is
-                // not fatal today, because there is no ui-manager yet and a
-                // workspace with no display is still better than no workspace.
-                if let Err(err) =
-                    self.hand_over("ui-manager", &["desk-attached", &id.to_string()], ui_end.as_fd())
-                {
-                    kwarn!("desk {id}: not attached to a compositor: {err}");
-                }
+                self.attach_to_display(&["desk-attached", &id.to_string()], ui_end, id);
                 vec![id.to_string()]
             })
         }
@@ -318,13 +340,32 @@ impl Control {
         "open-app" => {
             let id = parse_id(1);
             let app = arg(2).ok_or_else(|| "missing app name".to_owned());
-            id.and_then(|id| app.and_then(|app| desks.open_app(id, app)))
-                .map(|pid| vec![pid.to_string()])
+            id.and_then(|id| app.and_then(|app| desks.open_app(id, app).map(|r| (id, app, r))))
+                .map(|(id, app, (pid, ui_end))| {
+                    // The workspace id travels with the descriptor so the
+                    // haimanager knows which workspace to render the app into
+                    // and which agent is allowed to see it.
+                    let fields =
+                        ["app-attached", &id.to_string(), app, &pid.to_string()].map(String::from);
+                    let borrowed: Vec<&str> = fields.iter().map(String::as_str).collect();
+                    self.attach_to_display(&borrowed, ui_end, id);
+                    vec![pid.to_string()]
+                })
         }
 
-        "start-agent" => parse_id(1)
-            .and_then(|id| desks.start_agent(id))
-            .map(|pid| vec![pid.to_string()]),
+        "start-agent" => parse_id(1).and_then(|id| desks.start_agent(id)).map(
+            |(pid, ui_end, desk_end)| {
+                let fields = ["agent-attached", &id_text(fields), &pid.to_string()].map(String::from);
+                let borrowed: Vec<&str> = fields.iter().map(String::as_str).collect();
+                self.attach_to_display(&borrowed, ui_end, 0);
+
+                // The agentdesk's private channel to its agent goes back on this
+                // reply. Conversation history flows down it and telemetry back
+                // up it, so neither ever passes through PID 1.
+                attach = Some(desk_end);
+                vec![pid.to_string()]
+            },
+        ),
 
         "interrupt" => parse_id(1).and_then(|id| desks.interrupt(id)).map(|()| vec![]),
 
@@ -339,12 +380,28 @@ impl Control {
         Ok(mut data) => {
             let mut reply = vec!["ok".to_owned()];
             reply.append(&mut data);
-            reply
+            (reply, attach)
         }
         Err(message) => {
             kerr!("control request {verb:?} failed: {message}");
-            vec!["err".to_owned(), message]
+            (vec!["err".to_owned(), message], None)
+        }
+    }
+    }
+
+    /// Hand a freshly created process's descriptor to the compositor.
+    ///
+    /// Failing is not fatal: there is no haimanager yet, and a workspace with no
+    /// display is still better than no workspace. It becomes an error worth
+    /// acting on once the graphical stack exists.
+    fn attach_to_display(&mut self, fields: &[&str], fd: OwnedFd, desk: u32) {
+        if let Err(err) = self.hand_over(ROLE_HAIMANAGER, fields, fd.as_fd()) {
+            kwarn!("desk {desk}: not attached to a display: {err}");
         }
     }
 }
+
+/// The desk id out of a request that has already been parsed once.
+fn id_text(fields: &[String]) -> String {
+    fields.get(1).cloned().unwrap_or_default()
 }

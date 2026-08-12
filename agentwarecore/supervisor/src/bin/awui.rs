@@ -1,16 +1,20 @@
 //! A stand-in compositor, used to prove the descriptor handoff works before the
-//! real `ui-manager` exists.
+//! real `haimanager` exists.
 //!
-//! It does what `ui-manager` will do at startup: connect to the supervisor's
-//! control socket and register as `ui-manager`. Registering is what marks it
+//! It does what `haimanager` will do at startup: connect to the supervisor's
+//! control socket and register as `haimanager`. Registering is what marks it
 //! ready, so anything that depends on the compositor starts only after this.
 //!
-//! Then it waits for the supervisor to push it descriptors. Each one arrives as
-//! ancillary data on a `desk-attached` frame and is already connected to a new
-//! agentdesk. Reading a message off one proves the workspace and the compositor
-//! are talking over a socket neither of them ever opened by path.
+//! Then it waits for the supervisor to push it descriptors. Each arrives as
+//! ancillary data on a frame naming what it is: a `desk-attached`, an
+//! `app-attached` or an `agent-attached`. Each descriptor is already connected
+//! to the process in question, over a socket neither side ever opened by path.
 //!
-//! Usage: awui [expected_desks]
+//! Only workspaces greet, so only those are read from. What matters for the
+//! others is that the descriptor arrives at all, tagged with the workspace it
+//! belongs to, since that tag is what scopes an agent to its own desk.
+//!
+//! Usage: awui [expected_attachments]
 
 use std::io::{IoSliceMut, Read, Write};
 use std::mem::MaybeUninit;
@@ -18,11 +22,8 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
-use rustix::net::{
-    RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, recvmsg,
-};
-
-const SOCKET: &str = "/run/agentware/sup.sock";
+use awproto::{ROLE_HAIMANAGER, SOCKET_PATH, encode, read_frame};
+use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, recvmsg};
 
 /// A bound on every blocking read, so a broken handoff fails the self-test
 /// instead of hanging the machine until someone notices.
@@ -34,7 +35,7 @@ fn main() {
         .and_then(|value| value.parse().ok())
         .unwrap_or(2);
 
-    let mut stream = match UnixStream::connect(SOCKET) {
+    let mut stream = match UnixStream::connect(SOCKET_PATH) {
         Ok(stream) => stream,
         Err(err) => {
             eprintln!("awui: FAIL cannot reach the supervisor: {err}");
@@ -49,35 +50,51 @@ fn main() {
         eprintln!("awui: FAIL {err}");
         std::process::exit(1);
     }
-    eprintln!("awui: registered as ui-manager");
+    eprintln!("awui: registered as {ROLE_HAIMANAGER}");
 
     let mut received = 0;
     let mut failures = 0;
+    let mut held: Vec<OwnedFd> = Vec::new();
 
     while received < expected {
-        match accept_handoff(&stream) {
-            Ok((fields, fd)) => {
-                received += 1;
-                match read_greeting(fd) {
-                    Ok(text) => {
-                        eprintln!("awui: PASS {} -> workspace says {text:?}", fields.join(" "));
-                    }
-                    Err(err) => {
-                        eprintln!("awui: FAIL {} -> {err}", fields.join(" "));
-                        failures += 1;
-                    }
-                }
-            }
+        let (fields, fd) = match accept_handoff(&stream) {
+            Ok(handoff) => handoff,
             Err(err) => {
-                eprintln!("awui: FAIL waiting for a workspace handoff: {err}");
+                eprintln!("awui: FAIL waiting for a handoff: {err}");
                 failures += 1;
                 break;
+            }
+        };
+        received += 1;
+        let label = fields.join(" ");
+
+        match fields.first().map(String::as_str) {
+            // Workspaces greet as soon as they start, so the descriptor can be
+            // proven live rather than merely delivered.
+            Some("desk-attached") => match read_greeting(fd) {
+                Ok(text) => eprintln!("awui: PASS {label} -> workspace says {text:?}"),
+                Err(err) => {
+                    eprintln!("awui: FAIL {label} -> {err}");
+                    failures += 1;
+                }
+            },
+
+            // Apps and agents are held open. Their arrival, tagged with the
+            // workspace, is the whole claim being tested.
+            Some("app-attached") | Some("agent-attached") => {
+                held.push(fd);
+                eprintln!("awui: PASS {label}");
+            }
+
+            _ => {
+                eprintln!("awui: FAIL unexpected handoff {label}");
+                failures += 1;
             }
         }
     }
 
     if failures == 0 && received == expected {
-        eprintln!("awui: all {received} workspace handoff(s) arrived over passed descriptors");
+        eprintln!("awui: all {received} handoff(s) arrived over passed descriptors");
         std::process::exit(0);
     }
 
@@ -86,22 +103,14 @@ fn main() {
 }
 
 fn register(stream: &mut UnixStream) -> Result<(), String> {
-    let body = "register\0ui-manager";
-    let mut frame = (body.len() as u32).to_le_bytes().to_vec();
-    frame.extend_from_slice(body.as_bytes());
-    stream.write_all(&frame).map_err(|err| format!("register write: {err}"))?;
+    stream
+        .write_all(&encode(&["register", ROLE_HAIMANAGER]))
+        .map_err(|err| format!("register write: {err}"))?;
 
-    let mut header = [0u8; 4];
-    stream.read_exact(&mut header).map_err(|err| format!("register reply: {err}"))?;
-    let len = u32::from_le_bytes(header) as usize;
-    let mut body = vec![0u8; len];
-    stream.read_exact(&mut body).map_err(|err| format!("register reply body: {err}"))?;
-
-    let text = String::from_utf8_lossy(&body);
-    let mut fields = text.split('\0');
-    match fields.next() {
+    let reply = read_frame(stream).map_err(|err| format!("register reply: {err}"))?;
+    match reply.first().map(String::as_str) {
         Some("ok") => Ok(()),
-        _ => Err(format!("supervisor refused registration: {text}")),
+        _ => Err(format!("supervisor refused registration: {}", reply.join(" "))),
     }
 }
 

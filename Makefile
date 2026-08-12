@@ -8,7 +8,7 @@ TARGET := x86_64-unknown-linux-musl
 .PHONY: all build buildcore buildsupervisor pack run selftest clean
 
 # Shared QEMU invocation. virtio-vga is what gives the guest /dev/dri/card0,
-# which ui-manager will render onto via DRM/KMS.
+# which haimanager will render onto via DRM/KMS.
 QEMU := qemu-system-x86_64 -enable-kvm -m 4G -cpu host \
 	-kernel $(KERNEL) -initrd $(INITRAMFS_ARCHIVE) \
 	-device virtio-vga -no-reboot

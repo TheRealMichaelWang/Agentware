@@ -12,18 +12,15 @@
 //!   1. filesystems  mount proc, sysfs, devtmpfs and friends
 //!   2. machine      console log level, Ctrl-Alt-Del, hostname
 //!   3. signals      block them and route them through a signalfd
-//!   4. services     start ui-manager and desktop-main        (not yet)
+//!   4. services     bind the control socket, start the service table
 //!   5. main loop    epoll over signals and the control socket
 //!   6. shutdown     stop everything, flush, unmount, power off
-//!
-//! Stages 4 and the control socket half of stage 5 land with the service table.
 
 mod cgroup;
 mod desk;
 mod early;
 mod ipc;
 mod klog;
-mod proto;
 mod reaper;
 mod selftest;
 mod service;
@@ -33,6 +30,7 @@ mod signals;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+use awproto::ROLE_HAIMANAGER;
 use rustix::event::epoll;
 
 use desk::{Desks, Programs};
@@ -52,19 +50,18 @@ const TOKEN_SIGNALS: u64 = 1;
 
 /// The services that make up the Agentware userland.
 ///
-/// `ui-manager` comes first: `desktop-main` draws through it, so starting them
-/// the other way round means the desktop fails against a compositor that is not
-/// listening yet. Neither binary exists today, and the service table logs and
-/// skips what is not installed rather than crash looping against it.
+/// `desktop-main` draws through `haimanager`, so it waits for the compositor to
+/// register on the control socket rather than merely to be forked. Table order
+/// alone would not be enough: a forked process is not a listening one.
 ///
-/// `desktop-main` waits for `ui-manager` to register on the control socket
-/// rather than merely being forked. Registering proves the compositor is
-/// serving, which is what the desktop actually needs before it tries to draw.
+/// Neither binary exists yet. The service table logs and skips what is not
+/// installed rather than crash looping against it, which is what lets the
+/// supervisor boot and be useful before the graphical stack is written.
 fn system_services() -> Vec<Service> {
     vec![
-        Service::new("ui-manager", "/bin/ui-manager", &[], RestartPolicy::Always),
+        Service::new(ROLE_HAIMANAGER, "/bin/haimanager", &[], RestartPolicy::Always),
         Service::new("desktop-main", "/bin/desktop-main", &[], RestartPolicy::Always)
-            .requires("ui-manager"),
+            .requires(ROLE_HAIMANAGER),
     ]
 }
 
@@ -99,7 +96,7 @@ fn main() {
     //
     // Level 6 keeps kernel and supervisor info messages on screen, which is
     // what we want while there is no graphical shell to look at. Drop this to
-    // `klog::WARN` at the point ui-manager takes over the display, or kernel
+    // `klog::WARN` at the point haimanager takes over the display, or kernel
     // messages will draw straight over the compositor's output.
     early::set_console_loglevel(klog::INFO);
     early::disable_ctrl_alt_del();
@@ -119,9 +116,8 @@ fn main() {
 
     let selftest = selftest::requested();
 
-    // Stage 4a: the control socket comes up before any service does, so nothing
-    // can start, try to reach the broker, and fail a race it did not know it was
-    // in.
+    // Stage 4a. Both of these come up before any service does, so nothing can
+    // start, try to reach the broker, and lose a race it did not know it was in.
     if let Err(err) = cgroup::Cgroup::init_root() {
         kwarn!("could not create the cgroup root: {err} (workspace teardown will be degraded)");
     }
@@ -152,10 +148,11 @@ fn main() {
 
 /// Wait for events and dispatch them, forever.
 ///
-/// Everything the supervisor reacts to becomes a file descriptor so it can live
-/// in one epoll set: signals via signalfd today, the control socket and service
-/// readiness pipes later. There is no polling and no busy loop, the process is
-/// asleep in `epoll_wait` whenever nothing is happening.
+/// Everything the supervisor reacts to is a file descriptor, so it all lives in
+/// one epoll set: signals via signalfd, the control socket listener, and every
+/// accepted connection. There is no polling and no busy loop; the process is
+/// asleep in `epoll_wait` whenever nothing is happening, and wakes on either an
+/// event or the soonest pending deadline.
 fn main_loop(
     mut signalfd: SignalFd,
     mut control: Control,
@@ -197,12 +194,12 @@ fn main_loop(
     }; 16];
 
     loop {
-        // Start anything whose backoff has expired, and find out when the next
-        // one is due. That deadline becomes the epoll timeout, so waiting out a
-        // backoff costs no extra file descriptor and no polling: the loop simply
-        // sleeps until either an event arrives or a restart falls due.
-        // Workspaces being torn down have deadlines of their own, so the loop
-        // wakes for whichever comes first.
+        // Drive both tables forward: services whose backoff has expired or whose
+        // dependency just became ready, and workspaces partway through teardown.
+        // Each reports when it next needs attention, and the sooner of the two
+        // becomes the epoll timeout. Waiting on a deadline therefore costs no
+        // extra file descriptor and no polling; the loop just sleeps until an
+        // event arrives or the deadline falls due.
         let deadline = soonest(services.tick(|role| control.is_ready(role)), desks.tick());
 
         if selftest && services.all_settled() && desks.is_empty() {

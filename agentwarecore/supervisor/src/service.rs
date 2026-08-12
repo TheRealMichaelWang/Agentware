@@ -4,7 +4,7 @@
 //! about. That opinion is its [`RestartPolicy`], and the policies differ by kind
 //! for reasons that come straight out of what Agentware is:
 //!
-//! * `ui-manager` and `desktop-main` restart forever. If the compositor dies,
+//! * `haimanager` and `desktop-main` restart forever. If the compositor dies,
 //!   the machine is a brick until it comes back, so giving up is never the right
 //!   answer.
 //! * An `agentdesk` restarts a bounded number of times. It is one workspace
@@ -113,7 +113,7 @@ impl Service {
     /// Hold this service back until the named one reports itself ready.
     ///
     /// Readiness is not "the process was forked", it is "the process said it is
-    /// serving". Starting `desktop-main` the instant `ui-manager` is forked
+    /// serving". Starting `desktop-main` the instant `haimanager` is forked
     /// means it tries to connect to a compositor that is not listening yet and
     /// fails, which shows up as an unexplained flicker at boot rather than as
     /// the ordering bug it is.
@@ -252,7 +252,7 @@ impl Services {
     /// Start every service, in table order.
     ///
     /// Services whose executable is missing are skipped rather than retried.
-    /// That is what lets the supervisor boot today, before `ui-manager` and
+    /// That is what lets the supervisor boot today, before `haimanager` and
     /// `desktop-main` exist: it says so and carries on instead of crash looping
     /// against a binary that was never built.
     pub fn start_all(&mut self) {
@@ -359,7 +359,7 @@ impl Services {
     /// Ask every running service to stop, in reverse table order.
     ///
     /// Reverse order matters: `desktop-main` should go down before the
-    /// `ui-manager` it draws through, so it is not writing to a socket that has
+    /// `haimanager` it draws through, so it is not writing to a socket that has
     /// just been closed. This only sends the signal; the caller waits.
     pub fn stop_all(&mut self) {
         self.stopping = true;

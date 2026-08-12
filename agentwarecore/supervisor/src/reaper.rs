@@ -47,7 +47,8 @@ impl std::fmt::Display for Exit {
 /// nothing left is what makes the count irrelevant.
 ///
 /// Returns the reaped children so the caller can match them against the service
-/// table. For now nothing owns that table, so the caller only logs them.
+/// table and the agentdesk registry. Whatever neither claims was an orphan that
+/// only ever needed collecting.
 pub fn reap_all() -> Vec<(Pid, Exit)> {
     let mut reaped = Vec::new();
 

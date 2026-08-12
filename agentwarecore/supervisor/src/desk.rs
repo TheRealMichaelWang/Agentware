@@ -25,13 +25,12 @@ use std::time::{Duration, Instant};
 use rustix::net;
 use rustix::process::{Pid, Signal, kill_process};
 
+use awproto::{DESK_FD_ENV, HAI_FD_ENV};
+
 use crate::cgroup::{self, Cgroup};
 use crate::klog::{kerr, kinfo, kwarn};
 use crate::reaper::Exit;
 use crate::signals;
-
-/// Environment variable naming the descriptor a process was handed at spawn.
-pub const HANDOFF_ENV: &str = "AGENTWARE_UI_FD";
 
 /// How long a closing workspace gets between `SIGTERM` and `cgroup.kill`.
 const CLOSE_GRACE: Duration = Duration::from_secs(3);
@@ -135,25 +134,14 @@ impl Desks {
     /// the conversation.
     ///
     /// Returns the workspace id and the compositor's end of a socket already
-    /// connected to the new agentdesk, which the caller hands to `ui-manager`.
+    /// connected to the new agentdesk, which the caller hands to `haimanager`.
     pub fn create(&mut self, prompt: Option<&str>) -> Result<(u32, OwnedFd), String> {
         let id = self.next_id;
 
         let cgroup = Cgroup::create(&format!("desk-{id}"))
             .map_err(|err| format!("could not create cgroup for desk {id}: {err}"))?;
 
-        // The two halves of the agentdesk's connection to the compositor,
-        // created before either side knows the other exists. Neither process
-        // ever opens a path, so there is no socket to race against, no
-        // filesystem permission to get wrong, and nothing for a sandboxed
-        // workspace to reach that it was not explicitly handed.
-        let (desk_end, ui_end) = net::socketpair(
-            net::AddressFamily::UNIX,
-            net::SocketType::STREAM,
-            net::SocketFlags::CLOEXEC,
-            None,
-        )
-        .map_err(|err| format!("could not create the compositor socketpair: {err}"))?;
+        let (desk_end, ui_end) = ui_socketpair()?;
 
         let (program, base_args) = &self.programs.desk;
         let mut args = base_args.clone();
@@ -162,7 +150,7 @@ impl Desks {
             args.push(text.to_owned());
         }
 
-        let pid = spawn_in(&cgroup, program, &args, Some(desk_end))
+        let pid = spawn_in(&cgroup, program, &args, vec![(HAI_FD_ENV, desk_end)])
             .map_err(|err| format!("could not start agentdesk: {err}"))?;
 
         self.next_id += 1;
@@ -184,7 +172,10 @@ impl Desks {
     /// The app name is validated rather than trusted. Everything on this socket
     /// is a local process today, but PID 1 turning an arbitrary string into a
     /// path is exactly the sort of thing worth refusing on principle.
-    pub fn open_app(&mut self, id: u32, app: &str) -> Result<i32, String> {
+    /// Returns the app's pid and the haimanager's end of a socket already
+    /// connected to it, which the caller hands over so the app is rendered into
+    /// the right workspace.
+    pub fn open_app(&mut self, id: u32, app: &str) -> Result<(i32, OwnedFd), String> {
         if !is_valid_app_name(app) {
             return Err(format!("invalid app name {app:?}"));
         }
@@ -192,13 +183,15 @@ impl Desks {
         let app_dir = self.programs.app_dir.clone();
         let desk = self.open_desk_mut(id)?;
 
+        let (app_end, ui_end) = ui_socketpair()?;
+
         let program = format!("{app_dir}/{app}");
-        let pid = spawn_in(&desk.cgroup, &program, &[], None)
+        let pid = spawn_in(&desk.cgroup, &program, &[], vec![(HAI_FD_ENV, app_end)])
             .map_err(|err| format!("could not start {program}: {err}"))?;
 
         desk.apps.push(App { name: app.to_owned(), pid });
         kinfo!("desk {id}: opened {app} as pid {pid}");
-        Ok(pid)
+        Ok((pid, ui_end))
     }
 
     /// Fork an agent process for a workspace, on that workspace's request.
@@ -213,7 +206,16 @@ impl Desks {
     /// workspace would fight over the same cursor and the same DOM. What happens
     /// to a message that arrives mid-turn, whether it queues or is injected into
     /// the running agent, is decided by the agentdesk and is invisible from here.
-    pub fn start_agent(&mut self, id: u32) -> Result<i32, String> {
+    /// Returns the agent's pid, the haimanager's end of its interface
+    /// connection, and the agentdesk's end of a private channel to it.
+    ///
+    /// Two sockets, because an agent talks to two different things. It reads
+    /// workspace state and sends intents to the haimanager, and it receives
+    /// conversation history from, and streams telemetry back to, the agentdesk
+    /// that asked for it. Neither carries a byte through PID 1, and neither
+    /// needs a path on the filesystem, which is what lets an agent be sandboxed
+    /// into its own mount namespace later without losing either channel.
+    pub fn start_agent(&mut self, id: u32) -> Result<(i32, OwnedFd, OwnedFd), String> {
         let (program, base_args) = self.programs.agent.clone();
         let desk = self.open_desk_mut(id)?;
 
@@ -221,18 +223,23 @@ impl Desks {
             return Err(format!("desk {id} already has an agent process (pid {pid})"));
         }
 
-        // The agent is told which workspace it belongs to so it can attach to
-        // it. Once fd passing lands, it will instead be handed an already
-        // connected socket and will not need to find its desk at all.
+        let (agent_ui, ui_end) = ui_socketpair()?;
+        let (agent_desk, desk_end) = ui_socketpair()?;
+
         let mut args = base_args;
         args.push(id.to_string());
 
-        let pid = spawn_in(&desk.cgroup, &program, &args, None)
-            .map_err(|err| format!("could not start agent: {err}"))?;
+        let pid = spawn_in(
+            &desk.cgroup,
+            &program,
+            &args,
+            vec![(HAI_FD_ENV, agent_ui), (DESK_FD_ENV, agent_desk)],
+        )
+        .map_err(|err| format!("could not start agent: {err}"))?;
 
         desk.agent_pid = Some(pid);
         kinfo!("desk {id}: agent started as pid {pid}");
-        Ok(pid)
+        Ok((pid, ui_end, desk_end))
     }
 
     /// Stop the running turn.
@@ -409,16 +416,16 @@ fn spawn_in(
     cgroup: &Cgroup,
     program: &str,
     args: &[String],
-    handoff: Option<OwnedFd>,
+    handoffs: Vec<(&'static str, OwnedFd)>,
 ) -> std::io::Result<i32> {
     let procs: OwnedFd = cgroup.open_procs()?;
 
     let mut command = Command::new(program);
     command.args(args);
 
-    let handoff_raw = handoff.as_ref().map(AsRawFd::as_raw_fd);
-    if let Some(raw) = handoff_raw {
-        command.env(HANDOFF_ENV, raw.to_string());
+    let raws: Vec<i32> = handoffs.iter().map(|(_, fd)| fd.as_raw_fd()).collect();
+    for (name, fd) in &handoffs {
+        command.env(name, fd.as_raw_fd().to_string());
     }
 
     // SAFETY: the closure runs in the forked child before exec and calls only
@@ -430,7 +437,7 @@ fn spawn_in(
             rustix::process::setsid().map_err(std::io::Error::from)?;
             cgroup::join_from_child(&procs)?;
 
-            if let Some(raw) = handoff_raw {
+            for &raw in &raws {
                 // Clearing close-on-exec so the descriptor survives the exec.
                 if libc::fcntl(raw, libc::F_SETFD, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
@@ -443,12 +450,28 @@ fn spawn_in(
 
     let child = command.spawn()?;
 
-    // The parent's copy goes now that the child has one. Holding it would keep
-    // the socket alive after the workspace died, so the compositor would never
-    // see the hangup that tells it the workspace is gone.
-    drop(handoff);
+    // The parent's copies go now that the child has its own. Holding one would
+    // keep the socket alive after the process died, so the peer would never see
+    // the hangup that tells it the process is gone.
+    drop(handoffs);
 
     Ok(child.id() as i32)
+}
+
+/// One half of a connection for a process that has not been forked yet.
+///
+/// Created before either side knows the other exists. Neither process ever
+/// opens a path, so there is no socket to race against, no filesystem
+/// permission to get wrong, and nothing a sandboxed process can reach that it
+/// was not explicitly handed.
+fn ui_socketpair() -> Result<(OwnedFd, OwnedFd), String> {
+    net::socketpair(
+        net::AddressFamily::UNIX,
+        net::SocketType::STREAM,
+        net::SocketFlags::CLOEXEC,
+        None,
+    )
+    .map_err(|err| format!("could not create a socketpair: {err}"))
 }
 
 fn signal(pid: i32, sig: Signal) {

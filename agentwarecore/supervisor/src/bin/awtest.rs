@@ -74,10 +74,10 @@ fn greet_compositor(id: &str) -> Result<(), String> {
     use std::os::fd::FromRawFd;
     use std::os::unix::net::UnixStream;
 
-    let raw: i32 = std::env::var("AGENTWARE_UI_FD")
-        .map_err(|_| "AGENTWARE_UI_FD is not set".to_owned())?
+    let raw: i32 = std::env::var(awproto::HAI_FD_ENV)
+        .map_err(|_| format!("{} is not set", awproto::HAI_FD_ENV))?
         .parse()
-        .map_err(|_| "AGENTWARE_UI_FD is not a number".to_owned())?;
+        .map_err(|_| format!("{} is not a number", awproto::HAI_FD_ENV))?;
 
     // SAFETY: the supervisor guarantees this descriptor is open, is ours, and
     // is a connected stream socket.

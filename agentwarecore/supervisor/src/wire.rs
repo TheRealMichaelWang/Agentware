@@ -10,7 +10,8 @@
 //! anything else a human might type.
 //!
 //! Requests:
-//!   create-desk [prompt]
+//!   register     <role>
+//!   create-desk  [prompt]
 //!   open-app     <desk> <app>
 //!   start-agent  <desk>
 //!   interrupt    <desk>
@@ -19,8 +20,29 @@
 //!
 //! Responses are `ok` followed by zero or more result fields, or `err`
 //! followed by a message.
+//!
+//! This is a library rather than a module of the supervisor so that the
+//! stand-in binaries speak the same protocol by construction instead of by
+//! copy-paste.
 
 use std::fmt;
+use std::io::{self, Read};
+
+/// Where the supervisor listens.
+pub const SOCKET_PATH: &str = "/run/agentware/sup.sock";
+
+/// Names the descriptor connecting a process to the haimanager, by number.
+/// Every agentdesk, app and agent is handed one at spawn.
+pub const HAI_FD_ENV: &str = "AGENTWARE_HAI_FD";
+
+/// Names the descriptor connecting an agent to its owning agentdesk. Agents
+/// only. Conversation history arrives down it and telemetry goes back up it,
+/// which is why neither ever touches PID 1 or the filesystem.
+pub const DESK_FD_ENV: &str = "AGENTWARE_DESK_FD";
+
+/// The role the compositor claims. Registering under it is what marks it ready
+/// and what makes it eligible to receive workspace descriptors.
+pub const ROLE_HAIMANAGER: &str = "haimanager";
 
 /// Longest frame the supervisor will accept.
 ///
@@ -91,4 +113,25 @@ impl Decoder {
         let text = String::from_utf8(body).map_err(|_| ProtoError::NotUtf8)?;
         Ok(Some(text.split('\0').map(str::to_owned).collect()))
     }
+}
+
+/// Read one whole frame from a blocking stream.
+///
+/// Only for clients. The supervisor never blocks on a read, so it uses
+/// [`Decoder`] against non-blocking sockets instead.
+pub fn read_frame(source: &mut impl Read) -> io::Result<Vec<String>> {
+    let mut header = [0u8; HEADER];
+    source.read_exact(&mut header)?;
+
+    let len = u32::from_le_bytes(header) as usize;
+    if len > MAX_FRAME {
+        return Err(io::Error::other(ProtoError::TooLarge(len).to_string()));
+    }
+
+    let mut body = vec![0u8; len];
+    source.read_exact(&mut body)?;
+
+    let text = String::from_utf8(body)
+        .map_err(|_| io::Error::other(ProtoError::NotUtf8.to_string()))?;
+    Ok(text.split('\0').map(str::to_owned).collect())
 }

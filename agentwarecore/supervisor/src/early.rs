@@ -1,7 +1,7 @@
 //! Stage 1 and 2 of boot: bring up the virtual filesystems and put the machine
 //! into a known state.
 //!
-//! Nothing else in the userland can work until this runs. `ui-manager` needs
+//! Nothing else in the userland can work until this runs. `haimanager` needs
 //! `/dev/dri/card0` and `/dev/input/event*`, both of which only appear once
 //! devtmpfs is mounted. Note that `CONFIG_DEVTMPFS_MOUNT=y` does *not* help
 //! here: the kernel only auto-mounts devtmpfs when booting a real root
@@ -76,7 +76,8 @@ const MOUNTS: &[MountPoint] = &[
         data: Some(c"mode=1777"),
         required: false,
     },
-    // Where the supervisor's IPC socket will live once the spawn broker exists.
+    // Home of the supervisor's control socket, so it has to be a real mount
+    // rather than a directory in the initramfs image.
     MountPoint {
         source: "tmpfs",
         target: "/run",
@@ -93,8 +94,9 @@ const MOUNTS: &[MountPoint] = &[
         data: Some(c"mode=1777"),
         required: false,
     },
-    // Not used yet. Mounted now because it is how a runaway agent gets its
-    // memory and CPU capped later, and doing it at boot avoids a remount dance.
+    // One cgroup per agentdesk is created under here, which is what makes a
+    // workspace killable as a unit. Also where per-workspace resource limits
+    // will go.
     MountPoint {
         source: "cgroup2",
         target: "/sys/fs/cgroup",
@@ -134,8 +136,8 @@ pub fn mount_virtual_filesystems() -> io::Result<()> {
         }
     }
 
-    // Reserved for the supervisor control socket that desktop-main will use to
-    // request agent spawns.
+    // Holds the control socket that desktop-main and the agentdesks use to ask
+    // the supervisor to fork things.
     if let Err(err) = fs::create_dir_all("/run/agentware") {
         kwarn!("could not create /run/agentware: {err}");
     }
@@ -180,7 +182,7 @@ pub fn unrestrict_kmsg() {
 /// takes the lowest severity that should remain visible and adds the one
 /// itself: passing `klog::INFO` shows info and everything more severe.
 ///
-/// Once `ui-manager` owns the display this should drop to `klog::WARN`,
+/// Once `haimanager` owns the display this should drop to `klog::WARN`,
 /// otherwise kernel messages will scribble over the compositor's framebuffer.
 pub fn set_console_loglevel(min_visible: u8) {
     let value = min_visible.saturating_add(1);
@@ -218,8 +220,8 @@ pub fn set_hostname(name: &str) {
 
 /// Log what the kernel actually gave us.
 ///
-/// This is the milestone 1 acceptance check. If `/dev/dri/card0` is missing,
-/// `ui-manager` has nothing to render onto and there is no point going further,
+/// If `/dev/dri/card0` is missing,
+/// `haimanager` has nothing to render onto and there is no point going further,
 /// so it is worth saying loudly at boot rather than debugging it later through
 /// a compositor that will not start.
 pub fn boot_report() {
@@ -228,7 +230,7 @@ pub fn boot_report() {
 
     match count_dir_entries("/dev/dri") {
         Some(n) if n > 0 => kinfo!("DRM: /dev/dri present with {n} node(s)"),
-        _ => kerr!("DRM: no /dev/dri nodes, ui-manager will have no display"),
+        _ => kerr!("DRM: no /dev/dri nodes, haimanager will have no display"),
     }
 
     match count_matching("/dev/input", "event") {

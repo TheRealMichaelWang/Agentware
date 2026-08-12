@@ -9,11 +9,10 @@
 //! supervisor, so the framing, the partial-read handling and the dispatch all
 //! get exercised for real.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::net::UnixStream;
 
-const SOCKET: &str = "/run/agentware/sup.sock";
-const HEADER: usize = 4;
+use awproto::{SOCKET_PATH, encode, read_frame};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -138,27 +137,13 @@ struct Conn {
 
 impl Conn {
     fn open() -> Result<Self, String> {
-        UnixStream::connect(SOCKET)
+        UnixStream::connect(SOCKET_PATH)
             .map(|stream| Self { stream })
-            .map_err(|err| format!("connect to {SOCKET}: {err}"))
+            .map_err(|err| format!("connect to {SOCKET_PATH}: {err}"))
     }
 
     fn request(&mut self, fields: &[&str]) -> Result<Vec<String>, String> {
-        let body = fields.join("\0");
-        let mut frame = Vec::with_capacity(HEADER + body.len());
-        frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
-        frame.extend_from_slice(body.as_bytes());
-
-        self.stream.write_all(&frame).map_err(|err| format!("write: {err}"))?;
-
-        let mut header = [0u8; HEADER];
-        self.stream.read_exact(&mut header).map_err(|err| format!("read header: {err}"))?;
-
-        let len = u32::from_le_bytes(header) as usize;
-        let mut body = vec![0u8; len];
-        self.stream.read_exact(&mut body).map_err(|err| format!("read body: {err}"))?;
-
-        let text = String::from_utf8(body).map_err(|_| "reply is not UTF-8".to_owned())?;
-        Ok(text.split('\0').map(str::to_owned).collect())
+        self.stream.write_all(&encode(fields)).map_err(|err| format!("write: {err}"))?;
+        read_frame(&mut self.stream).map_err(|err| format!("read reply: {err}"))
     }
 }

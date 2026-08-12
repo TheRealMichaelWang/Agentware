@@ -27,7 +27,8 @@ const HANDLED: &[libc::c_int] = &[
     libc::SIGTERM,
     // Ctrl-Alt-Del, once the kernel's own handling is disabled.
     libc::SIGINT,
-    // Reserved for reload and reboot requests.
+    // Poweroff and reboot, for callers that would rather be explicit than rely
+    // on SIGTERM's default meaning.
     libc::SIGUSR1,
     libc::SIGUSR2,
     // The kernel's "power is failing" notification.
