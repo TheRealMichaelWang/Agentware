@@ -4,10 +4,13 @@
 //! Agentware that touches any of them. Everything else describes what it wants
 //! shown as AWML and receives events back.
 //!
-//! Milestone 1 is display bring-up only: take the card, set a mode, and paint a
-//! test pattern that makes rendering mistakes visible at a glance.
+//! Milestone 2: the display is up and there is a software rasterizer on top of
+//! it. What is drawn is still a fixed specimen sheet rather than anything a
+//! client asked for.
 
 mod drm;
+mod paint;
+mod specimen;
 
 use std::io::Write;
 use std::os::unix::net::UnixStream;
@@ -34,59 +37,25 @@ fn main() {
         }
     };
 
-    let fb = display.framebuffer();
-    log(&format!(
-        "display up: {}x{} mode {:?} stride {}px",
-        fb.width(),
-        fb.height(),
-        display.mode_name(),
-        display.framebuffer().stride()
-    ));
+    let (width, height) = {
+        let fb = display.framebuffer();
+        (fb.width(), fb.height())
+    };
+    log(&format!("display up: {width}x{height} mode {:?}", display.mode_name()));
 
-    test_pattern(display.framebuffer());
-    if let Err(err) = display.flush() {
-        log(&format!("FATAL: could not flush the framebuffer: {err}"));
+    let mut canvas = paint::Canvas::new(width, height);
+    specimen::draw(&mut canvas);
+
+    if let Err(err) = display.present_canvas(&canvas) {
+        log(&format!("FATAL: could not present: {err}"));
         std::process::exit(1);
     }
-    log("test pattern painted");
+    log("specimen sheet presented");
 
     // Nothing to do yet, but the display only lives as long as this process: the
     // `Display` drop handler restores the previous mode, so exiting here would
     // blank the screen we just brought up.
     park();
-}
-
-/// A pattern chosen so the three ways this can go wrong are visible instantly.
-///
-/// * Four colour bars, in order red, green, blue, white. Wrong channel order
-///   shows up as the wrong colour in the wrong place, which a gradient would
-///   hide.
-/// * A one-pixel white border. If pitch is being confused with width, the right
-///   edge shears diagonally instead of running straight down.
-/// * A white diagonal from corner to corner, which is straight only if the
-///   geometry is right.
-fn test_pattern(fb: &mut drm::Framebuffer) {
-    const RED: u32 = 0x00FF_0000;
-    const GREEN: u32 = 0x0000_FF00;
-    const BLUE: u32 = 0x0000_00FF;
-    const WHITE: u32 = 0x00FF_FFFF;
-
-    let (width, height) = (fb.width(), fb.height());
-
-    fb.fill(|x, y| {
-        if x == 0 || y == 0 || x == width - 1 || y == height - 1 {
-            return WHITE;
-        }
-        if x * height == y * width {
-            return WHITE;
-        }
-        match x * 4 / width {
-            0 => RED,
-            1 => GREEN,
-            2 => BLUE,
-            _ => WHITE,
-        }
-    });
 }
 
 fn register() -> Result<(), String> {

@@ -56,22 +56,6 @@ impl Framebuffer {
         unsafe { std::slice::from_raw_parts_mut(self.pixels, self.bytes / 4) }
     }
 
-    pub fn stride(&self) -> usize {
-        self.stride
-    }
-
-    /// Fill every visible pixel using a function of position.
-    pub fn fill(&mut self, mut shade: impl FnMut(usize, usize) -> u32) {
-        let (width, height, stride) = (self.width, self.height, self.stride);
-        let pixels = self.pixels();
-
-        for y in 0..height {
-            let row = y * stride;
-            for x in 0..width {
-                pixels[row + x] = shade(x, y);
-            }
-        }
-    }
 }
 
 /// A display, held open for as long as the haimanager runs.
@@ -122,6 +106,26 @@ impl Display {
 
     pub fn framebuffer(&mut self) -> &mut Framebuffer {
         &mut self.front
+    }
+
+    /// Copy a finished frame to the screen.
+    ///
+    /// One pass over the canvas, row by row, because the scanout buffer's rows
+    /// are `stride` pixels apart and the canvas's are `width` apart. Then the
+    /// framebuffer is marked dirty, without which virtual hardware never
+    /// transfers it; see [`uapi::FbDirty`].
+    pub fn present_canvas(&mut self, canvas: &crate::paint::Canvas) -> io::Result<()> {
+        let stride = self.front.stride;
+        let width = self.front.width.min(canvas.width() as usize);
+        let height = self.front.height.min(canvas.height() as usize);
+        let pixels = self.front.pixels();
+
+        for (y, row) in canvas.rows().take(height).enumerate() {
+            let start = y * stride;
+            pixels[start..start + width].copy_from_slice(&row[..width]);
+        }
+
+        self.flush()
     }
 
     /// Push what has been drawn to the screen.
