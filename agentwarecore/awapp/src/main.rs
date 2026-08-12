@@ -362,7 +362,6 @@ impl App {
             out,
             r#"<window title="{title}" font="sans">
   <vstack gap="lg" grow="true">
-    <text role="heading">{title}</text>
     <text role="caption" color="muted">{status}</text>
 
     <group label="Recipient">
@@ -382,7 +381,7 @@ impl App {
               description="Sends the composed message to its recipient"/>
       <button id="discard" label="Discard" emphasis="danger"
               description="Throws away the draft without sending it"/>
-      <text grow="true" color="muted">tab moves focus, the wheel scrolls the list</text>
+      <text grow="true"></text>
     </hstack>
 
     <divider/>
@@ -433,28 +432,13 @@ impl App {
         let _ = write!(
             out,
             r##"<window title="Workspace {desk}" font="sans">
-  <vstack region="background">
-    <text role="heading" color="#191f2c">agentware</text>
-  </vstack>
-
-  <hstack region="taskbar" gap="sm">
-    <button id="launch-mail" label="Mail" description="Opens the Mail application in this workspace"/>
-    <button id="launch-notes" label="Notes" description="Opens the Notes application in this workspace"/>
-    <text grow="true" role="caption" color="muted">{running}</text>
-    <text role="caption" color="muted">{status}</text>
-  </hstack>
-
   <vstack region="pane" gap="sm">
     <text role="subheading">Conversation</text>
+    <text role="caption" color="muted">{status}</text>
     <scroll grow="true">
       <vstack gap="sm">
 "##,
             desk = self.desk,
-            running = display::escape(&if self.open.is_empty() {
-                "no applications open".to_owned()
-            } else {
-                format!("{} open: {}", self.open.len(), self.open.join(", "))
-            }),
             status = display::escape(&self.status),
         );
 

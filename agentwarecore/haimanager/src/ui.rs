@@ -424,8 +424,12 @@ fn bounded(tag: Tag) -> bool {
 ///
 /// A window is padded but not framed: content should not sit flush against the
 /// side of the screen, but the window itself draws nothing but background.
-fn padded(tag: Tag) -> bool {
-    matches!(tag, Tag::Dialog | Tag::Window)
+///
+/// `pad="none"` opts out. It exists for documents whose frame is already exact,
+/// which today means the compositor's own chrome: the navigation bar is sized to
+/// its content and double-padding it pushed the buttons out of the bar.
+fn padded(node: &Node) -> bool {
+    matches!(node.tag, Tag::Dialog | Tag::Window) && node.attr("pad") != Some("none")
 }
 
 /// Elements that confine their children to their own rectangle.
@@ -465,7 +469,7 @@ fn measure(fonts: &Fonts, tree: &Tree, index: usize, width: i32) -> i32 {
         // takes exactly the room it needs and never scrolls. It only scrolls
         // once something gives it less than that, which is what `grow` does.
         _ => {
-            let padding = if padded(node.tag) { PADDING * 2 } else { 0 };
+            let padding = if padded(node) { PADDING * 2 } else { 0 };
             let inner = width - padding;
             let gap = gap_of(node);
 
@@ -531,7 +535,7 @@ impl Placer<'_> {
 
         let node = tree.node(index);
         let tag = node.tag;
-        let padding = if padded(tag) { PADDING } else { 0 };
+        let padding = if padded(node) { PADDING } else { 0 };
         let mut inner = area.inset(padding);
 
         // A container that labels itself takes the top of the space before the

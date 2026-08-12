@@ -99,19 +99,21 @@ make run         # boot in a QEMU window
 make pack        # build and pack the initramfs without booting
 ```
 
-The guest display is 1600x1000. It comes from `virtio-vga`'s `xres`/`yres`,
-which default to 1280x800, and the compositor takes whatever the driver reports
-as its preferred mode, so those two numbers are the whole of it:
+The guest display is sized by asking the host: `make run` reads the desktop
+resolution from `xrandr` and subtracts a margin for window decorations, so the
+QEMU window comes up as large as the monitor allows. The boot line prints what
+was chosen and what the host reported, so a wrong size is visible rather than a
+mystery. With no X display to ask it falls back to 1600x1000, and both numbers
+can still be forced:
 
 ```
 make run DISPLAY_W=2560 DISPLAY_H=1440
 tools/screenshot.py out.png --width 2560 --height 1440
 ```
 
-1600x1000 rather than something larger because the QEMU window is exactly this
-many host pixels and has to fit on the monitor with its decorations. `zoom-to-fit`
-is off: with it on, a host that cannot fit the window shrinks it and scales the
-guest into it, so raising the resolution makes no visible difference at all.
+`zoom-to-fit` is off: with it on, a host that cannot fit the window shrinks it
+and scales the guest into it, so raising the resolution makes no visible
+difference at all, which cost two rounds of "the window is no bigger".
 
 Raising it changes how much fits and nothing else. Type stays the same number of
 pixels, so a bigger display is more room rather than larger controls. There is no
@@ -130,6 +132,11 @@ Once it is up, F1 cycles workspaces, standing in for the start menu, F2 toggles 
 diagnostic overlay listing every connection and the version it is on, and F3
 folds the conversation pane away. Windows have a title bar with the usual three
 controls and can be dragged; the dock along the bottom switches between them.
+
+The agentdesk's `taskbar` region is parked at zero height for now. The strip
+duplicated the dock and spent a full-width band doing it. The region stays in
+the protocol and the layout path, so nothing breaks when a desk declares it; it
+gets no room until there is a design worth giving room to.
 The taskbar's launcher and the pane's Send button both go through the real
 broker, so clicking them forks real processes: Send starts an agent turn, which
 is the whole of milestone 7 running against a live screen. The kernel log carries

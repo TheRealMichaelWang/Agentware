@@ -11,13 +11,21 @@ BIN_DIR := $(AW_CORE_DIR)/target/$(TARGET)/release
 # Guest display size. virtio-vga defaults to 1280x800 and the compositor takes
 # the driver's preferred mode, so these two numbers are the whole of it.
 #
-# 1600x1000 rather than something larger because the QEMU window is exactly this
-# many host pixels and has to fit on the monitor with its decorations. A window
-# the host has to shrink is a window that ends up no bigger than it started.
+# The host screen is asked rather than guessed. Every hardcoded default so far
+# has been wrong on the actual monitor: too small looks cramped, too large gets
+# clipped by the window manager. xrandr answers in the same session `make run`
+# opens the QEMU window in, and the margins cover decorations and the WSLg
+# taskbar. If there is no X display to ask, fall back to something safe.
 #
 # Override per run: make run DISPLAY_W=2560 DISPLAY_H=1440
+HOST_PX := $(shell xrandr --current 2>/dev/null | sed -n 's/.*current \([0-9]\+\) x \([0-9]\+\).*/\1x\2/p' | head -1)
+ifneq ($(HOST_PX),)
+DISPLAY_W ?= $(shell expr $(word 1,$(subst x, ,$(HOST_PX))) - 24)
+DISPLAY_H ?= $(shell expr $(word 2,$(subst x, ,$(HOST_PX))) - 120)
+else
 DISPLAY_W ?= 1600
 DISPLAY_H ?= 1000
+endif
 
 # Shared QEMU invocation. virtio-vga is what gives the guest /dev/dri/card0,
 # which haimanager will render onto via DRM/KMS.
@@ -102,7 +110,7 @@ pack: build
 # compositor would come up with no clients. It substitutes a stand-in start menu
 # and a stand-in agentdesk, and drops out the moment either is written.
 run: pack
-	@echo "==> Booting Agentware in QEMU..."
+	@echo "==> Booting Agentware in QEMU at $(DISPLAY_W)x$(DISPLAY_H) (host reports $(if $(HOST_PX),$(HOST_PX),nothing))..."
 	$(QEMU) -display gtk,zoom-to-fit=off -serial stdio \
 		-append "console=tty0 console=ttyS0,115200 agentware.demo"
 

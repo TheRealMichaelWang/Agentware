@@ -60,12 +60,16 @@ use crate::ui::{self, Focus, Frame, Layout, Regions};
 
 /// Height of the navigation bar, which sits above every workspace.
 pub const NAV_HEIGHT: i32 = 32;
-const TASKBAR_HEIGHT: i32 = 34;
-const PANE_WIDTH: i32 = 320;
+/// The agentdesk's taskbar region is parked at zero height for now. The strip
+/// duplicated what the dock does and spent a full-width band saying so. The
+/// region stays in the protocol and the layout path, so an agentdesk may still
+/// declare content for it and nothing breaks; it simply gets no room until
+/// there is a design worth giving room to.
+const TASKBAR_HEIGHT: i32 = 0;
 /// Width of the handle left behind when the pane is collapsed.
 const PANE_HANDLE: i32 = 12;
 /// Height of the title bar the compositor draws around an application window.
-const WINDOW_TITLE: i32 = 26;
+const WINDOW_TITLE: i32 = 24;
 /// How far each successive window is offset, so none opens exactly on another.
 const CASCADE: i32 = 26;
 const WINDOW_MARGIN: i32 = 14;
@@ -76,8 +80,8 @@ const LIGHT_INSET: i32 = 14;
 /// Distance between dot centres.
 const LIGHT_STEP: i32 = 17;
 /// The strip along the bottom of the apps region holding every open window.
-const DOCK_HEIGHT: i32 = 34;
-const DOCK_PILL: i32 = 132;
+const DOCK_HEIGHT: i32 = 26;
+const DOCK_PILL: i32 = 104;
 
 /// What a point in a title bar means.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -266,8 +270,12 @@ impl Screen {
             .workspaces
             .get(at)
             .is_some_and(|workspace| workspace.pane_collapsed);
-        let pane = if collapsed { 0 } else { PANE_WIDTH };
-        Regions::carve(self.workspace_area(), TASKBAR_HEIGHT, pane)
+        let area = self.workspace_area();
+        // Proportional, with bounds. A fixed width was a third of a small
+        // screen and a sliver of a large one; a conversation column wants to be
+        // a modest sixth of either.
+        let pane = if collapsed { 0 } else { (area.w * 17 / 100).clamp(240, 320) };
+        Regions::carve(area, TASKBAR_HEIGHT, pane)
     }
 
     /// The grip that folds the conversation pane away, on its leading edge.
@@ -1246,7 +1254,7 @@ impl Screen {
     /// everything else rather than being a second rendering path.
     fn nav_markup(&self) -> String {
         let mut out = String::from(
-            "<window font=\"sans\">\n  <hstack gap=\"sm\">\n\
+            "<window font=\"sans\" pad=\"none\" size=\"sm\">\n  <hstack gap=\"sm\">\n\
              \x20   <button id=\"nav-home\" label=\"Home\" \
              description=\"Opens the start menu, where a new workspace is created\"/>\n",
         );
@@ -1279,12 +1287,17 @@ impl Screen {
     fn build_nav(&mut self, fonts: &Fonts) {
         let markup = self.nav_markup();
         let Ok(doc) = Document::parse(&markup, 0) else { return };
-        self.nav_layout = ui::layout(
-            fonts,
-            &doc,
-            &Frame::Whole(self.nav_rect()),
-            &mut self.nav_scroll,
-        );
+
+        // The frame is the bar minus a margin that centres one row of small
+        // controls, computed rather than hoped. The earlier version handed the
+        // whole bar to a padded window, and the padding pushed the buttons past
+        // the bottom edge, which is why the tabs looked like they were bleeding
+        // off the screen.
+        let bar = self.nav_rect();
+        let row = fonts.line_height(&Style { size: 11.0, ..Style::default() }) + 12;
+        let inset_y = ((bar.h - row) / 2).max(2);
+        let frame = Rect::new(bar.x + 10, bar.y + inset_y, bar.w - 20, bar.h - inset_y * 2);
+        self.nav_layout = ui::layout(fonts, &doc, &Frame::Whole(frame), &mut self.nav_scroll);
         self.nav = Some(doc);
     }
 
@@ -1386,16 +1399,14 @@ impl Screen {
 
         self.draw_dock(canvas, fonts);
 
-        for region in ["pane", "taskbar"] {
-            let rect = if region == "pane" { regions.pane } else { regions.taskbar };
-            if rect.w == 0 || rect.h == 0 {
-                continue;
-            }
+        // Only the pane has a painted background now; the taskbar region has no
+        // height and the dock is its own floating surface.
+        let rect = regions.pane;
+        if rect.w > 0 {
             canvas.fill_rect(rect, ui::SURFACE);
             canvas.fill_rect(Rect::new(rect.x, rect.y, 1, rect.h), ui::BORDER);
-            canvas.fill_rect(Rect::new(rect.x, rect.y, rect.w, 1), ui::BORDER);
             if let Some(desk) = desk {
-                canvas.clipped(rect, |canvas| desk.draw_region(canvas, fonts, region));
+                canvas.clipped(rect, |canvas| desk.draw_region(canvas, fonts, "pane"));
             }
         }
 
