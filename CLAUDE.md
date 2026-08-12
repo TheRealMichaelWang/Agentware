@@ -46,6 +46,7 @@ it and powers the machine off; QEMU exiting on its own is the pass signal.
 3. evdev input, both cursors, event-driven loop
 4. AWML parser, layout, hit testing, agent view
 5. Client protocol, tree diffing, ephemeral state, versioned events
+6. Workspace compositing: regions, windows, the navigation bar, input routing
 
 Milestone 5 in more detail, since the rest builds on it. Clients arrive as
 descriptors the supervisor pushes over the control socket, each tagged with the
@@ -62,8 +63,6 @@ keystroke being thrown away by the echo of the first.
 
 **Remaining:**
 
-6. **Workspace compositing.** The four regions per workspace, the global
-   navigation bar, app windows, routing input to the right client.
 7. **Agent surface.** Queries scoped by connection, the reduced view, intent
    resolution with visibility and enabled checks, fake cursor animation,
    rejections.
@@ -90,8 +89,10 @@ the start menu, which asks for one workspace with one `awapp` in it. Everything
 between them is the real path. Drop the flag to see the compositor with nothing
 attached.
 
-Once it is up, F1 cycles which client is in front. That is a stand-in for window
-management, which arrives with compositing.
+Once it is up, F1 cycles workspaces, standing in for the start menu, and F2
+toggles a diagnostic overlay listing every connection and the version it is on.
+The taskbar's launcher and the pane's Send button both go through the real
+broker, so clicking them forks real processes.
 
 Builds target `x86_64-unknown-linux-musl`. No sudo is needed: `cpio` records a
 device node's major/minor from `stat` and never opens it.
@@ -195,6 +196,10 @@ is the list so it does not get relitigated.
 * **QEMU's `mouse_button` wheel bits do not reach a PS/2 guest.** Bit 8 and bit
   16 produce nothing at all. The wheel is the optional third argument to
   `mouse_move`, so `mouse_move 0 0 -1` is one notch down.
+* **A large `mouse_move` is truncated by the PS/2 packet format.** Around 400
+  pixels still works and 530 does not, and the failure looks exactly like a
+  broken hit test: the cursor is drawn where it was asked to be and the click
+  lands somewhere else. Split any move over about 250 pixels into two.
 * **`/dev/input` is not fully populated at startup.** QEMU's PS/2 mouse appears
   about 300ms after the directory first has entries, so devices must be
   rescanned rather than enumerated once.

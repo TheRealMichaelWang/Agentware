@@ -191,6 +191,65 @@ fn parse_hex(value: &str) -> Option<Color> {
     }
 }
 
+/// Where a document's top level is put on screen.
+pub enum Frame {
+    /// One rectangle for the whole document. Applications get this: an app
+    /// describes a window, and where the window goes is not its business.
+    Whole(Rect),
+    /// The root's children are placed by the `region` each one declares.
+    ///
+    /// Only a desk connection is laid out this way. That is what makes `region`
+    /// a property of the connection rather than an attribute anything may write:
+    /// an application can put the word in its markup and it will mean nothing,
+    /// because nothing ever reads it on that path.
+    Regions(Regions),
+}
+
+/// The four parts a workspace is divided into.
+///
+/// Three belong to the agentdesk and one belongs to application processes. The
+/// division is the compositor's, so an agentdesk cannot give itself the whole
+/// screen and an application cannot escape the part it was given.
+#[derive(Clone, Copy)]
+pub struct Regions {
+    /// Wallpaper, behind everything. Spans the whole workspace.
+    pub background: Rect,
+    /// Open apps and the launcher, along the bottom.
+    pub taskbar: Rect,
+    /// Chat transcript, input box, collapse toggle, down the side.
+    pub pane: Rect,
+    /// Application windows. Not addressable by the agentdesk.
+    pub apps: Rect,
+}
+
+impl Regions {
+    /// Carve a workspace up. Order matters: the taskbar takes the full width
+    /// along the bottom, then the pane takes the side of what is left.
+    pub fn carve(area: Rect, taskbar: i32, pane: i32) -> Regions {
+        let body = Rect::new(area.x, area.y, area.w, area.h - taskbar);
+        Regions {
+            background: area,
+            taskbar: Rect::new(area.x, area.y + area.h - taskbar, area.w, taskbar),
+            pane: Rect::new(body.x + body.w - pane, body.y, pane, body.h),
+            apps: Rect::new(body.x, body.y, body.w - pane, body.h),
+        }
+    }
+
+    /// The rectangle a top-level node claims, or `None` if it claims nothing it
+    /// is allowed to have.
+    ///
+    /// `apps` is deliberately absent. It belongs to application processes, and a
+    /// desk asking for it is asking to draw over its own applications.
+    fn claim(&self, name: Option<&str>) -> Option<Rect> {
+        match name? {
+            "background" => Some(self.background),
+            "taskbar" => Some(self.taskbar),
+            "pane" => Some(self.pane),
+            _ => None,
+        }
+    }
+}
+
 /// A scroll container that was placed, and how much of it did not fit.
 pub struct Scroller {
     pub node: usize,
@@ -280,19 +339,28 @@ impl Layout {
 pub fn layout(
     fonts: &Fonts,
     doc: &Document,
-    area: Rect,
+    frame: &Frame,
     scroll: &mut HashMap<String, i32>,
 ) -> Layout {
     let count = doc.tree.nodes.len();
+    let bounds = match frame {
+        Frame::Whole(rect) => *rect,
+        Frame::Regions(regions) => regions.background,
+    };
+
     let mut placer = Placer {
         fonts,
         doc,
         scroll,
         rects: vec![Rect::new(0, 0, 0, 0); count],
-        clips: vec![area; count],
+        clips: vec![bounds; count],
         scrollers: Vec::new(),
     };
-    placer.place(Tree::ROOT, area, area);
+
+    match frame {
+        Frame::Whole(rect) => placer.place(Tree::ROOT, *rect, *rect),
+        Frame::Regions(regions) => placer.place_regions(*regions),
+    }
 
     Layout {
         rects: placer.rects,
@@ -392,6 +460,33 @@ struct Placer<'a> {
 }
 
 impl Placer<'_> {
+    /// Place each top-level child into the region it declares.
+    ///
+    /// A child that declares nothing, or declares something it may not have, is
+    /// given an empty rectangle. It is then invisible and unreachable rather
+    /// than being silently promoted to somewhere it does not belong, which is
+    /// the failure that would be hardest to notice.
+    fn place_regions(&mut self, regions: Regions) {
+        self.rects[Tree::ROOT] = regions.background;
+        self.clips[Tree::ROOT] = regions.background;
+
+        let children = self.doc.tree.node(Tree::ROOT).children.clone();
+        for child in children {
+            let claim = regions.claim(self.doc.tree.node(child).attr("region"));
+            match claim {
+                // Inset, so a region's content does not sit flush against the
+                // edge of the region. The compositor owns the division, so it
+                // owns the breathing room too; there is no attribute an
+                // agentdesk could set to take it back.
+                Some(rect) => self.place(child, rect.inset(PADDING), rect),
+                None => {
+                    self.rects[child] = Rect::new(0, 0, 0, 0);
+                    self.clips[child] = Rect::new(0, 0, 0, 0);
+                }
+            }
+        }
+    }
+
     fn place(&mut self, index: usize, area: Rect, clip: Rect) {
         let tree = &self.doc.tree;
         self.rects[index] = area;
@@ -558,30 +653,48 @@ fn prefix(text: &str, caret: usize) -> &str {
 }
 
 pub fn paint(canvas: &mut Canvas, fonts: &Fonts, tree: &Tree, layout: &Layout, focus: &Focus) {
-    paint_node(canvas, fonts, tree, layout, Tree::ROOT, focus);
-    paint_scrollbars(canvas, layout);
+    paint_subtree(canvas, fonts, tree, layout, Tree::ROOT, focus);
+}
+
+/// Paint one branch of a document.
+///
+/// A workspace's regions are separate branches of one tree that do not paint
+/// consecutively: the wallpaper goes down, then the application windows on top
+/// of it, then the side pane and the taskbar above those. Painting has to be
+/// interruptible at the top level for that to be possible.
+pub fn paint_subtree(
+    canvas: &mut Canvas,
+    fonts: &Fonts,
+    tree: &Tree,
+    layout: &Layout,
+    index: usize,
+    focus: &Focus,
+) {
+    paint_node(canvas, fonts, tree, layout, index, focus);
 }
 
 /// A thin indicator beside content that overflows.
 ///
-/// Drawn last so it sits above whatever it is describing, and only when there is
-/// something out of sight: a bar on content that fits would say something untrue.
-fn paint_scrollbars(canvas: &mut Canvas, layout: &Layout) {
-    for scroller in &layout.scrollers {
-        if scroller.content <= scroller.viewport || scroller.viewport <= 0 {
-            continue;
-        }
-
-        let rect = layout.rects[scroller.node];
-        let track = Rect::new(rect.x + rect.w - SCROLLBAR - 2, rect.y, SCROLLBAR, rect.h);
-        canvas.fill_rect(track, SURFACE);
-
-        let span = (track.h * scroller.viewport / scroller.content).max(16);
-        let travel = track.h - span;
-        let furthest = (scroller.content - scroller.viewport).max(1);
-        let top = track.y + travel * scroller.offset / furthest;
-        canvas.fill_rect(Rect::new(track.x, top, track.w, span), BORDER);
+/// Drawn after a scroll container's children so it sits above them, and only
+/// when there is something out of sight: a bar on content that fits would say
+/// something untrue.
+fn paint_scrollbar(canvas: &mut Canvas, layout: &Layout, index: usize) {
+    let Some(scroller) = layout.scrollers.iter().find(|s| s.node == index) else {
+        return;
+    };
+    if scroller.content <= scroller.viewport || scroller.viewport <= 0 {
+        return;
     }
+
+    let rect = layout.rects[index];
+    let track = Rect::new(rect.x + rect.w - SCROLLBAR - 2, rect.y, SCROLLBAR, rect.h);
+    canvas.fill_rect(track, SURFACE);
+
+    let span = (track.h * scroller.viewport / scroller.content).max(16);
+    let travel = track.h - span;
+    let furthest = (scroller.content - scroller.viewport).max(1);
+    let top = track.y + travel * scroller.offset / furthest;
+    canvas.fill_rect(Rect::new(track.x, top, track.w, span), BORDER);
 }
 
 fn paint_node(
@@ -749,6 +862,10 @@ fn paint_node(
 
     for &child in &tree.node(index).children {
         paint_node(canvas, fonts, tree, layout, child, focus);
+    }
+
+    if node.tag == Tag::Scroll {
+        canvas.clipped(clip, |canvas| paint_scrollbar(canvas, layout, index));
     }
 }
 

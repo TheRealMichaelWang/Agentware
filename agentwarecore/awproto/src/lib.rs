@@ -30,6 +30,7 @@
 //! lives here for the same reason: two processes that must agree on a wire
 //! should read it out of one file.
 
+pub mod broker;
 pub mod display;
 
 use std::fmt;

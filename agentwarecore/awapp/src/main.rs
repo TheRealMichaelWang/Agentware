@@ -20,11 +20,17 @@
 //! are what the human's caret is carried across, and what an agent will name to
 //! act. Generating them per frame would break both, silently.
 //!
-//! Usage: awapp [desk]
+//! Which face it wears comes from the name it was invoked under, because the
+//! spawn broker forks an application by name with no arguments: `awapp` is the
+//! compose window, `awnotes` is a second one so windows overlap. The agentdesk
+//! is the exception, since the supervisor does pass a workspace id to a desk.
+//!
+//! Usage: awapp | awnotes | awapp desk <id>
 
 use std::fmt::Write as _;
 use std::io::Write as IoWrite;
 
+use awproto::broker::Broker;
 use awproto::display::{self, Event, Surface};
 
 /// Which interface this process is standing in for.
@@ -36,6 +42,9 @@ use awproto::display::{self, Event, Surface};
 enum Face {
     /// An application window: the thing an agent will read and drive.
     Compose,
+    /// A second application, so a workspace holds more than one window and
+    /// covering is a real case rather than a hypothetical one.
+    Notes,
     /// The workspace shell. Chrome, and invisible to agents by construction.
     Workspace,
 }
@@ -48,6 +57,8 @@ struct Draft {
 
 struct App {
     face: Face,
+    /// Which workspace this process belongs to. Only a desk has one.
+    desk: u32,
     // The compose window's model.
     to: String,
     copy_self: bool,
@@ -60,13 +71,24 @@ struct App {
     // Shown on screen so the app's own view of what happened can be compared
     // against the compositor's.
     status: String,
+    /// The control socket, for the workspace face only. An application never
+    /// has one: apps are opened *into* a workspace by the workspace, and an app
+    /// that could fork its own would be outside the boundary that owns it.
+    broker: Option<Broker>,
 }
 
 fn main() {
+    let program = std::env::args().next().unwrap_or_default();
     let face = match std::env::args().nth(1).as_deref() {
         Some("desk") => Face::Workspace,
+        _ if program.ends_with("awnotes") => Face::Notes,
         _ => Face::Compose,
     };
+
+    // A desk is told which workspace it is, because it has to name it when it
+    // asks the broker for anything. An application is told nothing: it does not
+    // know which workspace it is in and has no use for the answer.
+    let desk: u32 = std::env::args().nth(2).and_then(|id| id.parse().ok()).unwrap_or(0);
 
     let mut surface = match Surface::inherited() {
         Ok(surface) => surface,
@@ -76,7 +98,7 @@ fn main() {
         }
     };
 
-    let mut app = App::new(face);
+    let mut app = App::new(face, desk);
     if let Err(err) = surface.render(&app.render()) {
         log(&format!("could not send the first tree: {err}"));
         std::process::exit(1);
@@ -109,9 +131,10 @@ fn main() {
 }
 
 impl App {
-    fn new(face: Face) -> Self {
+    fn new(face: Face, desk: u32) -> Self {
         App {
             face,
+            desk,
             to: String::new(),
             copy_self: true,
             body: String::new(),
@@ -134,7 +157,33 @@ impl App {
                 "agent: opened Messages, the recipient field is empty".into(),
             ],
             status: "ready".into(),
+            broker: None,
         }
+    }
+
+    /// Ask PID 1 for something, connecting the first time it is needed.
+    ///
+    /// This is the agentdesk's job and nobody else's in this file. It is by path
+    /// because a process that has not been forked yet cannot have been handed a
+    /// descriptor to the thing that will fork it.
+    fn ask(&mut self, what: &str, request: impl FnOnce(&mut Broker) -> Result<String, String>) {
+        if self.broker.is_none() {
+            match Broker::connect() {
+                Ok(broker) => self.broker = Some(broker),
+                Err(err) => {
+                    self.status = format!("cannot reach the supervisor: {err}");
+                    log(&self.status);
+                    return;
+                }
+            }
+        }
+
+        let Some(broker) = &mut self.broker else { return };
+        match request(broker) {
+            Ok(note) => self.status = note,
+            Err(err) => self.status = format!("{what} refused: {err}"),
+        }
+        log(&self.status);
     }
 
     /// Decide whether an event should be acted on, and act on it.
@@ -157,7 +206,7 @@ impl App {
         }
 
         match self.face {
-            Face::Compose => self.compose_event(event),
+            Face::Compose | Face::Notes => self.compose_event(event),
             Face::Workspace => self.workspace_event(event),
         }
     }
@@ -214,21 +263,43 @@ impl App {
     }
 
     fn workspace_event(&mut self, event: &Event) -> bool {
+        let desk = self.desk;
+
         match (event.target.as_str(), event.action.as_str()) {
             ("message", display::ACTION_TYPE_TEXT) => {
                 self.message = event.value.clone();
                 self.status = "composing".into();
             }
+
             ("message", display::ACTION_SUBMIT) | ("send-message", display::ACTION_CLICK) => {
                 if self.message.trim().is_empty() {
                     self.status = "nothing to send".into();
                     return false;
                 }
                 self.transcript.push(format!("you: {}", self.message));
-                self.transcript.push("agent: queued, no agent process exists yet".into());
                 self.message.clear();
-                self.status = "message queued".into();
+
+                // A message is what starts a turn, and the agentdesk is what
+                // decides that, not the supervisor and not the start menu.
+                self.ask("start-agent", move |broker| {
+                    broker
+                        .start_agent(desk)
+                        .map(|pid| format!("agent started as pid {pid}"))
+                });
+                let note = self.status.clone();
+                self.transcript.push(format!("system: {note}"));
             }
+
+            // The launcher. Apps are forked by PID 1 into this workspace's
+            // cgroup, so closing the workspace takes them with it.
+            ("launch-notes", display::ACTION_CLICK) => {
+                self.ask("open-app", move |broker| {
+                    broker
+                        .open_app(desk, "awnotes")
+                        .map(|pid| format!("Notes opened as pid {pid}"))
+                });
+            }
+
             _ => return false,
         }
         true
@@ -236,7 +307,7 @@ impl App {
 
     fn render(&self) -> String {
         match self.face {
-            Face::Compose => self.render_compose(),
+            Face::Compose | Face::Notes => self.render_compose(),
             Face::Workspace => self.render_workspace(),
         }
     }
@@ -251,9 +322,9 @@ impl App {
         let mut out = String::new();
         let _ = write!(
             out,
-            r#"<window title="Messages" font="sans">
+            r#"<window title="{title}" font="sans">
   <vstack gap="lg" grow="true">
-    <text role="heading">Compose</text>
+    <text role="heading">{title}</text>
     <text role="caption" color="muted">{status}</text>
 
     <group label="Recipient">
@@ -281,6 +352,7 @@ impl App {
     <scroll grow="true">
       <list id="drafts" label="Saved drafts">
 "#,
+            title = if self.face == Face::Notes { "Notes" } else { "Compose" },
             status = display::escape(&self.status),
             to = display::escape(&self.to),
             body = display::escape(&self.body),
@@ -310,21 +382,37 @@ impl App {
 
     /// A stand-in for the workspace shell.
     ///
-    /// It declares no regions, because honouring `region` is what milestone 6
-    /// adds. What it is here to prove is that a second connection is held
-    /// separately: its own tree, its own version, its own focus and its own
-    /// scroll offset, none of which the compose window can see or disturb.
+    /// The top-level nodes declare which region they belong to, and the
+    /// compositor honours that only because this arrived on a desk connection.
+    /// An application can write `region` into its markup and nothing will ever
+    /// read it.
+    ///
+    /// There is no `region="apps"` here, and there cannot be. That one belongs
+    /// to application processes; a workspace claiming it would be drawing over
+    /// its own windows.
     fn render_workspace(&self) -> String {
         let mut out = String::new();
         let _ = write!(
             out,
-            r#"<window title="Workspace" font="sans">
-  <vstack gap="md" grow="true">
-    <text role="heading">Workspace 1</text>
-    <text role="caption" color="muted">{status}</text>
+            r##"<window title="Workspace {desk}" font="sans">
+  <vstack region="background">
+    <text role="heading" color="#222c40">agentware</text>
+    <text role="caption" color="#1c2436">workspace {desk}</text>
+  </vstack>
+
+  <hstack region="taskbar" gap="sm">
+    <button id="launch-notes" label="Open Notes"
+            description="Opens the Notes application in this workspace"/>
+    <text grow="true" color="muted">taskbar</text>
+    <text color="muted">{status}</text>
+  </hstack>
+
+  <vstack region="pane" gap="sm">
+    <text role="subheading">Conversation</text>
     <scroll grow="true">
       <vstack gap="sm">
-"#,
+"##,
+            desk = self.desk,
             status = display::escape(&self.status),
         );
 
@@ -334,17 +422,15 @@ impl App {
 
         let _ = write!(
             out,
-            r#"      </vstack>
+            r##"      </vstack>
     </scroll>
-    <hstack gap="sm">
-      <field id="message" grow="true" placeholder="Message the agent" value="{message}"
-             description="Sends a message to the agent working in this workspace"/>
-      <button id="send-message" label="Send" emphasis="primary"
-              description="Sends the composed message to the agent"/>
-    </hstack>
+    <field id="message" placeholder="Message the agent" value="{message}"
+           description="Sends a message to the agent working in this workspace"/>
+    <button id="send-message" label="Send" emphasis="primary"
+            description="Sends the composed message, which starts an agent turn"/>
   </vstack>
 </window>
-"#,
+"##,
             message = display::escape(&self.message),
         );
         out

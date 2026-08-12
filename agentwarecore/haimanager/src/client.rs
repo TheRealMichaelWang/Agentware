@@ -39,7 +39,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::os::unix::net::UnixStream;
 
 use awproto::Decoder;
@@ -50,7 +50,7 @@ use crate::document::Document;
 use crate::input::{Button, Event, Key};
 use crate::paint::font::Fonts;
 use crate::paint::{Canvas, Rect};
-use crate::ui::{self, Focus, Layout};
+use crate::ui::{self, Focus, Frame, Layout};
 
 /// How much unsent event traffic a client may accumulate before it is treated as
 /// gone.
@@ -109,7 +109,11 @@ pub struct Client {
 
     doc: Option<Document>,
     layout: Layout,
-    area: Rect,
+    /// Where this document goes on screen. Decided by the compositor and
+    /// changed under the client without telling it: an application is not
+    /// informed of its own window, because there is nothing it could correctly
+    /// do with the knowledge.
+    frame: Frame,
 
     // Ephemeral state, keyed by node identity rather than by index, because
     // indices do not survive a re-render and identities are meant to.
@@ -127,7 +131,7 @@ pub struct Progress {
 }
 
 impl Client {
-    fn new(kind: Kind, desk: u32, name: String, stream: UnixStream, area: Rect) -> io::Result<Self> {
+    pub fn adopt(kind: Kind, desk: u32, name: String, stream: UnixStream) -> io::Result<Self> {
         stream.set_nonblocking(true)?;
         Ok(Client {
             kind,
@@ -140,7 +144,7 @@ impl Client {
             broken: false,
             doc: None,
             layout: Layout::empty(),
-            area,
+            frame: Frame::Whole(Rect::new(0, 0, 0, 0)),
             focus: None,
             editing: HashMap::new(),
             scroll: HashMap::new(),
@@ -161,10 +165,6 @@ impl Client {
 
     pub fn version(&self) -> u64 {
         self.doc.as_ref().map_or(0, |doc| doc.version)
-    }
-
-    pub fn has_document(&self) -> bool {
-        self.doc.is_some()
     }
 
     /// True once this client can no longer be sent events.
@@ -323,7 +323,40 @@ impl Client {
 
     fn relayout(&mut self, fonts: &Fonts) {
         let Some(doc) = &self.doc else { return };
-        self.layout = ui::layout(fonts, doc, self.area, &mut self.scroll);
+        self.layout = ui::layout(fonts, doc, &self.frame, &mut self.scroll);
+    }
+
+    /// Move or resize this client's part of the screen.
+    pub fn set_frame(&mut self, fonts: &Fonts, frame: Frame) {
+        self.frame = frame;
+        self.relayout(fonts);
+    }
+
+    /// The window title the document declares, for the chrome the compositor
+    /// draws around it. Applications name their windows; they do not draw them.
+    pub fn title(&self) -> &str {
+        self.doc
+            .as_ref()
+            .and_then(|doc| doc.tree.node(Document::ROOT).attr("title"))
+            .unwrap_or(&self.name)
+    }
+
+    /// The top-level node claiming a region, for a desk connection.
+    pub fn region(&self, name: &str) -> Option<usize> {
+        let doc = self.doc.as_ref()?;
+        doc.tree
+            .node(Document::ROOT)
+            .children
+            .iter()
+            .copied()
+            .find(|&child| doc.tree.node(child).attr("region") == Some(name))
+    }
+
+    /// Paint one branch, for a workspace whose regions do not paint
+    /// consecutively.
+    pub fn draw_region(&self, canvas: &mut Canvas, fonts: &Fonts, name: &str) {
+        let (Some(doc), Some(index)) = (&self.doc, self.region(name)) else { return };
+        ui::paint_subtree(canvas, fonts, &doc.tree, &self.layout, index, &self.focus_state());
     }
 
     /// Where the compositor believes focus and the caret are, in this tree.
@@ -337,7 +370,6 @@ impl Client {
 
     pub fn draw(&self, canvas: &mut Canvas, fonts: &Fonts) {
         let Some(doc) = &self.doc else { return };
-        canvas.clear(ui::BACKGROUND);
         ui::paint(canvas, fonts, &doc.tree, &self.layout, &self.focus_state());
     }
 
@@ -630,108 +662,4 @@ fn move_line(value: &str, caret: usize, down: bool) -> usize {
         at += length + 1;
     }
     caret
-}
-
-/// Every client the compositor is holding.
-///
-/// Ordered by when they attached, because that is the order the handoffs arrived
-/// in and there is no other ordering to have yet. Which one is on screen is
-/// milestone 6's question; for now the newest is in front and the human can
-/// cycle.
-pub struct Clients {
-    entries: Vec<Client>,
-    front: usize,
-    area: Rect,
-}
-
-impl Clients {
-    pub fn new(area: Rect) -> Self {
-        Clients { entries: Vec::new(), front: 0, area }
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = &Client> {
-        self.entries.iter()
-    }
-
-    pub fn front_index(&self) -> usize {
-        self.front
-    }
-
-    pub fn front(&self) -> Option<&Client> {
-        self.entries.get(self.front)
-    }
-
-    pub fn front_mut(&mut self) -> Option<&mut Client> {
-        self.entries.get_mut(self.front)
-    }
-
-    /// Bring the next client forward. There is no window management yet, so this
-    /// is how a second connection can be looked at.
-    pub fn cycle(&mut self) -> bool {
-        if self.entries.len() < 2 {
-            return false;
-        }
-        self.front = (self.front + 1) % self.entries.len();
-        true
-    }
-
-    pub fn get_mut(&mut self, fd: RawFd) -> Option<&mut Client> {
-        self.entries.iter_mut().find(|client| client.fd() == fd)
-    }
-
-    /// Drain any backlog that a partial write left behind.
-    ///
-    /// Called on every pass of the event loop rather than only after sending,
-    /// so a socket that was full when an event was generated is not left holding
-    /// it until the next thing happens to that client.
-    pub fn flush_all(&mut self) {
-        for client in &mut self.entries {
-            client.flush();
-        }
-    }
-
-    /// Clients that can no longer be sent events, and so are not worth keeping.
-    pub fn broken(&self) -> Vec<RawFd> {
-        self.entries
-            .iter()
-            .filter(|client| client.is_broken())
-            .map(Client::fd)
-            .collect()
-    }
-
-    /// Adopt a descriptor the supervisor pushed, using the frame that named it.
-    ///
-    /// The workspace id comes off the wire from PID 1 and nowhere else. This is
-    /// the point at which identity becomes a capability: everything downstream
-    /// that scopes an agent to its own desk, or hides the desk's chrome from it,
-    /// is enforced by what was recorded here.
-    pub fn attach(&mut self, fields: &[String], fd: OwnedFd) -> Result<String, String> {
-        let field = |at: usize| fields.get(at).map(String::as_str).unwrap_or("");
-        let desk: u32 = field(1).parse().unwrap_or(0);
-
-        let (kind, name) = match field(0) {
-            "desk-attached" => (Kind::Desk, "workspace".to_owned()),
-            "app-attached" => (Kind::App, field(2).to_owned()),
-            "agent-attached" => (Kind::Agent, "agent".to_owned()),
-            other => return Err(format!("unknown handoff {other:?}")),
-        };
-
-        let client = Client::new(kind, desk, name, UnixStream::from(fd), self.area)
-            .map_err(|err| format!("could not adopt the descriptor: {err}"))?;
-        let label = client.label();
-
-        // The newest connection comes to the front, which is what a human
-        // opening something expects and what makes the demo path legible.
-        self.entries.push(client);
-        self.front = self.entries.len() - 1;
-        Ok(label)
-    }
-
-    pub fn remove(&mut self, fd: RawFd) -> Option<String> {
-        let at = self.entries.iter().position(|client| client.fd() == fd)?;
-        let label = self.entries[at].label();
-        self.entries.remove(at);
-        self.front = self.front.min(self.entries.len().saturating_sub(1));
-        Some(label)
-    }
 }

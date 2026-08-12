@@ -45,6 +45,8 @@ pub struct Document {
 }
 
 impl Document {
+    pub const ROOT: usize = Tree::ROOT;
+
     pub fn parse(source: &str, version: u64) -> Result<Document, awml::Error> {
         let tree = awml::parse(source)?;
         let keys = compute_keys(&tree);

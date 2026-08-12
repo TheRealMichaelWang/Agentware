@@ -11,10 +11,7 @@
 //! supervisor, so the framing, the partial-read handling and the dispatch all
 //! get exercised for real.
 
-use std::io::Write;
-use std::os::unix::net::UnixStream;
-
-use awproto::{SOCKET_PATH, encode, read_frame};
+use awproto::broker::Broker;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -33,7 +30,7 @@ fn main() {
 }
 
 fn single(args: &[String]) -> i32 {
-    let mut conn = match Conn::open() {
+    let mut conn = match Broker::connect() {
         Ok(conn) => conn,
         Err(err) => {
             eprintln!("awctl: {err}");
@@ -59,7 +56,7 @@ fn single(args: &[String]) -> i32 {
 /// The sequence is ordered so each step depends on the last having actually
 /// worked, rather than checking a pile of independent calls.
 fn selftest() -> i32 {
-    let mut conn = match Conn::open() {
+    let mut conn = match Broker::connect() {
         Ok(conn) => conn,
         Err(err) => {
             eprintln!("selftest: cannot reach the supervisor: {err}");
@@ -134,67 +131,55 @@ fn selftest() -> i32 {
     }
 }
 
-/// Put a workspace and an application on screen.
+/// Put a workspace with two applications on screen, and a second workspace
+/// beside it.
 ///
-/// `startmenu` is what will do this, and it does not exist. Until it does,
+/// The start menu is what will do this, and it does not exist. Until it does,
 /// the compositor has nothing to render and the display half of the system
 /// cannot be looked at. This is the smallest thing that fills that gap, and it
-/// goes through the real broker: the workspace and the app are forked by PID 1,
-/// their descriptors are pushed to the haimanager by the supervisor, and nothing
-/// here is aware of any of it.
+/// goes through the real broker: every process is forked by PID 1 into the right
+/// cgroup, and their descriptors are pushed to the haimanager by the supervisor
+/// with the workspace each one belongs to attached.
+///
+/// Two applications rather than one because a single window never overlaps
+/// anything, and covering is what makes "can this node actually be reached" a
+/// real question. Two workspaces rather than one because the navigation bar with
+/// nowhere to navigate to proves nothing.
 fn demo() -> i32 {
-    let mut conn = match Conn::open() {
-        Ok(conn) => conn,
+    let mut broker = match Broker::connect() {
+        Ok(broker) => broker,
         Err(err) => {
             eprintln!("demo: cannot reach the supervisor: {err}");
             return 1;
         }
     };
 
-    let reply = match conn.request(&["create-desk"]) {
-        Ok(reply) => reply,
+    let first = match broker.create_desk(None) {
+        Ok(id) => id,
         Err(err) => {
             eprintln!("demo: create-desk: {err}");
             return 1;
         }
     };
-    if reply.first().map(String::as_str) != Some("ok") {
-        eprintln!("demo: create-desk refused: {}", reply.join(" "));
-        return 1;
+    println!("demo: workspace {first} created");
+
+    for app in ["awapp", "awnotes"] {
+        match broker.open_app(first, app) {
+            Ok(pid) => println!("demo: {app} opened in workspace {first} as pid {pid}"),
+            Err(err) => {
+                eprintln!("demo: open-app {app}: {err}");
+                return 1;
+            }
+        }
     }
 
-    let desk = reply.get(1).cloned().unwrap_or_default();
-    println!("demo: workspace {desk} created");
-
-    match conn.request(&["open-app", &desk, "awapp"]) {
-        Ok(reply) if reply.first().map(String::as_str) == Some("ok") => {
-            println!("demo: awapp opened in workspace {desk}");
-            0
-        }
-        Ok(reply) => {
-            eprintln!("demo: open-app refused: {}", reply.join(" "));
-            1
-        }
+    match broker.create_desk(Some("look at the second workspace")) {
+        Ok(id) => println!("demo: workspace {id} created"),
         Err(err) => {
-            eprintln!("demo: open-app: {err}");
-            1
+            eprintln!("demo: second create-desk: {err}");
+            return 1;
         }
     }
-}
 
-struct Conn {
-    stream: UnixStream,
-}
-
-impl Conn {
-    fn open() -> Result<Self, String> {
-        UnixStream::connect(SOCKET_PATH)
-            .map(|stream| Self { stream })
-            .map_err(|err| format!("connect to {SOCKET_PATH}: {err}"))
-    }
-
-    fn request(&mut self, fields: &[&str]) -> Result<Vec<String>, String> {
-        self.stream.write_all(&encode(fields)).map_err(|err| format!("write: {err}"))?;
-        read_frame(&mut self.stream).map_err(|err| format!("read reply: {err}"))
-    }
+    0
 }
