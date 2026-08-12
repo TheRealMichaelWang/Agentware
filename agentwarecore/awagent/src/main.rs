@@ -60,10 +60,15 @@ fn main() {
     // so a run that behaves differently is visible in the log rather than
     // needing to be reasoned about.
     let script: &[(&str, &str, &str, &str, &str)] = &[
-        // The compose window opened first and is behind the notes window, so it
-        // is covered. `scroll-into-view` is the way out of that, and of a node
-        // scrolled off its own container: the agent says what it wants to be
-        // true rather than how to bring it about.
+        // The compose window opened first and the notes window is on top of it,
+        // so nothing in it can be reached. This is the reliable way to show a
+        // `not-visible` rejection: it depends on one window covering another,
+        // which is true at any display size, rather than on a list being longer
+        // than the window it is in, which is not.
+        ("awapp", "click", "discard", "", "not-visible"),
+        // `scroll-into-view` is the way out of that, and of a node scrolled off
+        // its own container. The agent says what it wants to be true rather than
+        // how to bring it about, and the compositor raises the window.
         ("awapp", "scroll-into-view", "to", "", "done"),
         ("awapp", "type-text", "to", "alice@example.com", "done"),
         ("awapp", "type-text", "body", "Sent by an agent.", "done"),
@@ -89,11 +94,10 @@ fn main() {
         // be used at all is a better answer than a list of what it would have
         // offered.
         ("awapp", "type-text", "discard", "hello", "unsupported-action"),
-        // Scrolled off the end of the draft list, so no human could have clicked
-        // it either. This is the one step in the script whose outcome depends on
-        // the size of the display: it is a rejection only while the list is
-        // longer than the window it is in.
-        ("awapp", "click", "draft-24", "", "not-visible"),
+        // The far end of the draft list. Whether this needs scrolling depends on
+        // the size of the display, so the outcome expected is the same either
+        // way and the interesting part is that the compositor works out what to
+        // move without ever being told which container to scroll.
         ("awapp", "scroll-into-view", "draft-24", "", "done"),
         ("awapp", "click", "draft-24", "", "done"),
     ];

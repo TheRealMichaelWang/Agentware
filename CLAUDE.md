@@ -99,7 +99,7 @@ make run         # boot in a QEMU window
 make pack        # build and pack the initramfs without booting
 ```
 
-The guest display is 1920x1200. It comes from `virtio-vga`'s `xres`/`yres`,
+The guest display is 1600x1000. It comes from `virtio-vga`'s `xres`/`yres`,
 which default to 1280x800, and the compositor takes whatever the driver reports
 as its preferred mode, so those two numbers are the whole of it:
 
@@ -108,11 +108,15 @@ make run DISPLAY_W=2560 DISPLAY_H=1440
 tools/screenshot.py out.png --width 2560 --height 1440
 ```
 
-The window is `zoom-to-fit`, so it can be resized smaller than the guest without
-losing anything. Note that this changes how much fits on screen and nothing
-else: type stays the same number of pixels, so a bigger display means more room
-rather than larger controls. There is no display scale factor, because QEMU
-reports no physical size and guessing one from the resolution would be guessing.
+1600x1000 rather than something larger because the QEMU window is exactly this
+many host pixels and has to fit on the monitor with its decorations. `zoom-to-fit`
+is off: with it on, a host that cannot fit the window shrinks it and scales the
+guest into it, so raising the resolution makes no visible difference at all.
+
+Raising it changes how much fits and nothing else. Type stays the same number of
+pixels, so a bigger display is more room rather than larger controls. There is no
+display scale factor, because QEMU reports no physical size and deriving one from
+the resolution would be guessing at the monitor.
 
 `make run` passes `agentware.demo` on the kernel command line. `startmenu`
 does not exist, so nothing would otherwise ask the broker for a workspace and
@@ -122,8 +126,10 @@ the start menu, which asks for one workspace with one `awapp` in it. Everything
 between them is the real path. Drop the flag to see the compositor with nothing
 attached.
 
-Once it is up, F1 cycles workspaces, standing in for the start menu, and F2
-toggles a diagnostic overlay listing every connection and the version it is on.
+Once it is up, F1 cycles workspaces, standing in for the start menu, F2 toggles a
+diagnostic overlay listing every connection and the version it is on, and F3
+folds the conversation pane away. Windows have a title bar with the usual three
+controls and can be dragged; the dock along the bottom switches between them.
 The taskbar's launcher and the pane's Send button both go through the real
 broker, so clicking them forks real processes: Send starts an agent turn, which
 is the whole of milestone 7 running against a live screen. The kernel log carries
@@ -247,10 +253,10 @@ is the list so it does not get relitigated.
   broken hit test: the cursor is drawn where it was asked to be and the click
   lands somewhere else. Split any move over about 250 pixels into two.
 * **A demonstration that depends on geometry breaks at another resolution.** The
-  agent script expects `not-visible` on a draft scrolled off the end of a list,
-  which stopped being true at 1920x1200 because the list then fitted. The list
-  is now long enough to overflow at 2560x1440, and the step is commented as the
-  one that depends on the size of the display.
+  agent script proved `not-visible` with a draft scrolled off the end of a list,
+  which stopped being true the moment the display got bigger and the list fitted.
+  There is no list length that works at every size. It now proves it with one
+  window covering another, which is true at any size.
 * **`/dev/input` is not fully populated at startup.** QEMU's PS/2 mouse appears
   about 300ms after the directory first has entries, so devices must be
   rescanned rather than enumerated once.

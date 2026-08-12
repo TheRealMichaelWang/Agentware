@@ -328,6 +328,7 @@ fn route(fonts: &Fonts, screen: &mut Screen, event: Event) -> bool {
                 screen.debug = !screen.debug;
                 true
             }
+            CompositorKey::TogglePane => screen.toggle_pane(fonts),
         };
     }
 

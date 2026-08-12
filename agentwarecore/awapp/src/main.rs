@@ -71,6 +71,8 @@ struct App {
     // Shown on screen so the app's own view of what happened can be compared
     // against the compositor's.
     status: String,
+    /// Applications this workspace has open, for its taskbar.
+    open: Vec<&'static str>,
     /// The control socket, for the workspace face only. An application never
     /// has one: apps are opened *into* a workspace by the workspace, and an app
     /// that could fork its own would be outside the boundary that owns it.
@@ -99,6 +101,16 @@ fn main() {
     };
 
     let mut app = App::new(face, desk);
+
+    // A workspace opens its own applications. That is what the launcher is, and
+    // it is also the only way the taskbar can list them: nothing tells a
+    // workspace what is running in it, because it is the thing that asked.
+    if app.face == Face::Workspace {
+        for name in ["awapp", "awnotes"] {
+            app.launch(name);
+        }
+    }
+
     if let Err(err) = surface.render(&app.render()) {
         log(&format!("could not send the first tree: {err}"));
         std::process::exit(1);
@@ -176,7 +188,19 @@ impl App {
                 "agent: opened Messages, the recipient field is empty".into(),
             ],
             status: "ready".into(),
+            open: Vec::new(),
             broker: None,
+        }
+    }
+
+    /// Open an application into this workspace, and remember that it is open.
+    fn launch(&mut self, name: &'static str) {
+        let desk = self.desk;
+        self.ask("open-app", move |broker| {
+            broker.open_app(desk, name).map(|pid| format!("{name} opened as pid {pid}"))
+        });
+        if !self.open.contains(&name) {
+            self.open.push(name);
         }
     }
 
@@ -311,13 +335,8 @@ impl App {
 
             // The launcher. Apps are forked by PID 1 into this workspace's
             // cgroup, so closing the workspace takes them with it.
-            ("launch-notes", display::ACTION_CLICK) => {
-                self.ask("open-app", move |broker| {
-                    broker
-                        .open_app(desk, "awnotes")
-                        .map(|pid| format!("Notes opened as pid {pid}"))
-                });
-            }
+            ("launch-notes", display::ACTION_CLICK) => self.launch("awnotes"),
+            ("launch-mail", display::ACTION_CLICK) => self.launch("awapp"),
 
             _ => return false,
         }
@@ -415,15 +434,14 @@ impl App {
             out,
             r##"<window title="Workspace {desk}" font="sans">
   <vstack region="background">
-    <text role="heading" color="#222c40">agentware</text>
-    <text role="caption" color="#1c2436">workspace {desk}</text>
+    <text role="heading" color="#191f2c">agentware</text>
   </vstack>
 
   <hstack region="taskbar" gap="sm">
-    <button id="launch-notes" label="Open Notes"
-            description="Opens the Notes application in this workspace"/>
-    <text grow="true" color="muted">taskbar</text>
-    <text color="muted">{status}</text>
+    <button id="launch-mail" label="Mail" description="Opens the Mail application in this workspace"/>
+    <button id="launch-notes" label="Notes" description="Opens the Notes application in this workspace"/>
+    <text grow="true" role="caption" color="muted">{running}</text>
+    <text role="caption" color="muted">{status}</text>
   </hstack>
 
   <vstack region="pane" gap="sm">
@@ -432,6 +450,11 @@ impl App {
       <vstack gap="sm">
 "##,
             desk = self.desk,
+            running = display::escape(&if self.open.is_empty() {
+                "no applications open".to_owned()
+            } else {
+                format!("{} open: {}", self.open.len(), self.open.join(", "))
+            }),
             status = display::escape(&self.status),
         );
 
@@ -443,10 +466,12 @@ impl App {
             out,
             r##"      </vstack>
     </scroll>
-    <field id="message" placeholder="Message the agent" value="{message}"
-           description="Sends a message to the agent working in this workspace"/>
-    <button id="send-message" label="Send" emphasis="primary"
-            description="Sends the composed message, which starts an agent turn"/>
+    <hstack gap="sm">
+      <field id="message" grow="true" placeholder="Message the agent" value="{message}"
+             description="Sends a message to the agent working in this workspace"/>
+      <button id="send-message" label="Send" emphasis="primary"
+              description="Sends the composed message, which starts an agent turn"/>
+    </hstack>
   </vstack>
 </window>
 "##,

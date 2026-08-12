@@ -133,9 +133,9 @@ def main():
                         help="kernel command line")
     parser.add_argument("--serial", default=None,
                         help="where to write the serial log")
-    parser.add_argument("--width", type=int, default=1920,
+    parser.add_argument("--width", type=int, default=1600,
                         help="guest display width")
-    parser.add_argument("--height", type=int, default=1200,
+    parser.add_argument("--height", type=int, default=1000,
                         help="guest display height")
     parser.add_argument("--do", action="append", default=[], metavar="CMD",
                         help="a QEMU monitor command to run before capturing, "

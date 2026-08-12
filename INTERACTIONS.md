@@ -98,14 +98,16 @@ It speaks the same AWML over the same kind of connection, and the haimanager run
 | --- | --- | --- |
 | `background` | agentdesk | wallpaper |
 | `taskbar` | agentdesk | open apps, launcher button |
-| `pane` | agentdesk | chat transcript, input box, collapse toggle |
+| `pane` | agentdesk | chat transcript, input box |
 | `apps` | app processes | application windows |
 
 Above all workspaces sits the navigation bar, drawn by the haimanager itself because it belongs to no workspace.
 
 **Window chrome is the compositor's, not the application's.** The title bar, the shadow, and the close, minimize and maximize controls are drawn by the haimanager around a client, from the `title` the application declared. They are the only controls in the system that are not AWML, and that is the point: putting them in the tree would let every application decide whether it was closable, and would make an agent's view of a window include the button that destroys it.
 
-Minimized windows appear in a strip along the bottom of the `apps` region, drawn by the compositor. Not in the agentdesk's taskbar, even though a taskbar is where one would expect them, because whether a window is minimized is compositor state and the agentdesk is never told that windows exist at all.
+Every open window appears as a pill in a dock along the bottom of the `apps` region, drawn by the compositor. Not in the agentdesk's taskbar, even though a taskbar is where one would expect it, because switching between windows is what a dock is for and which window is where is not something the agentdesk is told. Its taskbar holds what it does own: the launcher, and what it has opened.
+
+**Collapsing the pane is the compositor's too.** The grip that folds it away is drawn on its edge and the width of the region is compositor geometry. The reasoning is the stop button's: the pane is a fifth of the screen, and a wedged agentdesk must not be able to keep it. An agentdesk that drew its own toggle would mean a human who cannot reclaim their own display.
 
 **Invisibility to agents is a property of the connection, not an attribute.** Trees arriving on a desk connection are chrome. They are excluded from every agent-facing query by construction, and intents naming their node IDs are rejected. Nothing is marked; nothing can be marked wrongly or forgotten. A useful consequence: an agent cannot read the chat pane containing its own streamed thoughts, which would otherwise be a feedback loop.
 

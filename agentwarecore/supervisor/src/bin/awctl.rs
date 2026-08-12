@@ -131,20 +131,17 @@ fn selftest() -> i32 {
     }
 }
 
-/// Put a workspace with two applications on screen, and a second workspace
-/// beside it.
+/// Put two workspaces on screen.
 ///
 /// The start menu is what will do this, and it does not exist. Until it does,
 /// the compositor has nothing to render and the display half of the system
-/// cannot be looked at. This is the smallest thing that fills that gap, and it
-/// goes through the real broker: every process is forked by PID 1 into the right
-/// cgroup, and their descriptors are pushed to the haimanager by the supervisor
-/// with the workspace each one belongs to attached.
+/// cannot be looked at. This is the smallest thing that fills that gap: two
+/// workspaces and nothing else, because a workspace opens its own applications
+/// through its own launcher and being handed them by the start menu would be a
+/// path nothing real will ever take.
 ///
-/// Two applications rather than one because a single window never overlaps
-/// anything, and covering is what makes "can this node actually be reached" a
-/// real question. Two workspaces rather than one because the navigation bar with
-/// nowhere to navigate to proves nothing.
+/// Two rather than one because a navigation bar with nowhere to navigate to
+/// proves nothing.
 fn demo() -> i32 {
     let mut broker = match Broker::connect() {
         Ok(broker) => broker,
@@ -154,32 +151,16 @@ fn demo() -> i32 {
         }
     };
 
-    let first = match broker.create_desk(None) {
-        Ok(id) => id,
-        Err(err) => {
-            eprintln!("demo: create-desk: {err}");
-            return 1;
-        }
-    };
-    println!("demo: workspace {first} created");
-
-    for app in ["awapp", "awnotes"] {
-        match broker.open_app(first, app) {
-            Ok(pid) => println!("demo: {app} opened in workspace {first} as pid {pid}"),
+    for prompt in [None, Some("look at the second workspace")] {
+        match broker.create_desk(prompt) {
+            Ok(id) => println!("demo: workspace {id} created"),
             Err(err) => {
-                eprintln!("demo: open-app {app}: {err}");
+                eprintln!("demo: create-desk: {err}");
                 return 1;
             }
         }
     }
 
-    match broker.create_desk(Some("look at the second workspace")) {
-        Ok(id) => println!("demo: workspace {id} created"),
-        Err(err) => {
-            eprintln!("demo: second create-desk: {err}");
-            return 1;
-        }
-    }
-
     0
 }
+

@@ -59,22 +59,25 @@ use crate::paint::{Canvas, Rect, rgb};
 use crate::ui::{self, Focus, Frame, Layout, Regions};
 
 /// Height of the navigation bar, which sits above every workspace.
-pub const NAV_HEIGHT: i32 = 40;
-const TASKBAR_HEIGHT: i32 = 56;
-const PANE_WIDTH: i32 = 380;
+pub const NAV_HEIGHT: i32 = 32;
+const TASKBAR_HEIGHT: i32 = 34;
+const PANE_WIDTH: i32 = 320;
+/// Width of the handle left behind when the pane is collapsed.
+const PANE_HANDLE: i32 = 12;
 /// Height of the title bar the compositor draws around an application window.
-const WINDOW_TITLE: i32 = 34;
+const WINDOW_TITLE: i32 = 26;
 /// How far each successive window is offset, so none opens exactly on another.
-const CASCADE: i32 = 32;
-const WINDOW_MARGIN: i32 = 26;
+const CASCADE: i32 = 26;
+const WINDOW_MARGIN: i32 = 14;
 /// Radius of the close, minimize and maximize dots.
-const LIGHT: i32 = 6;
+const LIGHT: i32 = 5;
 /// Centre of the first dot, from the left edge of the title bar.
-const LIGHT_INSET: i32 = 17;
+const LIGHT_INSET: i32 = 14;
 /// Distance between dot centres.
-const LIGHT_STEP: i32 = 20;
-/// The strip along the bottom of the apps region holding minimized windows.
-const DOCK_HEIGHT: i32 = 42;
+const LIGHT_STEP: i32 = 17;
+/// The strip along the bottom of the apps region holding every open window.
+const DOCK_HEIGHT: i32 = 34;
+const DOCK_PILL: i32 = 132;
 
 /// What a point in a title bar means.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -169,6 +172,12 @@ struct Workspace {
     /// How many windows have ever opened here, so the next one cascades off the
     /// last rather than landing exactly on it.
     opened: usize,
+    /// Whether the conversation pane is folded away.
+    ///
+    /// Compositor state, not the agentdesk's, for the same reason the stop
+    /// button is: the pane is most of the screen, and a wedged workspace must
+    /// not be able to keep it.
+    pane_collapsed: bool,
 }
 
 pub struct Screen {
@@ -249,16 +258,46 @@ impl Screen {
     }
 
     fn regions(&self) -> Regions {
-        Regions::carve(self.workspace_area(), TASKBAR_HEIGHT, PANE_WIDTH)
+        self.regions_for(self.current)
+    }
+
+    fn regions_for(&self, at: usize) -> Regions {
+        let collapsed = self
+            .workspaces
+            .get(at)
+            .is_some_and(|workspace| workspace.pane_collapsed);
+        let pane = if collapsed { 0 } else { PANE_WIDTH };
+        Regions::carve(self.workspace_area(), TASKBAR_HEIGHT, pane)
+    }
+
+    /// The grip that folds the conversation pane away, on its leading edge.
+    fn pane_handle(&self, at: usize) -> Rect {
+        let regions = self.regions_for(at);
+        let body = regions.pane;
+        let x = if body.w == 0 {
+            self.workspace_area().x + self.workspace_area().w - PANE_HANDLE
+        } else {
+            body.x - PANE_HANDLE / 2
+        };
+        Rect::new(x, body.y + body.h / 2 - 26, PANE_HANDLE, 52)
+    }
+
+    pub fn toggle_pane(&mut self, fonts: &Fonts) -> bool {
+        let at = self.current;
+        let Some(workspace) = self.workspaces.get_mut(at) else { return false };
+        workspace.pane_collapsed = !workspace.pane_collapsed;
+        self.reframe(fonts);
+        true
     }
 
     /// Where windows may go: the apps region, less the dock if it is showing.
     fn window_area(&self, at: usize) -> Rect {
-        let apps = self.regions().apps;
-        if self.docked(at).is_empty() {
+        let apps = self.regions_for(at);
+        let apps = apps.apps;
+        if self.dock_pills(at).is_empty() {
             return apps;
         }
-        Rect::new(apps.x, apps.y, apps.w, apps.h - DOCK_HEIGHT)
+        Rect::new(apps.x, apps.y, apps.w, apps.h - DOCK_HEIGHT - 8)
     }
 
     /// Where a window opens, before the human has an opinion about it.
@@ -274,8 +313,8 @@ impl Screen {
         Rect::new(
             area.x + WINDOW_MARGIN + step,
             area.y + WINDOW_MARGIN + step,
-            (area.w - WINDOW_MARGIN * 2 - CASCADE).max(320),
-            (area.h - WINDOW_MARGIN * 2 - CASCADE).max(220),
+            (area.w - WINDOW_MARGIN * 2 - CASCADE).max(360),
+            (area.h - WINDOW_MARGIN * 2 - CASCADE).max(260),
         )
     }
 
@@ -284,43 +323,56 @@ impl Screen {
     /// Drawn by the compositor rather than put in the agentdesk's taskbar,
     /// because whether a window is minimized is compositor state and the
     /// agentdesk is never told that windows exist at all.
-    fn dock_rect(&self) -> Rect {
-        let apps = self.regions().apps;
+    /// The dock: one pill per open window, floating at the bottom of the apps
+    /// region.
+    ///
+    /// Every window rather than only the minimized ones, because switching
+    /// between windows is what a dock is for and half a switcher is worse than
+    /// none. It is compositor chrome for the same reason the title bars are:
+    /// which window is where is not something the agentdesk is told.
+    fn dock_rect(&self, at: usize) -> Rect {
+        let apps = self.regions_for(at).apps;
+        let count = self
+            .workspaces
+            .get(at)
+            .map(|workspace| workspace.windows.len())
+            .unwrap_or(0) as i32;
+        let width = (DOCK_PILL + 6) * count + 6;
         Rect::new(
-            apps.x,
-            apps.y + apps.h - DOCK_HEIGHT,
-            apps.w,
+            apps.x + (apps.w - width) / 2,
+            apps.y + apps.h - DOCK_HEIGHT - 8,
+            width,
             DOCK_HEIGHT,
         )
     }
 
-    fn docked(&self, at: usize) -> Vec<RawFd> {
-        self.workspaces
-            .get(at)
-            .map(|workspace| {
-                workspace
-                    .windows
-                    .iter()
-                    .filter(|window| window.minimized)
-                    .map(|window| window.fd)
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    /// Where each minimized window's pill sits.
+    /// Where each window's pill sits.
     fn dock_pills(&self, at: usize) -> Vec<(RawFd, Rect)> {
-        let dock = self.dock_rect();
-        let mut x = dock.x + 14;
-        self.docked(at)
-            .into_iter()
-            .map(|fd| {
-                let width = 150;
-                let pill = Rect::new(x, dock.y + 7, width, DOCK_HEIGHT - 14);
-                x += width + 8;
-                (fd, pill)
+        let Some(workspace) = self.workspaces.get(at) else { return Vec::new() };
+        if workspace.windows.is_empty() {
+            return Vec::new();
+        }
+
+        let dock = self.dock_rect(at);
+        let mut x = dock.x + 6;
+        // In the order they opened rather than in z-order, so a pill does not
+        // move under the pointer when the window behind it is raised.
+        let mut pills: Vec<(RawFd, Rect)> = workspace
+            .windows
+            .iter()
+            .map(|window| {
+                let pill = Rect::new(x, dock.y + 4, DOCK_PILL, DOCK_HEIGHT - 8);
+                x += DOCK_PILL + 6;
+                (window.fd, pill)
             })
-            .collect()
+            .collect();
+        pills.sort_by_key(|(fd, _)| *fd);
+        let mut x = dock.x + 6;
+        for (_, pill) in &mut pills {
+            pill.x = x;
+            x += DOCK_PILL + 6;
+        }
+        pills
     }
 
     /// What part of a window's title bar a point is on.
@@ -499,18 +551,30 @@ impl Screen {
             windows: Vec::new(),
             agent: None,
             opened: 0,
+            pane_collapsed: false,
         });
         self.workspaces.len() - 1
     }
 
     /// Hand every client the part of the screen it currently occupies.
     fn reframe(&mut self, fonts: &Fonts) {
-        let regions = self.regions();
+        // A maximized window means "fill the space", so it follows the space
+        // when the space changes. A normal one keeps the rectangle the human
+        // put it at: folding the pane away must not rearrange their desk.
+        for at in 0..self.workspaces.len() {
+            let area = self.window_area(at).inset(6);
+            for window in &mut self.workspaces[at].windows {
+                if window.maximized {
+                    window.rect = area;
+                }
+            }
+        }
+
         let mut frames: Vec<(RawFd, Frame)> = Vec::new();
 
-        for workspace in &self.workspaces {
+        for (at, workspace) in self.workspaces.iter().enumerate() {
             if let Some(fd) = workspace.desk {
-                frames.push((fd, Frame::Regions(regions)));
+                frames.push((fd, Frame::Regions(self.regions_for(at))));
             }
             for window in &workspace.windows {
                 frames.push((window.fd, Frame::Whole(content_of(window.rect))));
@@ -628,8 +692,13 @@ impl Screen {
             }
 
             Surface::Desk => {
-                // A minimized window's pill sits over the wallpaper, so it is
-                // checked before the click is handed to the workspace.
+                // Both of these are compositor chrome sitting over the
+                // workspace, so they are checked before the click is handed to
+                // it.
+                if self.pane_handle(self.current).contains(x, y) {
+                    return self.toggle_pane(fonts);
+                }
+
                 if let Some((fd, _)) = self
                     .dock_pills(self.current)
                     .into_iter()
@@ -690,7 +759,7 @@ impl Screen {
                     window.maximized = false;
                 } else {
                     window.restored = window.rect;
-                    window.rect = area.inset(8);
+                    window.rect = area.inset(6);
                     window.maximized = true;
                 }
                 self.reframe(fonts);
@@ -1319,37 +1388,75 @@ impl Screen {
 
         for region in ["pane", "taskbar"] {
             let rect = if region == "pane" { regions.pane } else { regions.taskbar };
+            if rect.w == 0 || rect.h == 0 {
+                continue;
+            }
             canvas.fill_rect(rect, ui::SURFACE);
-            canvas.stroke_rect(rect, 1, ui::BORDER);
+            canvas.fill_rect(Rect::new(rect.x, rect.y, 1, rect.h), ui::BORDER);
+            canvas.fill_rect(Rect::new(rect.x, rect.y, rect.w, 1), ui::BORDER);
             if let Some(desk) = desk {
                 canvas.clipped(rect, |canvas| desk.draw_region(canvas, fonts, region));
             }
         }
+
+        self.draw_pane_handle(canvas);
     }
 
-    /// The minimized windows, as pills along the bottom of the apps region.
+    /// The dock: one pill per open window, floating over the apps region.
     fn draw_dock(&self, canvas: &mut Canvas, fonts: &Fonts) {
         let pills = self.dock_pills(self.current);
         if pills.is_empty() {
             return;
         }
 
-        let dock = self.dock_rect();
-        canvas.fill_round_rect(
-            Rect::new(dock.x + 8, dock.y, dock.w - 16, dock.h - 6),
-            ui::RADIUS_SURFACE,
-            ui::SURFACE,
-        );
+        let dock = self.dock_rect(self.current);
+        canvas.shadow(dock, ui::RADIUS_SURFACE, 14, 110);
+        canvas.fill_round_rect(dock, ui::RADIUS_SURFACE, ui::SURFACE);
+        canvas.stroke_round_rect(dock, ui::RADIUS_SURFACE, 1, ui::BORDER);
 
-        let style = Style { size: 13.0, ..Style::default() };
+        let style = Style { size: 12.0, ..Style::default() };
         for (fd, pill) in pills {
             let Some(client) = self.client(fd) else { continue };
-            canvas.fill_round_rect(pill, ui::RADIUS_CONTROL, ui::RAISED);
-            canvas.stroke_round_rect(pill, ui::RADIUS_CONTROL, 1, ui::BORDER);
+            let minimized = self
+                .window(self.current, fd)
+                .is_some_and(|window| window.minimized);
+            let focused = self.focus == Surface::App(fd);
+
+            if focused {
+                canvas.fill_round_rect(pill, ui::RADIUS_CONTROL, ui::RAISED);
+            }
+            let ink = if minimized { ui::MUTED } else { ui::TEXT };
             canvas.clipped(pill.inset(2), |canvas| {
-                canvas.draw_text(fonts, client.title(), pill.x + 12, pill.y + 8, &style, ui::MUTED);
+                canvas.draw_text(
+                    fonts,
+                    client.title(),
+                    pill.x + 12,
+                    pill.y + (pill.h - fonts.line_height(&style)) / 2,
+                    &style,
+                    ink,
+                );
             });
+            // A dot under a window that is on screen, the way a dock marks a
+            // running application. Absent for one that is put away.
+            if !minimized {
+                canvas.fill_round_rect(
+                    Rect::new(pill.x + 5, pill.y + pill.h / 2 - 2, 4, 4),
+                    2,
+                    ui::ACCENT,
+                );
+            }
         }
+    }
+
+    /// The grip that folds the conversation pane away.
+    fn draw_pane_handle(&self, canvas: &mut Canvas) {
+        let grip = self.pane_handle(self.current);
+        canvas.fill_round_rect(grip, PANE_HANDLE / 2, ui::RAISED);
+        canvas.stroke_round_rect(grip, PANE_HANDLE / 2, 1, ui::BORDER);
+        canvas.fill_rect(
+            Rect::new(grip.x + grip.w / 2 - 1, grip.y + 14, 2, grip.h - 28),
+            ui::MUTED,
+        );
     }
 
     fn draw_empty(&self, canvas: &mut Canvas, fonts: &Fonts) {
@@ -1479,6 +1586,7 @@ pub fn compositor_key(key: Key) -> Option<CompositorKey> {
     match key {
         Key::Other(59) => Some(CompositorKey::CycleWorkspace),
         Key::Other(60) => Some(CompositorKey::ToggleDebug),
+        Key::Other(61) => Some(CompositorKey::TogglePane),
         _ => None,
     }
 }
@@ -1488,4 +1596,6 @@ pub enum CompositorKey {
     CycleWorkspace,
     /// F2. The diagnostic overlay.
     ToggleDebug,
+    /// F3. Fold the conversation pane away, for when the window needs the room.
+    TogglePane,
 }

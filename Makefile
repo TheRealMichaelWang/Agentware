@@ -11,9 +11,13 @@ BIN_DIR := $(AW_CORE_DIR)/target/$(TARGET)/release
 # Guest display size. virtio-vga defaults to 1280x800 and the compositor takes
 # the driver's preferred mode, so these two numbers are the whole of it.
 #
+# 1600x1000 rather than something larger because the QEMU window is exactly this
+# many host pixels and has to fit on the monitor with its decorations. A window
+# the host has to shrink is a window that ends up no bigger than it started.
+#
 # Override per run: make run DISPLAY_W=2560 DISPLAY_H=1440
-DISPLAY_W ?= 1920
-DISPLAY_H ?= 1200
+DISPLAY_W ?= 1600
+DISPLAY_H ?= 1000
 
 # Shared QEMU invocation. virtio-vga is what gives the guest /dev/dri/card0,
 # which haimanager will render onto via DRM/KMS.
@@ -99,7 +103,7 @@ pack: build
 # and a stand-in agentdesk, and drops out the moment either is written.
 run: pack
 	@echo "==> Booting Agentware in QEMU..."
-	$(QEMU) -display gtk,zoom-to-fit=on -serial stdio \
+	$(QEMU) -display gtk,zoom-to-fit=off -serial stdio \
 		-append "console=tty0 console=ttyS0,115200 agentware.demo"
 
 # Headless boot that exercises the supervisor end to end and powers itself off.

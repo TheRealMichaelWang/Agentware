@@ -60,18 +60,27 @@ pub const SELECTED: Color = rgb(0x2b, 0x3f, 0x5e);
 /// Corner radii. Everything drawn gets one, because a hard corner at these
 /// sizes is what makes a surface look like a drawn rectangle rather than a
 /// panel, and one square element among rounded ones looks like a bug.
-pub const RADIUS_WINDOW: i32 = 11;
-pub const RADIUS_SURFACE: i32 = 9;
-pub const RADIUS_CONTROL: i32 = 7;
-pub const RADIUS_SMALL: i32 = 4;
+///
+/// Kept small. A large radius on a small control is the single loudest thing an
+/// interface can do, and it reads as a toy rather than as a tool.
+pub const RADIUS_WINDOW: i32 = 8;
+pub const RADIUS_SURFACE: i32 = 6;
+pub const RADIUS_CONTROL: i32 = 5;
+pub const RADIUS_SMALL: i32 = 3;
 
-const BODY_SIZE: f32 = 15.0;
-const PADDING: i32 = 14;
+// Density. These are the numbers that decide whether the result looks like an
+// interface or like a toy, and every one of them was too large.
+//
+// The reference points are the desktops people actually use: a 13px system font,
+// a control about 28px tall, and single-digit padding almost everywhere. Chunky
+// controls do not read as friendly at this scale, they read as unfinished.
+const BODY_SIZE: f32 = 13.0;
+const PADDING: i32 = 10;
 /// Space above and below the text inside a control.
-const CONTROL_PAD: i32 = 9;
+const CONTROL_PAD: i32 = 6;
 /// Space either side of the text inside a button.
-const BUTTON_PAD: i32 = 16;
-const CHECKBOX_SIZE: i32 = 17;
+const BUTTON_PAD: i32 = 12;
+const CHECKBOX_SIZE: i32 = 14;
 const DIVIDER: i32 = 1;
 /// An editor is this many lines tall.
 const EDITOR_LINES: i32 = 4;
@@ -83,9 +92,9 @@ pub const WHEEL_STEP: i32 = 48;
 fn gap_of(node: &Node) -> i32 {
     match node.attr("gap") {
         Some("none") => 0,
-        Some("sm") => 6,
-        Some("lg") => 18,
-        _ => 10,
+        Some("sm") => 4,
+        Some("lg") => 14,
+        _ => 8,
     }
 }
 
@@ -117,8 +126,8 @@ pub fn style_at(tree: &Tree, index: usize) -> Style {
 
     let mut style = Style {
         size: match role {
-            Some("heading") => BODY_SIZE * 1.75,
-            Some("subheading") => BODY_SIZE * 1.3,
+            Some("heading") => BODY_SIZE * 1.45,
+            Some("subheading") => BODY_SIZE * 1.15,
             Some("caption") => BODY_SIZE * 0.85,
             _ => BODY_SIZE,
         },
@@ -396,12 +405,18 @@ fn line_height(fonts: &Fonts, tree: &Tree, index: usize) -> i32 {
     fonts.line_height(&style_at(tree, index))
 }
 
+/// The height of the small label a group or list draws above its children.
+fn label_height(fonts: &Fonts, tree: &Tree, index: usize) -> i32 {
+    let style = style_at(tree, index);
+    fonts.line_height(&Style { size: style.size * 0.85, ..style }) + 6
+}
+
 fn control_height(fonts: &Fonts, tree: &Tree, index: usize) -> i32 {
     line_height(fonts, tree, index) + CONTROL_PAD * 2
 }
 
-/// Elements that draw a surface behind their children.
-fn framed(tag: Tag) -> bool {
+/// Elements that confine their children and so need their own clip.
+fn bounded(tag: Tag) -> bool {
     matches!(tag, Tag::Group | Tag::Dialog | Tag::List)
 }
 
@@ -410,12 +425,12 @@ fn framed(tag: Tag) -> bool {
 /// A window is padded but not framed: content should not sit flush against the
 /// side of the screen, but the window itself draws nothing but background.
 fn padded(tag: Tag) -> bool {
-    framed(tag) || tag == Tag::Window
+    matches!(tag, Tag::Dialog | Tag::Window)
 }
 
 /// Elements that confine their children to their own rectangle.
 fn clipping(tag: Tag) -> bool {
-    framed(tag) || tag == Tag::Scroll
+    bounded(tag) || tag == Tag::Scroll
 }
 
 /// Elements that draw their own label above their children, and so must reserve
@@ -463,7 +478,7 @@ fn measure(fonts: &Fonts, tree: &Tree, index: usize, width: i32) -> i32 {
             }
 
             let title = if titled(node.tag) && node.attr("label").is_some() {
-                line_height(fonts, tree, index) + gap
+                label_height(fonts, tree, index) + gap
             } else {
                 0
             };
@@ -522,7 +537,7 @@ impl Placer<'_> {
         // A container that labels itself takes the top of the space before the
         // children divide what is left.
         if titled(tag) && node.attr("label").is_some() {
-            let used = line_height(self.fonts, tree, index) + gap_of(node);
+            let used = label_height(self.fonts, tree, index) + gap_of(node);
             inner = Rect::new(inner.x, inner.y + used, inner.w, inner.h - used);
         }
 
@@ -770,18 +785,26 @@ fn paint_node(
             );
         }
 
-        Tag::Group | Tag::Dialog | Tag::List => {
-            if node.tag == Tag::Dialog {
-                canvas.shadow(rect, RADIUS_SURFACE, 18, 120);
-            }
-            canvas.fill_round_rect(
-                rect,
-                RADIUS_SURFACE,
-                if node.tag == Tag::Dialog { RAISED } else { SURFACE },
-            );
+        Tag::Dialog => {
+            canvas.shadow(rect, RADIUS_SURFACE, 18, 120);
+            canvas.fill_round_rect(rect, RADIUS_SURFACE, RAISED);
             canvas.stroke_round_rect(rect, RADIUS_SURFACE, 1, BORDER);
             if let Some(label) = node.attr("label") {
                 canvas.draw_text(fonts, label, rect.x + PADDING, rect.y + PADDING, &style, MUTED);
+            }
+        }
+
+        // A group draws a hairline and a small label, and nothing else. It is a
+        // heading with a rule under it, not a container: a filled box inside a
+        // filled window inside a filled region is three surfaces deep and none
+        // of them carries information.
+        Tag::Group | Tag::List => {
+            let heading = style_at(tree, index);
+            let heading = Style { size: heading.size * 0.85, ..heading };
+            if let Some(label) = node.attr("label") {
+                canvas.draw_text(fonts, label, rect.x, rect.y, &heading, MUTED);
+                let rule = rect.y + fonts.line_height(&heading) + 3;
+                canvas.fill_rect(Rect::new(rect.x, rule, rect.w, 1), BORDER);
             }
         }
 
