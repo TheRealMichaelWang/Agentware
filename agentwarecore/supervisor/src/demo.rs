@@ -23,6 +23,7 @@ use crate::service::{RestartPolicy, Service};
 
 const AWCTL: &str = "/bin/awctl";
 const AWAPP: &str = "/bin/awapp";
+const AWAGENT: &str = "/bin/awagent";
 const HAIMANAGER: &str = "/bin/haimanager";
 
 /// True if the kernel command line asked for the demonstration.
@@ -32,11 +33,15 @@ pub fn requested() -> bool {
         .unwrap_or(false)
 }
 
-/// The workspace process is the reference client; agents are still nothing.
+/// The workspace process and the agent are both stand-ins.
+///
+/// The agent is forked on request from the agentdesk, exactly as a real one
+/// would be, with a descriptor to the compositor and a private channel back to
+/// the workspace that asked for it.
 pub fn programs() -> Programs {
     Programs {
         desk: (AWAPP.into(), vec!["desk".into()]),
-        agent: ("/bin/agent".into(), vec![]),
+        agent: (AWAGENT.into(), vec![]),
         app_dir: "/bin".into(),
     }
 }

@@ -1,0 +1,11 @@
+[package]
+name = "awagent"
+version = "0.1.0"
+edition = "2024"
+
+# A stand-in for the per-turn worker. It owns nothing durable, exits when its
+# turn is finished, and is never restarted. There is no model behind it: what it
+# does is a fixed script, because the point is to exercise the compositor's
+# agent surface rather than to be intelligent.
+[dependencies]
+awproto = { path = "../awproto" }

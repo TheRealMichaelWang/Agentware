@@ -43,6 +43,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::os::unix::net::UnixStream;
 
 use awproto::Decoder;
+use awproto::agent;
 use awproto::display::{self, MAX_TREE};
 
 use crate::awml::{self, Tag};
@@ -128,6 +129,9 @@ pub struct Progress {
     pub dirty: bool,
     /// Lines worth putting in the kernel log.
     pub log: Vec<String>,
+    /// Queries and intents from an agent connection, for the screen to answer.
+    /// An agent does not render, so nothing it sends is understood here.
+    pub requests: Vec<Vec<String>>,
 }
 
 impl Client {
@@ -181,7 +185,8 @@ impl Client {
 
     /// Drain whatever arrived and apply it.
     pub fn readable(&mut self, fonts: &Fonts) -> Progress {
-        let mut progress = Progress { gone: false, dirty: false, log: Vec::new() };
+        let mut progress =
+            Progress { gone: false, dirty: false, log: Vec::new(), requests: Vec::new() };
         let mut buf = [0u8; 8192];
 
         loop {
@@ -211,6 +216,8 @@ impl Client {
                         let (dirty, line) = self.apply(fonts, &source, version);
                         progress.dirty |= dirty;
                         progress.log.push(line);
+                    } else if self.kind == Kind::Agent {
+                        progress.requests.push(fields);
                     } else {
                         progress.log.push(format!(
                             "{}: ignoring {:?}",
@@ -439,37 +446,217 @@ impl Client {
 
         self.focus = Some(key.clone());
 
-        match tag {
-            Tag::Field | Tag::Editor => {
-                let style = ui::style_at(&doc.tree, index);
-                let caret = ui::caret_from_x(fonts, &value, &style, ui::text_origin(rect), x);
+        // A click on a text control places the caret and reports nothing: where
+        // the caret is inside a value is not the application's business.
+        if matches!(tag, Tag::Field | Tag::Editor) {
+            let style = ui::style_at(&doc.tree, index);
+            let caret = ui::caret_from_x(fonts, &value, &style, ui::text_origin(rect), x);
+            let state = self.editing.entry(key).or_insert(Editing {
+                value,
+                caret: 0,
+                outstanding: Vec::new(),
+            });
+            state.caret = caret.min(state.value.chars().count());
+            self.note = format!("caret in {id} at {}", state.caret);
+            return true;
+        }
+
+        // Everything else goes through the same door an agent's intent does. A
+        // click on a checkbox is a toggle rather than a click: `check` and
+        // `uncheck` exist so an intent can be unconditional, but a human
+        // pressing the box means invert it.
+        let action = if tag == Tag::Checkbox {
+            display::ACTION_TOGGLE
+        } else {
+            display::ACTION_CLICK
+        };
+        let _ = self.act(fonts, index, action, "");
+        true
+    }
+
+    /// Perform one action from the closed vocabulary on one node.
+    ///
+    /// Both paths end here. A human's click resolves a point to a node and calls
+    /// this; an agent's intent resolves a name to a node and calls this. One
+    /// implementation, so the two cannot disagree about what an action does, and
+    /// so an application cannot tell which of them it was.
+    ///
+    /// The action list is checked against what the element derives from its type
+    /// and state, which is the same list the agent was shown. Nothing here
+    /// trusts a verb because it arrived.
+    pub fn act(
+        &mut self,
+        fonts: &Fonts,
+        index: usize,
+        action: &str,
+        value: &str,
+    ) -> Result<(), &'static str> {
+        let Some(doc) = &self.doc else { return Err(agent::REASON_NO_SUCH_NODE) };
+        let node = doc.tree.node(index);
+        let tag = node.tag;
+        let disabled = node.disabled();
+
+        if disabled {
+            return Err(agent::REASON_DISABLED);
+        }
+        if !tag.actions(disabled).contains(&action) {
+            return Err(agent::REASON_UNSUPPORTED);
+        }
+
+        let id = node.id().unwrap_or_default().to_owned();
+        let key = doc.key(index).to_owned();
+        let checked = node.flag("checked");
+        let selected = node.flag("selected");
+        let current = node.attr("value").unwrap_or("").to_owned();
+
+        // Focus is the compositor's. An application is never told about it,
+        // which is why it is not in the event vocabulary at all.
+        self.focus = Some(key.clone());
+
+        match action {
+            "focus" => {}
+
+            "click" => self.emit(&id, display::ACTION_CLICK, ""),
+
+            "toggle" => self.emit(&id, display::ACTION_TOGGLE, ""),
+
+            // The unconditional forms. They become the event a human would have
+            // produced, which is a toggle, and only when the state has to move.
+            // An agent asking for a box to be checked should not depend on a
+            // state it read a moment ago.
+            "check" | "uncheck" => {
+                if checked != (action == "check") {
+                    self.emit(&id, display::ACTION_TOGGLE, "");
+                }
+            }
+
+            "select" | "deselect" => {
+                if selected != (action == "select") {
+                    let verb = if action == "select" {
+                        display::ACTION_SELECT
+                    } else {
+                        display::ACTION_DESELECT
+                    };
+                    self.emit(&id, verb, "");
+                }
+            }
+
+            "type-text" | "clear" => {
+                let next = if action == "clear" { String::new() } else { value.to_owned() };
                 let state = self.editing.entry(key).or_insert(Editing {
-                    value,
+                    value: current,
                     caret: 0,
                     outstanding: Vec::new(),
                 });
-                state.caret = caret.min(state.value.chars().count());
-                self.note = format!("caret in {id} at {}", state.caret);
-                true
+                state.value = next.clone();
+                state.caret = next.chars().count();
+                state.outstanding.push(next.clone());
+
+                if let Some(doc) = &mut self.doc {
+                    doc.tree.nodes[index].set("value", &next);
+                }
+                self.relayout(fonts);
+                self.emit(&id, display::ACTION_TYPE_TEXT, &next);
             }
 
-            // A click on a checkbox is a toggle, not a click: `check` and
-            // `uncheck` exist so an intent can be unconditional, but a human
-            // pressing the box means invert it.
-            Tag::Checkbox => {
-                self.emit(&id, display::ACTION_TOGGLE, "");
-                self.note = format!("toggled {id}");
-                true
+            "submit" => {
+                let value = self
+                    .editing
+                    .get(&key)
+                    .map(|state| state.value.clone())
+                    .unwrap_or(current);
+                self.emit(&id, display::ACTION_SUBMIT, &value);
             }
 
-            Tag::Button | Tag::Item => {
-                self.emit(&id, display::ACTION_CLICK, "");
-                self.note = format!("clicked {id}");
-                true
-            }
-
-            _ => true,
+            _ => return Err(agent::REASON_UNSUPPORTED),
         }
+
+        self.note = format!("{action} on {id}");
+        Ok(())
+    }
+
+    /// Resolve an id the way an agent names one.
+    ///
+    /// Ids are unique within a window, not globally, which is why this is scoped
+    /// to one client and an agent has to name the application first.
+    pub fn node_by_id(&self, id: &str) -> Option<usize> {
+        let doc = self.doc.as_ref()?;
+        (0..doc.tree.nodes.len()).find(|&index| doc.tree.node(index).id() == Some(id))
+    }
+
+    pub fn rect_of(&self, index: usize) -> Rect {
+        self.layout.rect_of(index)
+    }
+
+    pub fn is_visible(&self, index: usize) -> bool {
+        self.layout.is_visible(index)
+    }
+
+    pub fn is_disabled(&self, index: usize) -> bool {
+        self.doc
+            .as_ref()
+            .is_some_and(|doc| doc.tree.node(index).disabled())
+    }
+
+    /// Whether the application declared that a human must approve this control
+    /// before an agent may act on it.
+    ///
+    /// An app declaring its own permissions is a starting point rather than a
+    /// security model: it can mark a destructive action false through
+    /// carelessness or design. Nothing here should assume the declaration is the
+    /// final word, which is why the check is a lookup rather than a cached flag.
+    pub fn needs_approval(&self, index: usize) -> bool {
+        self.doc
+            .as_ref()
+            .is_some_and(|doc| doc.tree.node(index).flag("must-ask-perms"))
+    }
+
+    /// Scroll whatever has to move so a node is inside its container.
+    ///
+    /// This is the one action handled entirely by the compositor. The agent says
+    /// which node it wants visible and the compositor works out which container
+    /// to scroll and by how much, which is why `scroll` needs no id and an agent
+    /// never addresses one. It is the intent principle applied to a mechanism:
+    /// express what should be true, not the steps to make it so.
+    pub fn reveal(&mut self, fonts: &Fonts, index: usize) -> bool {
+        let Some(doc) = &self.doc else { return false };
+
+        // Innermost scroll container above the node. Only one is moved: a nested
+        // scroll is rare and moving the outer one first would undo the inner.
+        let mut at = doc.tree.node(index).parent;
+        let mut container = None;
+        while let Some(node) = at {
+            if doc.tree.node(node).tag == Tag::Scroll {
+                container = Some(node);
+                break;
+            }
+            at = doc.tree.node(node).parent;
+        }
+
+        let Some(container) = container else { return false };
+        let rect = self.layout.rect_of(index);
+        let view = self.layout.rect_of(container);
+
+        let shift = if rect.y < view.y {
+            rect.y - view.y
+        } else if rect.y + rect.h > view.y + view.h {
+            rect.y + rect.h - (view.y + view.h)
+        } else {
+            return false;
+        };
+
+        let key = doc.key(container).to_owned();
+        let was = self.scroll.get(&key).copied().unwrap_or(0);
+        self.scroll.insert(key, was + shift);
+        self.relayout(fonts);
+        self.note = format!("scrolled to reveal {}", self.label());
+        true
+    }
+
+    /// Queue one frame for this client.
+    pub fn send(&mut self, fields: &[&str]) {
+        self.pending.extend_from_slice(&awproto::encode(fields));
+        self.flush();
     }
 
     fn wheel(&mut self, fonts: &Fonts, delta: i32, x: i32, y: i32) -> bool {

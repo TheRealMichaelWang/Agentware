@@ -43,9 +43,12 @@
 //! chat input and the transcript all stay live, or the freeze would be a trap
 //! rather than a safety measure.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::os::fd::{OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::time::{Duration, Instant};
+
+use awproto::agent;
 
 use crate::client::{Client, Kind, Progress};
 use crate::cursor;
@@ -64,6 +67,32 @@ const WINDOW_TITLE: i32 = 28;
 /// How far each successive window is offset, so none is entirely hidden.
 const CASCADE: i32 = 34;
 const WINDOW_MARGIN: i32 = 22;
+
+/// How long the fake cursor takes to travel to what an agent named.
+///
+/// Long enough for a human to follow, which is the entire point of it. An agent
+/// that acted instantly would be indistinguishable from one that had never
+/// shown its work, and the visible embodiment VISION.md promises would be a
+/// claim rather than something on screen.
+const FLIGHT: Duration = Duration::from_millis(600);
+
+/// An intent that has been accepted and is being performed.
+///
+/// It exists as state rather than as a blocking call because the compositor must
+/// keep answering the human while it runs. The stop button and the navigation
+/// bar stay live through the whole of it.
+struct Flight {
+    agent: RawFd,
+    app: RawFd,
+    app_name: String,
+    desk: u32,
+    target: String,
+    action: String,
+    value: String,
+    from: (i32, i32),
+    to: (i32, i32),
+    started: Instant,
+}
 
 /// Where the keyboard is pointed.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -115,6 +144,16 @@ pub struct Screen {
     /// can block inside one.
     requests: Vec<Vec<String>>,
     notes: Vec<String>,
+
+    /// The intent being performed, if any.
+    flight: Option<Flight>,
+    /// Intents that arrived while one was in flight. An agent waits for its
+    /// answer before sending the next, so this is a safety net rather than a
+    /// pipeline.
+    queued: VecDeque<(RawFd, Vec<String>)>,
+    /// Where the agent's pointer is, and whose workspace it is in. Kept after a
+    /// flight lands, so the human can see what was just touched.
+    agent_cursor: Option<(u32, i32, i32)>,
 }
 
 impl Screen {
@@ -131,6 +170,9 @@ impl Screen {
             debug: false,
             requests: Vec::new(),
             notes: Vec::new(),
+            flight: None,
+            queued: VecDeque::new(),
+            agent_cursor: None,
         }
     }
 
@@ -244,6 +286,16 @@ impl Screen {
 
         if self.focus == Surface::App(fd) {
             self.focus = Surface::Desk;
+        }
+
+        // An agent that has gone leaves no pointer behind, and an intent whose
+        // agent or target has gone has nobody to answer and nothing to act on.
+        if self.flight.as_ref().is_some_and(|f| f.agent == fd || f.app == fd) {
+            self.flight = None;
+        }
+        self.queued.retain(|(from, _)| *from != fd);
+        if self.clients.iter().all(|client| client.kind != Kind::Agent) {
+            self.agent_cursor = None;
         }
 
         self.reframe(fonts);
@@ -420,7 +472,7 @@ impl Screen {
                     ));
                     return true;
                 }
-                self.raise(fd, fonts);
+                self.raise(self.current, fd);
                 self.focus = Surface::App(fd);
                 self.route_to(fd, fonts, Event::ButtonPressed { button: Button::Left, x, y })
             }
@@ -445,17 +497,16 @@ impl Screen {
         self.route_to(fd, fonts, event)
     }
 
-    fn raise(&mut self, fd: RawFd, fonts: &Fonts) {
-        let Some(workspace) = self.workspaces.get_mut(self.current) else { return };
+    fn raise(&mut self, at: usize, fd: RawFd) {
+        let Some(workspace) = self.workspaces.get_mut(at) else { return };
         let Some(at) = workspace.windows.iter().position(|w| w.fd == fd) else { return };
         if at + 1 == workspace.windows.len() {
             return;
         }
         let window = workspace.windows.remove(at);
         workspace.windows.push(window);
-        // The frame does not change, since a window keeps its slot when raised,
-        // but the client list order did and painting follows it.
-        let _ = fonts;
+        // No reframing: a window keeps the slot it was given when it opened, so
+        // raising it changes only what paints last and what a point resolves to.
     }
 
     fn agent_running(&self) -> bool {
@@ -480,6 +531,310 @@ impl Screen {
             return false;
         }
         self.switch((self.current + 1) % self.workspaces.len())
+    }
+
+    // ---- the agent surface -------------------------------------------------
+
+    /// Answer whatever an agent asked for.
+    ///
+    /// Every answer is scoped to the workspace the supervisor said this
+    /// connection belongs to. There is no workspace id in any of these messages
+    /// and there is nowhere for the agent to put one.
+    pub fn requests(&mut self, fonts: &Fonts, from: RawFd, requests: Vec<Vec<String>>) -> bool {
+        let mut dirty = false;
+        for fields in requests {
+            dirty |= self.answer(fonts, from, &fields);
+        }
+        dirty
+    }
+
+    fn answer(&mut self, fonts: &Fonts, from: RawFd, fields: &[String]) -> bool {
+        let field = |at: usize| fields.get(at).map(String::as_str).unwrap_or("");
+
+        match (field(0), field(1)) {
+            (agent::MSG_QUERY, agent::MSG_APPS) => {
+                let markup = self.list_apps(from);
+                self.reply(from, &[agent::MSG_APPS, &markup]);
+                false
+            }
+
+            (agent::MSG_QUERY, agent::MSG_VIEW) => {
+                let app = field(2).to_owned();
+                let markup = self.view_of(from, &app);
+                self.reply(from, &[agent::MSG_VIEW, &app, &markup]);
+                false
+            }
+
+            (agent::MSG_INTENT, _) => {
+                if self.flight.is_some() {
+                    self.queued.push_back((from, fields.to_vec()));
+                    return false;
+                }
+                self.begin(fonts, from, fields)
+            }
+
+            (other, _) => {
+                self.notes.push(format!("agent sent {other:?}, which is not a request"));
+                false
+            }
+        }
+    }
+
+    /// Which workspace an agent connection belongs to.
+    fn agent_workspace(&self, from: RawFd) -> Option<usize> {
+        self.workspaces.iter().position(|w| w.agent == Some(from))
+    }
+
+    /// What applications are open, in this agent's workspace and no other.
+    ///
+    /// The agentdesk is absent by construction rather than by being filtered:
+    /// only windows are listed, and a desk connection is not a window. A useful
+    /// consequence is that an agent cannot read the chat pane containing its own
+    /// streamed thoughts, which would otherwise be a feedback loop.
+    fn list_apps(&self, from: RawFd) -> String {
+        let Some(at) = self.agent_workspace(from) else {
+            return "<apps/>".to_owned();
+        };
+        let workspace = &self.workspaces[at];
+
+        let mut out = format!("<apps desk=\"{}\">\n", workspace.id);
+        for window in &workspace.windows {
+            let Some(client) = self.client(window.fd) else { continue };
+            out.push_str(&format!(
+                "  <app name=\"{}\" title=\"{}\"/>\n",
+                client.name,
+                client.title()
+            ));
+        }
+        out.push_str("</apps>");
+        out
+    }
+
+    fn view_of(&self, from: RawFd, app: &str) -> String {
+        let Some(at) = self.agent_workspace(from) else {
+            return format!("<rejected target=\"{app}\" reason=\"{}\"/>", agent::REASON_NOT_ADDRESSABLE);
+        };
+
+        match self.app_in(at, app).and_then(|fd| self.client(fd)) {
+            Some(client) => client.agent_view().unwrap_or_default(),
+            None => format!(
+                "<rejected target=\"{app}\" reason=\"{}\"/>",
+                self.why_not(at, app)
+            ),
+        }
+    }
+
+    fn app_in(&self, at: usize, name: &str) -> Option<RawFd> {
+        let workspace = self.workspaces.get(at)?;
+        workspace
+            .windows
+            .iter()
+            .find(|window| self.client(window.fd).is_some_and(|c| c.name == name))
+            .map(|window| window.fd)
+    }
+
+    /// Why an application the agent named is not one it may have.
+    ///
+    /// The distinction is worth making. Something open in another workspace, or
+    /// the workspace's own chrome, is not missing: it exists and is forbidden,
+    /// and telling an agent it does not exist would send it looking for it.
+    fn why_not(&self, at: usize, name: &str) -> &'static str {
+        let elsewhere = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .any(|(other, workspace)| {
+                other != at
+                    && workspace
+                        .windows
+                        .iter()
+                        .any(|w| self.client(w.fd).is_some_and(|c| c.name == name))
+            });
+
+        if elsewhere || name == "workspace" {
+            agent::REASON_NOT_ADDRESSABLE
+        } else {
+            agent::REASON_NO_SUCH_APP
+        }
+    }
+
+    /// The topmost window at a point within one workspace.
+    ///
+    /// Used both for routing the human's clicks and for deciding whether an
+    /// agent's target is covered, which is deliberate: they are the same
+    /// question, and answering it twice would let them drift.
+    fn topmost_at(&self, at: usize, x: i32, y: i32) -> Option<RawFd> {
+        let workspace = self.workspaces.get(at)?;
+        let slots = workspace.next_slot;
+        workspace
+            .windows
+            .iter()
+            .rev()
+            .find(|window| self.window_rect(window.slot, slots).contains(x, y))
+            .map(|window| window.fd)
+    }
+
+    /// Check an intent and start the cursor moving, or say why not.
+    fn begin(&mut self, fonts: &Fonts, from: RawFd, fields: &[String]) -> bool {
+        let field = |at: usize| fields.get(at).map(String::as_str).unwrap_or("");
+        let (app, action, target, value) =
+            (field(1).to_owned(), field(2).to_owned(), field(3).to_owned(), field(4).to_owned());
+
+        let Some(at) = self.agent_workspace(from) else {
+            self.refuse(from, &app, &target, agent::REASON_NOT_ADDRESSABLE);
+            return false;
+        };
+
+        let Some(app_fd) = self.app_in(at, &app) else {
+            let reason = self.why_not(at, &app);
+            self.refuse(from, &app, &target, reason);
+            return false;
+        };
+
+        let Some(client) = self.client(app_fd) else {
+            self.refuse(from, &app, &target, agent::REASON_NO_SUCH_APP);
+            return false;
+        };
+        let Some(index) = client.node_by_id(&target) else {
+            self.refuse(from, &app, &target, agent::REASON_NO_SUCH_NODE);
+            return false;
+        };
+
+        // `scroll-into-view` is the one action the compositor performs itself,
+        // and the one that targets any node rather than only a control. It is
+        // also the way out of both ways a node can be unreachable: it scrolls
+        // the container, and it brings a covered window forward. The agent says
+        // what it wants to be true and not how to bring it about.
+        if action == "scroll-into-view" {
+            self.raise(at, app_fd);
+            let moved = self
+                .client_mut(app_fd)
+                .map(|client| client.reveal(fonts, index))
+                .unwrap_or(false);
+            self.confirm(from, &app, &target, &action);
+            self.notes.push(format!("agent revealed {target} in {app}"));
+            return moved || true;
+        }
+
+        if client.is_disabled(index) {
+            self.refuse(from, &app, &target, agent::REASON_DISABLED);
+            return false;
+        }
+        if client.needs_approval(index) {
+            self.refuse(from, &app, &target, agent::REASON_NEEDS_APPROVAL);
+            return false;
+        }
+        // Scrolled out of its own container.
+        if !client.is_visible(index) {
+            self.refuse(from, &app, &target, agent::REASON_NOT_VISIBLE);
+            return false;
+        }
+
+        let rect = client.rect_of(index);
+        let to = (rect.x + rect.w / 2, rect.y + rect.h / 2);
+
+        // Behind another window. The test is literally "would a human clicking
+        // here have hit this", which is the standard every intent is held to.
+        if self.topmost_at(at, to.0, to.1) != Some(app_fd) {
+            self.refuse(from, &app, &target, agent::REASON_NOT_VISIBLE);
+            return false;
+        }
+
+        let desk = self.workspaces[at].id;
+        let from_point = self.agent_cursor.filter(|(d, _, _)| *d == desk).map_or(
+            (self.regions().apps.x + 20, self.regions().apps.y + 20),
+            |(_, x, y)| (x, y),
+        );
+
+        self.flight = Some(Flight {
+            agent: from,
+            app: app_fd,
+            app_name: app,
+            desk,
+            target,
+            action,
+            value,
+            from: from_point,
+            to,
+            started: Instant::now(),
+        });
+        true
+    }
+
+    /// True while the fake cursor is moving, so the loop should wake for frames.
+    pub fn wants_frame(&self) -> bool {
+        self.flight.is_some()
+    }
+
+    /// Advance the fake cursor, and act when it arrives.
+    pub fn tick(&mut self, fonts: &Fonts) -> bool {
+        let Some(flight) = &self.flight else { return false };
+
+        let elapsed = flight.started.elapsed();
+        if elapsed >= FLIGHT {
+            return self.land(fonts);
+        }
+
+        // Eased, because a pointer that moves at a constant speed and stops dead
+        // does not read as a pointer.
+        let t = elapsed.as_secs_f32() / FLIGHT.as_secs_f32();
+        let eased = 1.0 - (1.0 - t).powi(3);
+        let x = flight.from.0 + ((flight.to.0 - flight.from.0) as f32 * eased) as i32;
+        let y = flight.from.1 + ((flight.to.1 - flight.from.1) as f32 * eased) as i32;
+        self.agent_cursor = Some((flight.desk, x, y));
+        true
+    }
+
+    /// The cursor has arrived. Synthesize the event, or refuse.
+    fn land(&mut self, fonts: &Fonts) -> bool {
+        let Some(flight) = self.flight.take() else { return false };
+        self.agent_cursor = Some((flight.desk, flight.to.0, flight.to.1));
+
+        // The tree may have changed while the cursor was travelling. A human
+        // takes the same risk, and the difference is that the compositor can
+        // notice: refusing beats acting on whatever moved into that place.
+        let outcome = match self.client_mut(flight.app) {
+            Some(client) => match client.node_by_id(&flight.target) {
+                Some(index) => client.act(fonts, index, &flight.action, &flight.value).err(),
+                None => Some(agent::REASON_NO_SUCH_NODE),
+            },
+            None => Some(agent::REASON_NO_SUCH_APP),
+        };
+
+        match outcome {
+            None => {
+                self.notes.push(format!(
+                    "agent performed {} on {} in {}",
+                    flight.action, flight.target, flight.app_name
+                ));
+                self.confirm(flight.agent, &flight.app_name, &flight.target, &flight.action);
+            }
+            Some(reason) => {
+                self.refuse(flight.agent, &flight.app_name, &flight.target, reason)
+            }
+        }
+
+        if let Some((from, fields)) = self.queued.pop_front() {
+            self.begin(fonts, from, &fields);
+        }
+        true
+    }
+
+    fn confirm(&mut self, to: RawFd, app: &str, target: &str, action: &str) {
+        self.reply(to, &[agent::MSG_DONE, app, target, action]);
+    }
+
+    /// Rejections are answers, not silence. An agent that cannot be told no acts
+    /// blind and retries forever.
+    fn refuse(&mut self, to: RawFd, app: &str, target: &str, reason: &str) {
+        self.notes.push(format!("agent refused {target} in {app}: {reason}"));
+        self.reply(to, &[agent::MSG_REJECTED, app, target, reason]);
+    }
+
+    fn reply(&mut self, to: RawFd, fields: &[&str]) {
+        if let Some(client) = self.client_mut(to) {
+            client.send(fields);
+        }
     }
 
     // ---- the navigation bar ------------------------------------------------
@@ -580,6 +935,15 @@ impl Screen {
 
         if self.debug {
             self.draw_debug(canvas, fonts);
+        }
+
+        // The agent's pointer is drawn only in the workspace it is working in.
+        // Showing it elsewhere would say an agent was acting on a screen it is
+        // not touching.
+        if let Some((desk, x, y)) = self.agent_cursor
+            && self.workspaces.get(self.current).is_some_and(|w| w.id == desk)
+        {
+            cursor::draw(canvas, x, y, cursor::Kind::Agent);
         }
 
         let (x, y) = pointer;

@@ -41,14 +41,23 @@ pub const MSG_RENDER: &str = "render";
 /// The haimanager reporting something that happened to a node.
 pub const MSG_EVENT: &str = "event";
 
-// The subset of the action vocabulary a human's input can produce today. An
-// agent's intent is turned into exactly one of these, which is the point: the
+// The subset of the action vocabulary that reaches an application as an event.
+// An agent's intent is turned into exactly one of these, which is the point: the
 // application cannot tell the two apart, and there is no second event path for
 // an agent to reach that a human could not.
+//
+// Some verbs in the vocabulary never appear here. `focus` does not, because
+// focus is the compositor's and an application that tracked it would fight the
+// compositor for it. `check` and `uncheck` do not, because they are the
+// unconditional forms: the compositor compares them against the current state
+// and sends a `toggle` only if the state actually has to change, which is
+// exactly the event a human would have produced.
 pub const ACTION_CLICK: &str = "click";
 pub const ACTION_TYPE_TEXT: &str = "type-text";
 pub const ACTION_SUBMIT: &str = "submit";
 pub const ACTION_TOGGLE: &str = "toggle";
+pub const ACTION_SELECT: &str = "select";
+pub const ACTION_DESELECT: &str = "deselect";
 
 /// Longest tree the haimanager will accept from one client.
 ///

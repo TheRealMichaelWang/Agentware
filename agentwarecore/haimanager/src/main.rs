@@ -136,6 +136,11 @@ fn run(
     // look for new ones rather than enumerating once and hoping.
     let rescan_every = rustix::event::Timespec { tv_sec: 1, tv_nsec: 0 };
 
+    // While the agent's cursor is travelling there is an animation to run, and
+    // an animation is the one thing an event-driven loop cannot wait for. This
+    // is the only case in which the compositor wakes without being asked to.
+    let frame = rustix::event::Timespec { tv_sec: 0, tv_nsec: 16_000_000 };
+
     loop {
         for index in input.rescan() {
             let Some(device) = input.device(index) else { continue };
@@ -150,7 +155,8 @@ fn run(
             }
         }
 
-        let count = match epoll::wait(&epoll, &mut events, Some(&rescan_every)) {
+        let waiting = if screen.wants_frame() { &frame } else { &rescan_every };
+        let count = match epoll::wait(&epoll, &mut events, Some(waiting)) {
             Ok(count) => count,
             Err(rustix::io::Errno::INTR) => continue,
             Err(err) => {
@@ -159,7 +165,7 @@ fn run(
             }
         };
 
-        let mut dirty = false;
+        let mut dirty = screen.tick(fonts);
         for event in &events[..count] {
             let token = event.data.u64();
 
@@ -189,6 +195,13 @@ fn run(
                         log(&line);
                     }
                     dirty |= progress.dirty;
+
+                    // Queries and intents. Only an agent connection produces
+                    // any, and what it may see is decided by the workspace the
+                    // supervisor said this descriptor belongs to.
+                    if !progress.requests.is_empty() {
+                        dirty |= screen.requests(fonts, fd, progress.requests);
+                    }
 
                     // A first tree is worth printing whole: the reduced schema
                     // can then be read against the document that produced it,

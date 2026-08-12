@@ -27,6 +27,7 @@ agentwarecore/          cargo workspace
     src/bin/            awtest awstubborn awctl awui: self-test stand-ins
   haimanager/           the compositor: DRM, input, AWML, layout, paint, clients
   awapp/                reference client, standing in for apps and the agentdesk
+  awagent/              stand-in per-turn worker: queries, intents, rejections
 initramfs/              staged image contents (build output, gitignored)
 tools/screenshot.py     boot, inject input, capture the screen as PNG
 kernel-build/           Linux submodule
@@ -47,6 +48,7 @@ it and powers the machine off; QEMU exiting on its own is the pass signal.
 4. AWML parser, layout, hit testing, agent view
 5. Client protocol, tree diffing, ephemeral state, versioned events
 6. Workspace compositing: regions, windows, the navigation bar, input routing
+7. The agent surface: scoped queries, intents, the fake cursor, rejections
 
 Milestone 5 in more detail, since the rest builds on it. Clients arrive as
 descriptors the supervisor pushes over the control socket, each tagged with the
@@ -61,11 +63,18 @@ so typing is applied locally, painted immediately, and sent on. Values sent are
 remembered until a tree comes back carrying one, which is what stops a second
 keystroke being thrown away by the echo of the first.
 
-**Remaining:**
+Milestone 7 is the other half of that. An agent sends intents, never events, and
+the compositor resolves each one: find the application in the agent's own
+workspace, find the node, check it is enabled, not scrolled away and not behind
+another window, move the fake cursor there so the human sees it, and only then
+synthesize the event. A human's click and an agent's intent go through one
+`Client::act`, so an application cannot tell them apart and the two paths cannot
+drift. `scroll-into-view` is the way out of both ways a node can be unreachable:
+it scrolls the container and raises the window.
 
-7. **Agent surface.** Queries scoped by connection, the reduced view, intent
-   resolution with visibility and enabled checks, fake cursor animation,
-   rejections.
+**Nothing is left of the original plan.** What is missing now is not
+compositor work: `startmenu`, a real `agentdesk` that streams conversation to
+and from an agent, a real `agent` with a model behind it, and applications.
 
 Nothing else exists yet: no `agentdesk`, no `agent`, no `startmenu`, no real
 apps. `awapp` stands in for the first and the last of those, and is the reference
@@ -92,7 +101,9 @@ attached.
 Once it is up, F1 cycles workspaces, standing in for the start menu, and F2
 toggles a diagnostic overlay listing every connection and the version it is on.
 The taskbar's launcher and the pane's Send button both go through the real
-broker, so clicking them forks real processes.
+broker, so clicking them forks real processes: Send starts an agent turn, which
+is the whole of milestone 7 running against a live screen. The kernel log carries
+its intents and their outcomes.
 
 Builds target `x86_64-unknown-linux-musl`. No sudo is needed: `cpio` records a
 device node's major/minor from `stat` and never opens it.
@@ -164,6 +175,12 @@ is the list so it does not get relitigated.
 * The stop button is drawn by the haimanager and routes to the supervisor, so it
   works even if the agentdesk is wedged.
 * Applications send the **whole tree** every time; the haimanager diffs it.
+* A human's click and an agent's intent end in **one function**. Nothing else may
+  synthesize an event, or the two paths drift and the guarantee that an agent can
+  only do what a human could have done stops being checkable.
+* `scroll-into-view` is the only remedy for an unreachable node, and it covers
+  both scrolling and raising. The agent expresses what should be true, never the
+  steps.
 * The tree version is the **application's own counter**, stamped by it and echoed
   back on every event. Checking one is then a comparison against a number the app
   already holds, not a mapping it has to maintain.

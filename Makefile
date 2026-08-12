@@ -62,6 +62,8 @@ pack: build
 	# The same binary under a second name, because the spawn broker forks an
 	# app by name with no arguments, so two names is how there are two apps.
 	cp $(BIN_DIR)/awapp $(FS_DIR)/bin/awnotes
+	# The per-turn worker, forked on the agentdesk's request.
+	cp $(BIN_DIR)/awagent $(FS_DIR)/bin/awagent
 
 	# 3b. Stand-in binaries used by `make selftest` to exercise the service
 	# table and the control socket. Harmless to ship; nothing starts them
