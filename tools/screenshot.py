@@ -130,6 +130,10 @@ def main():
                         help="kernel command line")
     parser.add_argument("--serial", default=None,
                         help="where to write the serial log")
+    parser.add_argument("--do", action="append", default=[], metavar="CMD",
+                        help="a QEMU monitor command to run before capturing, "
+                             "repeatable. e.g. --do 'sendkey a' "
+                             "--do 'mouse_move 100 50' --do 'mouse_button 1'")
     args = parser.parse_args()
 
     workdir = tempfile.mkdtemp(prefix="agentware-shot-")
@@ -142,6 +146,13 @@ def main():
         time.sleep(args.seconds)
         if guest.poll() is not None:
             print("qemu exited early (status %s)" % guest.returncode, file=sys.stderr)
+
+        # Injected input goes through the same monitor connection, so it is
+        # ordered against the capture rather than racing it.
+        for command in args.do:
+            monitor_command(monitor_path, command)
+        if args.do:
+            time.sleep(0.5)   # let the guest react before the shutter
 
         reply = monitor_command(monitor_path, "screendump %s" % ppm_path)
         if not os.path.exists(ppm_path):
