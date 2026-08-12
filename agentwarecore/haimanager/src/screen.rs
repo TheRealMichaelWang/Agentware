@@ -55,7 +55,7 @@ use crate::cursor;
 use crate::document::Document;
 use crate::input::{Button, Event, Key};
 use crate::paint::font::{Family, Fonts, Style};
-use crate::paint::{Canvas, Rect, rgb};
+use crate::paint::{Canvas, Rect};
 use crate::ui::{self, Focus, Frame, Layout, Regions};
 
 /// Height of the navigation bar, which sits above every workspace.
@@ -73,12 +73,9 @@ fn window_title_h() -> i32 { ui::sc(24) }
 /// How far each successive window is offset, so none opens exactly on another.
 fn cascade() -> i32 { ui::sc(26) }
 fn window_margin() -> i32 { ui::sc(14) }
-/// Radius of the close, minimize and maximize dots.
-fn light_r() -> i32 { ui::sc(5) }
-/// Centre of the first dot, from the left edge of the title bar.
-fn light_inset() -> i32 { ui::sc(14) }
-/// Distance between dot centres.
-fn light_step() -> i32 { ui::sc(17) }
+/// Width of one title bar button. The three sit flush at the bar's right end,
+/// each the full height of the bar, which makes them targets rather than dots.
+fn title_button_w() -> i32 { ui::sc(34) }
 /// The strip along the bottom of the apps region holding every open window.
 fn dock_height() -> i32 { ui::sc(26) }
 fn dock_pill() -> i32 { ui::sc(104) }
@@ -383,6 +380,23 @@ impl Screen {
         pills
     }
 
+    /// Where each title bar button sits: minimize, maximize, close, flush right.
+    ///
+    /// Close is the outermost, so it lives in the corner a flung pointer lands
+    /// in, and the glyph order matches what each does: the chevron points down
+    /// at the dock the window will go to, the brackets push outward, the cross
+    /// is the end.
+    fn title_buttons(rect: Rect) -> [(Title, Rect); 3] {
+        let bar = Rect::new(rect.x, rect.y, rect.w, window_title_h());
+        let w = title_button_w();
+        let right = bar.x + bar.w;
+        [
+            (Title::Minimize, Rect::new(right - w * 3, bar.y, w, bar.h)),
+            (Title::Maximize, Rect::new(right - w * 2, bar.y, w, bar.h)),
+            (Title::Close, Rect::new(right - w, bar.y, w, bar.h)),
+        ]
+    }
+
     /// What part of a window's title bar a point is on.
     fn title_hit(rect: Rect, x: i32, y: i32) -> Option<Title> {
         let bar = Rect::new(rect.x, rect.y, rect.w, window_title_h());
@@ -390,15 +404,8 @@ impl Screen {
             return None;
         }
 
-        let cy = bar.y + bar.h / 2;
-        for (index, action) in
-            [Title::Close, Title::Minimize, Title::Maximize].into_iter().enumerate()
-        {
-            let cx = bar.x + light_inset() + light_step() * index as i32;
-            let (dx, dy) = (x - cx, y - cy);
-            // A little larger than the dot is drawn. A six pixel target is not
-            // a target.
-            if dx * dx + dy * dy <= (light_r() + 4) * (light_r() + 4) {
+        for (action, button) in Self::title_buttons(rect) {
+            if button.contains(x, y) {
                 return Some(action);
             }
         }
@@ -1343,7 +1350,7 @@ impl Screen {
         canvas.clear(ui::BACKGROUND);
 
         match self.workspaces.get(self.current) {
-            Some(_) => self.draw_workspace(canvas, fonts),
+            Some(_) => self.draw_workspace(canvas, fonts, pointer),
             None => self.draw_empty(canvas, fonts),
         }
 
@@ -1371,7 +1378,7 @@ impl Screen {
     /// The order is the reason painting has to be able to start partway down a
     /// tree: the workspace's regions are branches of one document that do not
     /// paint consecutively, because the application windows go between them.
-    fn draw_workspace(&self, canvas: &mut Canvas, fonts: &Fonts) {
+    fn draw_workspace(&self, canvas: &mut Canvas, fonts: &Fonts, pointer: (i32, i32)) {
         let regions = self.regions();
         let workspace = &self.workspaces[self.current];
         let desk = workspace.desk.and_then(|fd| self.client(fd));
@@ -1393,7 +1400,7 @@ impl Screen {
             let focused = self.focus == Surface::App(window.fd);
             let Some(client) = self.client(window.fd) else { continue };
             canvas.clipped(regions.apps, |canvas| {
-                draw_window(canvas, fonts, client, window.rect, focused)
+                draw_window(canvas, fonts, client, window.rect, focused, window.maximized, pointer)
             });
         }
 
@@ -1549,7 +1556,15 @@ fn content_of(rect: Rect) -> Rect {
 /// are compositor affordances over a client rather than part of any client's
 /// interface, and putting them in the tree would mean every application could
 /// decide whether it was closable.
-fn draw_window(canvas: &mut Canvas, fonts: &Fonts, client: &Client, rect: Rect, focused: bool) {
+fn draw_window(
+    canvas: &mut Canvas,
+    fonts: &Fonts,
+    client: &Client,
+    rect: Rect,
+    focused: bool,
+    maximized: bool,
+    pointer: (i32, i32),
+) {
     let bar = Rect::new(rect.x, rect.y, rect.w, window_title_h());
 
     // Depth rather than a heavy outline. A focused window sits higher.
@@ -1567,23 +1582,64 @@ fn draw_window(canvas: &mut Canvas, fonts: &Fonts, client: &Client, rect: Rect, 
     });
 
     let cy = bar.y + bar.h / 2;
-    for (index, colour) in [rgb(0xff, 0x5f, 0x57), rgb(0xfe, 0xbc, 0x2e), rgb(0x28, 0xc8, 0x40)]
-        .into_iter()
-        .enumerate()
-    {
-        let cx = bar.x + light_inset() + light_step() * index as i32;
-        let dot = Rect::new(cx - light_r(), cy - light_r(), light_r() * 2, light_r() * 2);
-        // Unfocused windows keep the dots but drain them, the way every desktop
-        // does, so the focused window is obvious without a coloured border.
-        canvas.fill_round_rect(dot, light_r(), if focused { colour } else { ui::BORDER });
+
+    // The window controls: stroke glyphs at the bar's right end rather than
+    // anyone else's coloured dots. Each is quiet until the pointer is over it,
+    // which the compositor can afford because it repaints on pointer motion
+    // anyway; the chip under the hovered one is what says "this is a button"
+    // without three glyphs shouting it all the time.
+    for (action, button) in Screen::title_buttons(rect) {
+        let hovered = button.contains(pointer.0, pointer.1);
+        if hovered {
+            let chip = if action == Title::Close { ui::DANGER } else { ui::PRESSED };
+            canvas.fill_round_rect(button.inset(ui::sc(4)), ui::radius_small(), chip);
+        }
+
+        let ink = match (hovered, focused) {
+            (true, _) => ui::TEXT,
+            (false, true) => ui::MUTED,
+            (false, false) => ui::BORDER,
+        };
+        let (cx, cyf) = (
+            (button.x + button.w / 2) as f32,
+            cy as f32,
+        );
+        let r = ui::sc(4) as f32;
+        let t = ui::sc(1).max(1);
+        match action {
+            // Points at the dock the window is about to join.
+            Title::Minimize => {
+                canvas.stroke_line(cx - r, cyf - r * 0.4, cx, cyf + r * 0.5, t, ink);
+                canvas.stroke_line(cx, cyf + r * 0.5, cx + r, cyf - r * 0.4, t, ink);
+            }
+            // Corner brackets pushing outward; inward when there is nowhere
+            // further out to go.
+            Title::Maximize => {
+                let d = if maximized { -r * 0.35 } else { 0.0 };
+                canvas.stroke_line(cx - r + d, cyf - r * 0.3 + d, cx - r + d, cyf - r + d, t, ink);
+                canvas.stroke_line(cx - r + d, cyf - r + d, cx - r * 0.3 + d, cyf - r + d, t, ink);
+                canvas.stroke_line(cx + r - d, cyf + r * 0.3 - d, cx + r - d, cyf + r - d, t, ink);
+                canvas.stroke_line(cx + r - d, cyf + r - d, cx + r * 0.3 - d, cyf + r - d, t, ink);
+            }
+            Title::Close => {
+                canvas.stroke_line(cx - r * 0.9, cyf - r * 0.9, cx + r * 0.9, cyf + r * 0.9, t, ink);
+                canvas.stroke_line(cx - r * 0.9, cyf + r * 0.9, cx + r * 0.9, cyf - r * 0.9, t, ink);
+            }
+            Title::Drag => {}
+        }
     }
 
     let style = Style { size: 13.0 * ui::scale(), ..Style::default() };
     let ink = if focused { ui::TEXT } else { ui::MUTED };
     let title = client.title();
-    let x = bar.x + (bar.w - fonts.measure(title, &style)) / 2;
-    let x = x.max(bar.x + light_inset() + light_step() * 3);
-    canvas.draw_text(fonts, title, x, cy - fonts.line_height(&style) / 2, &style, ink);
+    // The title starts at the bar's text inset rather than being centred:
+    // centred text between asymmetric furniture never quite looks centred, and
+    // a left-anchored title is where the drag region unambiguously begins.
+    let x = bar.x + ui::sc(12);
+    let clip = Rect::new(bar.x, bar.y, bar.w - title_button_w() * 3 - ui::sc(6), bar.h);
+    canvas.clipped(clip, |canvas| {
+        canvas.draw_text(fonts, title, x, cy - fonts.line_height(&style) / 2, &style, ink);
+    });
 
     let content = content_of(rect);
     canvas.clipped(content, |canvas| client.draw(canvas, fonts));

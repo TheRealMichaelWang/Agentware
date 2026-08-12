@@ -103,7 +103,7 @@ It speaks the same AWML over the same kind of connection, and the haimanager run
 
 Above all workspaces sits the navigation bar, drawn by the haimanager itself because it belongs to no workspace.
 
-**Window chrome is the compositor's, not the application's.** The title bar, the shadow, and the close, minimize and maximize controls are drawn by the haimanager around a client, from the `title` the application declared. They are the only controls in the system that are not AWML, and that is the point: putting them in the tree would let every application decide whether it was closable, and would make an agent's view of a window include the button that destroys it.
+**Window chrome is the compositor's, not the application's.** The title bar, the shadow, and the window controls are drawn by the haimanager around a client, from the `title` the application declared. The controls are stroke glyphs at the bar's right end, quiet until hovered: a chevron pointing down at the dock the window will join, corner brackets that push outward and flip inward once there is nowhere further to go, and a cross. They are the only controls in the system that are not AWML, and that is the point: putting them in the tree would let every application decide whether it was closable, and would make an agent's view of a window include the button that destroys it.
 
 Every open window appears as a pill in a dock along the bottom of the `apps` region, drawn by the compositor. Not in the agentdesk's taskbar, even though a taskbar is where one would expect it, because switching between windows is what a dock is for and which window is where is not something the agentdesk is told. Its taskbar holds what it does own: the launcher, and what it has opened.
 

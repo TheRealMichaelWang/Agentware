@@ -943,13 +943,7 @@ fn paint_node(
                     (low, (t.x as f32 + w * 0.90, t.y as f32 + h * 0.12)),
                 ];
                 for ((ax, ay), (bx, by)) in strokes {
-                    let steps = t.w.max(4);
-                    for step in 0..=steps {
-                        let f = step as f32 / steps as f32;
-                        let px = (ax + (bx - ax) * f).round() as i32;
-                        let py = (ay + (by - ay) * f).round() as i32;
-                        canvas.fill_rect(Rect::new(px, py - 1, 2, 2), BACKGROUND);
-                    }
+                    canvas.stroke_line(ax, ay, bx, by, sc(2).max(2), BACKGROUND);
                 }
             }
             canvas.draw_text(

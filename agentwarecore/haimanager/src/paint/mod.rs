@@ -373,6 +373,24 @@ impl Canvas {
         }
     }
 
+    /// A stroked line segment, drawn as squares stepped along it.
+    ///
+    /// Not a real line rasterizer, and deliberately so: every stroke in the
+    /// interface is a short glyph a few pixels long, where stepping a square is
+    /// indistinguishable from Bresenham with a pen and costs nothing to get
+    /// right. Anything that needs long precise lines should not be drawn with
+    /// this.
+    pub fn stroke_line(&mut self, ax: f32, ay: f32, bx: f32, by: f32, thickness: i32, color: Color) {
+        let steps = ((bx - ax).abs().max((by - ay).abs()).ceil() as i32).max(1) * 2;
+        let t = thickness.max(1);
+        for step in 0..=steps {
+            let f = step as f32 / steps as f32;
+            let x = (ax + (bx - ax) * f).round() as i32;
+            let y = (ay + (by - ay) * f).round() as i32;
+            self.fill_rect(Rect::new(x - t / 2, y - t / 2, t, t), color);
+        }
+    }
+
     /// The finished frame, row by row, for copying to a scanout buffer.
     pub fn rows(&self) -> impl Iterator<Item = &[Color]> {
         self.pixels.chunks_exact(self.width as usize)
