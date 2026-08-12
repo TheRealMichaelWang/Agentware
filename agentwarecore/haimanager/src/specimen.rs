@@ -28,7 +28,7 @@ const DOCUMENT: &str = r##"
              description="Address the message will be sent to" value=""/>
       <checkbox id="copy-self" label="Send me a copy"
                 description="Also deliver this message to your own inbox"/>
-      <text font="mono" size="sm" color="#7fd6a0">mono 12px  #7fd6a0  0123456789</text>
+      <text font="mono" size="sm" color="#7fd6a0">Sphinx of black quartz, judge my vow</text>
     </group>
 
     <group label="Message">
@@ -42,7 +42,8 @@ const DOCUMENT: &str = r##"
       <button id="discard" label="Discard" emphasis="danger"
               description="Throws away the draft without sending it"/>
       <text grow="true" color="muted">click a control to focus it</text>
-      <button id="help" label="Help"
+      <button id="help" label="Help" font="mono" size="18" weight="bold"
+              italic="true" color="#ffcc66"
               description="Explains what this window is for"/>
     </hstack>
 
