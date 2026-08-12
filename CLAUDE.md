@@ -99,35 +99,26 @@ make run         # boot in a QEMU window
 make pack        # build and pack the initramfs without booting
 ```
 
-The guest display is sized by asking the host: `make run` runs
-`tools/hostsize.sh`, which tries `xrandr` and then WSLg's own log, and subtracts
-a margin for window decorations, so the QEMU window comes up as large as the
-monitor allows. On this machine that is 1896x960 out of a 1920x1080 desktop. The boot line prints what
-was chosen and what the host reported, so a wrong size is visible rather than a
-mystery. With no X display to ask it falls back to 1600x1000, and both numbers
-can still be forced:
+The guest display is a custom 2560x1440 monitor QEMU invents, opened fullscreen
+with zoom-to-fit so the window fills whatever the host really has. Sizing the
+window to the reported host desktop was tried twice and both times read as
+"nothing changed", because the host either shrank the window or already matched
+it. `tools/hostsize.sh` still reports the host desktop on the boot line, for
+diagnosis rather than sizing. Ctrl+Alt+F leaves fullscreen.
+
+The compositor scales its whole interface by one factor set at startup: 960
+logical rows whatever the mode, so 1440 rows means 1.5x type and chrome rather
+than an emptier desk. Quarter steps; `agentware.scale=1.25` on the kernel
+command line overrides it. Every metric in `ui.rs` and `screen.rs` is a logical
+size through `ui::sc()`, so a new hardcoded pixel count is a bug.
 
 ```
-make run DISPLAY_W=2560 DISPLAY_H=1440
+make run DISPLAY_W=3840 DISPLAY_H=2160     # a bigger custom monitor
 tools/screenshot.py out.png --width 2560 --height 1440
 ```
 
-`zoom-to-fit` is off: with it on, a host that cannot fit the window shrinks it
-and scales the guest into it, so raising the resolution makes no visible
-difference at all, which cost two rounds of "the window is no bigger".
-
-Raising it changes how much fits and nothing else. Type stays the same number of
-pixels, so a bigger display is more room rather than larger controls. There is no
-display scale factor, because QEMU reports no physical size and deriving one from
-the resolution would be guessing at the monitor.
-
-`make run` passes `agentware.demo` on the kernel command line. `startmenu`
-does not exist, so nothing would otherwise ask the broker for a workspace and
-the compositor would come up with no clients at all. The flag substitutes two
-stand-ins and nothing else: `awapp desk` as the agentdesk, and `awctl demo` as
-the start menu, which asks for one workspace with one `awapp` in it. Everything
-between them is the real path. Drop the flag to see the compositor with nothing
-attached.
+Screenshots at 1600x1000 and below render at scale 1.0, which keeps the older
+coordinate-scripted captures valid.
 
 Once it is up, F1 cycles workspaces, standing in for the start menu, F2 toggles a
 diagnostic overlay listing every connection and the version it is on, and F3

@@ -33,6 +33,7 @@
 //! of it becoming load-bearing.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use crate::awml::{Node, Tag, Tree};
 use crate::document::Document;
@@ -57,16 +58,39 @@ pub const DANGER_DEEP: Color = rgb(0xb8, 0x42, 0x42);
 pub const OK: Color = rgb(0x5a, 0xc8, 0x8a);
 pub const SELECTED: Color = rgb(0x2b, 0x3f, 0x5e);
 
+/// The interface scale, set once at startup before anything is measured.
+///
+/// Every metric below is a *logical* size multiplied by this. It exists because
+/// the guest resolution is whatever monitor QEMU was told to be, and 13px type
+/// that is right at 1000 rows tall is illegibly small at 1440. One number, set
+/// once, scales the whole interface coherently; scattering per-element tweaks
+/// is how proportions drift apart.
+static SCALE: OnceLock<f32> = OnceLock::new();
+
+/// Fix the scale for the lifetime of the process. Must happen before layout.
+pub fn set_scale(scale: f32) {
+    let _ = SCALE.set(scale.clamp(1.0, 3.0));
+}
+
+pub fn scale() -> f32 {
+    *SCALE.get().unwrap_or(&1.0)
+}
+
+/// A logical dimension in physical pixels.
+pub fn sc(logical: i32) -> i32 {
+    (logical as f32 * scale()).round() as i32
+}
+
 /// Corner radii. Everything drawn gets one, because a hard corner at these
 /// sizes is what makes a surface look like a drawn rectangle rather than a
 /// panel, and one square element among rounded ones looks like a bug.
 ///
 /// Kept small. A large radius on a small control is the single loudest thing an
 /// interface can do, and it reads as a toy rather than as a tool.
-pub const RADIUS_WINDOW: i32 = 8;
-pub const RADIUS_SURFACE: i32 = 6;
-pub const RADIUS_CONTROL: i32 = 5;
-pub const RADIUS_SMALL: i32 = 3;
+pub fn radius_window() -> i32 { sc(8) }
+pub fn radius_surface() -> i32 { sc(6) }
+pub fn radius_control() -> i32 { sc(5) }
+pub fn radius_small() -> i32 { sc(3) }
 
 // Density. These are the numbers that decide whether the result looks like an
 // interface or like a toy, and every one of them was too large.
@@ -74,27 +98,27 @@ pub const RADIUS_SMALL: i32 = 3;
 // The reference points are the desktops people actually use: a 13px system font,
 // a control about 28px tall, and single-digit padding almost everywhere. Chunky
 // controls do not read as friendly at this scale, they read as unfinished.
-const BODY_SIZE: f32 = 13.0;
-const PADDING: i32 = 10;
+fn body_size() -> f32 { 13.0 * scale() }
+fn padding() -> i32 { sc(10) }
 /// Space above and below the text inside a control.
-const CONTROL_PAD: i32 = 6;
+fn control_pad() -> i32 { sc(6) }
 /// Space either side of the text inside a button.
-const BUTTON_PAD: i32 = 12;
-const CHECKBOX_SIZE: i32 = 14;
+fn button_pad() -> i32 { sc(12) }
+fn checkbox_size() -> i32 { sc(14) }
 const DIVIDER: i32 = 1;
 /// An editor is this many lines tall.
 const EDITOR_LINES: i32 = 4;
 /// Width of the indicator drawn beside overflowing scroll content.
-const SCROLLBAR: i32 = 5;
+fn scrollbar_w() -> i32 { sc(5) }
 /// How far one notch of the wheel moves a scroll container.
-pub const WHEEL_STEP: i32 = 48;
+pub fn wheel_step() -> i32 { sc(48) }
 
 fn gap_of(node: &Node) -> i32 {
     match node.attr("gap") {
         Some("none") => 0,
-        Some("sm") => 4,
-        Some("lg") => 14,
-        _ => 8,
+        Some("sm") => sc(4),
+        Some("lg") => sc(14),
+        _ => sc(8),
     }
 }
 
@@ -126,10 +150,10 @@ pub fn style_at(tree: &Tree, index: usize) -> Style {
 
     let mut style = Style {
         size: match role {
-            Some("heading") => BODY_SIZE * 1.45,
-            Some("subheading") => BODY_SIZE * 1.15,
-            Some("caption") => BODY_SIZE * 0.85,
-            _ => BODY_SIZE,
+            Some("heading") => body_size() * 1.45,
+            Some("subheading") => body_size() * 1.15,
+            Some("caption") => body_size() * 0.85,
+            _ => body_size(),
         },
         weight: if matches!(role, Some("heading") | Some("subheading")) {
             Weight::Bold
@@ -163,7 +187,7 @@ pub fn style_at(tree: &Tree, index: usize) -> Style {
 
 /// A size is either a number of pixels or one of a few names.
 fn parse_size(value: &str) -> Option<f32> {
-    let scale = match value {
+    let named = match value {
         "xs" => Some(0.75),
         "sm" => Some(0.85),
         "md" => Some(1.0),
@@ -171,13 +195,14 @@ fn parse_size(value: &str) -> Option<f32> {
         "xl" => Some(1.75),
         _ => None,
     };
-    if let Some(scale) = scale {
-        return Some(BODY_SIZE * scale);
+    if let Some(factor) = named {
+        return Some(body_size() * factor);
     }
 
     // Clamped, because a client asking for 4000px would have every glyph
-    // rasterize a coverage map the size of the screen.
-    value.parse::<f32>().ok().map(|size| size.clamp(6.0, 200.0))
+    // rasterize a coverage map the size of the screen. The scale applies to an
+    // app-chosen size too: it named a logical size, not a number of photons.
+    value.parse::<f32>().ok().map(|size| size.clamp(6.0, 200.0) * scale())
 }
 
 /// Resolve a node's text colour, falling back to `default`.
@@ -412,7 +437,7 @@ fn label_height(fonts: &Fonts, tree: &Tree, index: usize) -> i32 {
 }
 
 fn control_height(fonts: &Fonts, tree: &Tree, index: usize) -> i32 {
-    line_height(fonts, tree, index) + CONTROL_PAD * 2
+    line_height(fonts, tree, index) + control_pad() * 2
 }
 
 /// Elements that confine their children and so need their own clip.
@@ -452,8 +477,8 @@ fn measure(fonts: &Fonts, tree: &Tree, index: usize, width: i32) -> i32 {
         Tag::Text | Tag::Icon => line_height(fonts, tree, index),
         Tag::Divider => DIVIDER,
         Tag::Button | Tag::Field | Tag::Item => control_height(fonts, tree, index),
-        Tag::Checkbox => control_height(fonts, tree, index).max(CHECKBOX_SIZE),
-        Tag::Editor => line_height(fonts, tree, index) * EDITOR_LINES + CONTROL_PAD * 2,
+        Tag::Checkbox => control_height(fonts, tree, index).max(checkbox_size()),
+        Tag::Editor => line_height(fonts, tree, index) * EDITOR_LINES + control_pad() * 2,
 
         Tag::HStack => node
             .children
@@ -469,7 +494,7 @@ fn measure(fonts: &Fonts, tree: &Tree, index: usize, width: i32) -> i32 {
         // takes exactly the room it needs and never scrolls. It only scrolls
         // once something gives it less than that, which is what `grow` does.
         _ => {
-            let padding = if padded(node) { PADDING * 2 } else { 0 };
+            let padding = if padded(node) { padding() * 2 } else { 0 };
             let inner = width - padding;
             let gap = gap_of(node);
 
@@ -519,7 +544,7 @@ impl Placer<'_> {
                 // edge of the region. The compositor owns the division, so it
                 // owns the breathing room too; there is no attribute an
                 // agentdesk could set to take it back.
-                Some(rect) => self.place(child, rect.inset(PADDING), rect),
+                Some(rect) => self.place(child, rect.inset(padding()), rect),
                 None => {
                     self.rects[child] = Rect::new(0, 0, 0, 0);
                     self.clips[child] = Rect::new(0, 0, 0, 0);
@@ -535,7 +560,7 @@ impl Placer<'_> {
 
         let node = tree.node(index);
         let tag = node.tag;
-        let padding = if padded(node) { PADDING } else { 0 };
+        let padding = if padded(node) { padding() } else { 0 };
         let mut inner = area.inset(padding);
 
         // A container that labels itself takes the top of the space before the
@@ -679,9 +704,9 @@ fn natural_width(fonts: &Fonts, tree: &Tree, index: usize) -> i32 {
 
     match node.tag {
         Tag::Text | Tag::Icon => fonts.measure(label_of(node), &style),
-        Tag::Button => fonts.measure(label_of(node), &style) + BUTTON_PAD * 2,
-        Tag::Checkbox => CHECKBOX_SIZE + 8 + fonts.measure(label_of(node), &style),
-        _ => 160,
+        Tag::Button => fonts.measure(label_of(node), &style) + button_pad() * 2,
+        Tag::Checkbox => checkbox_size() + 8 + fonts.measure(label_of(node), &style),
+        _ => sc(160),
     }
 }
 
@@ -728,7 +753,7 @@ fn paint_scrollbar(canvas: &mut Canvas, layout: &Layout, index: usize) {
     }
 
     let rect = layout.rects[index];
-    let track = Rect::new(rect.x + rect.w - SCROLLBAR - 2, rect.y, SCROLLBAR, rect.h);
+    let track = Rect::new(rect.x + rect.w - scrollbar_w() - 2, rect.y, scrollbar_w(), rect.h);
     canvas.fill_rect(track, SURFACE);
 
     let span = (track.h * scroller.viewport / scroller.content).max(16);
@@ -790,11 +815,11 @@ fn paint_node(
         }
 
         Tag::Dialog => {
-            canvas.shadow(rect, RADIUS_SURFACE, 18, 120);
-            canvas.fill_round_rect(rect, RADIUS_SURFACE, RAISED);
-            canvas.stroke_round_rect(rect, RADIUS_SURFACE, 1, BORDER);
+            canvas.shadow(rect, radius_surface(), 18, 120);
+            canvas.fill_round_rect(rect, radius_surface(), RAISED);
+            canvas.stroke_round_rect(rect, radius_surface(), 1, BORDER);
             if let Some(label) = node.attr("label") {
-                canvas.draw_text(fonts, label, rect.x + PADDING, rect.y + PADDING, &style, MUTED);
+                canvas.draw_text(fonts, label, rect.x + padding(), rect.y + padding(), &style, MUTED);
             }
         }
 
@@ -823,11 +848,11 @@ fn paint_node(
                 (_, _, Some("danger")) => DANGER,
                 _ => RAISED,
             };
-            canvas.fill_round_rect(rect, RADIUS_CONTROL, fill);
+            canvas.fill_round_rect(rect, radius_control(), fill);
             if focused && !disabled {
-                canvas.stroke_round_rect(rect, RADIUS_CONTROL, 2, ACCENT);
+                canvas.stroke_round_rect(rect, radius_control(), 2, ACCENT);
             } else if emphasis.is_none() {
-                canvas.stroke_round_rect(rect, RADIUS_CONTROL, 1, BORDER);
+                canvas.stroke_round_rect(rect, radius_control(), 1, BORDER);
             }
 
             let label = label_of(node);
@@ -836,13 +861,13 @@ fn paint_node(
         }
 
         Tag::Field | Tag::Editor => {
-            canvas.fill_round_rect(rect, RADIUS_CONTROL, BACKGROUND);
+            canvas.fill_round_rect(rect, radius_control(), BACKGROUND);
             let edge = match (focused, node.flag("invalid")) {
                 (_, true) => DANGER,
                 (true, _) => ACCENT,
                 _ => BORDER,
             };
-            canvas.stroke_round_rect(rect, RADIUS_CONTROL, if focused { 2 } else { 1 }, edge);
+            canvas.stroke_round_rect(rect, radius_control(), if focused { 2 } else { 1 }, edge);
 
             let value = value_of(node);
             let empty = value.is_empty();
@@ -853,8 +878,8 @@ fn paint_node(
             };
             let color = if empty { MUTED } else { ink };
 
-            let x = rect.x + CONTROL_PAD;
-            let top = if node.tag == Tag::Editor { rect.y + CONTROL_PAD } else { centred(rect.h) };
+            let x = rect.x + control_pad();
+            let top = if node.tag == Tag::Editor { rect.y + control_pad() } else { centred(rect.h) };
             let step = fonts.line_height(&style);
 
             canvas.clipped(rect.inset(1), |inner| {
@@ -882,25 +907,25 @@ fn paint_node(
                 let (row, column) = caret_position(&value, focus.caret, node.tag);
                 let line = value.lines().nth(row).unwrap_or("");
                 let caret_x = x + fonts.measure(prefix(line, column), &style);
-                inner.fill_rect(Rect::new(caret_x, top + row as i32 * step, 2, step), ACCENT);
+                inner.fill_rect(Rect::new(caret_x, top + row as i32 * step, sc(2).max(2), step), ACCENT);
             });
         }
 
         Tag::Checkbox => {
             let box_rect = Rect::new(
                 rect.x,
-                rect.y + (rect.h - CHECKBOX_SIZE) / 2,
-                CHECKBOX_SIZE,
-                CHECKBOX_SIZE,
+                rect.y + (rect.h - checkbox_size()) / 2,
+                checkbox_size(),
+                checkbox_size(),
             );
             let checked = node.flag("checked");
             canvas.fill_round_rect(
                 box_rect,
-                RADIUS_SMALL,
+                radius_small(),
                 if checked && !disabled { ACCENT } else { BACKGROUND },
             );
             if !checked || disabled {
-                canvas.stroke_round_rect(box_rect, RADIUS_SMALL, 1, if focused { ACCENT } else { BORDER });
+                canvas.stroke_round_rect(box_rect, radius_small(), 1, if focused { ACCENT } else { BORDER });
             }
             if checked && disabled {
                 canvas.fill_round_rect(box_rect.inset(4), 2, MUTED);
@@ -930,7 +955,7 @@ fn paint_node(
             canvas.draw_text(
                 fonts,
                 label_of(node),
-                rect.x + CHECKBOX_SIZE + 8,
+                rect.x + checkbox_size() + 8,
                 centred(rect.h),
                 &style,
                 ink,
@@ -947,7 +972,7 @@ fn paint_node(
             canvas.draw_text(
                 fonts,
                 label_of(node),
-                rect.x + CONTROL_PAD,
+                rect.x + control_pad(),
                 centred(rect.h),
                 &style,
                 ink,
@@ -1013,5 +1038,5 @@ pub fn caret_from_x(fonts: &Fonts, value: &str, style: &Style, left: i32, x: i32
 
 /// The left edge text starts at inside a text control.
 pub fn text_origin(rect: Rect) -> i32 {
-    rect.x + CONTROL_PAD
+    rect.x + control_pad()
 }

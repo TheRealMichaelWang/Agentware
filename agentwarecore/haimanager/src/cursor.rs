@@ -32,31 +32,41 @@ const ARROW: [(f32, f32); 7] = [
     (11.4, 10.8),
 ];
 
-const MASK_W: usize = 13;
-const MASK_H: usize = 19;
 /// Subsamples per axis. Sixteen looks identical to four here; four is enough.
 const SUB: i32 = 4;
 
-/// Per-pixel coverage of the arrow, computed once.
-fn mask() -> &'static [u8; MASK_W * MASK_H] {
-    static MASK: OnceLock<[u8; MASK_W * MASK_H]> = OnceLock::new();
+struct Mask {
+    w: usize,
+    h: usize,
+    data: Vec<u8>,
+}
+
+/// Per-pixel coverage of the arrow at the interface scale, computed once.
+///
+/// The polygon is multiplied by the scale before rasterizing, so a scaled
+/// cursor is the shape drawn larger, not the small mask blown up.
+fn mask() -> &'static Mask {
+    static MASK: OnceLock<Mask> = OnceLock::new();
     MASK.get_or_init(|| {
-        let mut out = [0u8; MASK_W * MASK_H];
-        for (index, coverage) in out.iter_mut().enumerate() {
-            let (px, py) = ((index % MASK_W) as f32, (index / MASK_W) as f32);
+        let s = crate::ui::scale();
+        let w = (13.0 * s).ceil() as usize;
+        let h = (19.0 * s).ceil() as usize;
+        let mut data = vec![0u8; w * h];
+        for (index, coverage) in data.iter_mut().enumerate() {
+            let (px, py) = ((index % w) as f32, (index / w) as f32);
             let mut hits = 0;
             for sy in 0..SUB {
                 for sx in 0..SUB {
                     let x = px + (sx as f32 + 0.5) / SUB as f32;
                     let y = py + (sy as f32 + 0.5) / SUB as f32;
-                    if inside(x, y) {
+                    if inside(x / s, y / s) {
                         hits += 1;
                     }
                 }
             }
             *coverage = (hits * 255 / (SUB * SUB)) as u8;
         }
-        out
+        Mask { w, h, data }
     })
 }
 
@@ -93,7 +103,13 @@ pub fn draw(canvas: &mut Canvas, x: i32, y: i32, kind: Kind) {
     // The agent's pointer carries a halo, so a still screenshot of an agent
     // mid-action is unambiguous even in greyscale.
     if kind == Kind::Agent {
-        canvas.stroke_round_rect(Rect::new(x - 7, y - 7, 27, 29), 13, 1, AGENT);
+        let r = crate::ui::sc(13);
+        canvas.stroke_round_rect(
+            Rect::new(x - r / 2, y - r / 2, 2 * r + 1, 2 * r + 3),
+            r,
+            1,
+            AGENT,
+        );
     }
 
     // Outline first: the fill's own mask stamped at the eight neighbouring
@@ -105,10 +121,10 @@ pub fn draw(canvas: &mut Canvas, x: i32, y: i32, kind: Kind) {
     stamp(canvas, mask, x, y, fill);
 }
 
-fn stamp(canvas: &mut Canvas, mask: &[u8; MASK_W * MASK_H], x: i32, y: i32, color: Color) {
-    for row in 0..MASK_H {
-        for column in 0..MASK_W {
-            let coverage = mask[row * MASK_W + column];
+fn stamp(canvas: &mut Canvas, mask: &Mask, x: i32, y: i32, color: Color) {
+    for row in 0..mask.h {
+        for column in 0..mask.w {
+            let coverage = mask.data[row * mask.w + column];
             if coverage > 0 {
                 canvas.blend_px(x + column as i32, y + row as i32, color, coverage);
             }

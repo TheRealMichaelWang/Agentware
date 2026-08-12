@@ -11,22 +11,18 @@ BIN_DIR := $(AW_CORE_DIR)/target/$(TARGET)/release
 # Guest display size. virtio-vga defaults to 1280x800 and the compositor takes
 # the driver's preferred mode, so these two numbers are the whole of it.
 #
-# The host screen is asked rather than guessed. Every hardcoded default so far
-# has been wrong on the actual monitor: too small looks cramped, too large gets
-# clipped by the window manager. tools/hostsize.sh knows the ways of asking,
-# including WSLg's log when no X tool is installed, and the margins cover the
-# window title bar and the Windows taskbar. If nothing answers, fall back and
-# say so on the boot line.
+# The virtual monitor is deliberately larger than the reported host desktop:
+# 2560x1440, a custom monitor QEMU invents. Sizing to the host was tried twice
+# and produced a window the host desktop then shrank or matched, which reads as
+# "nothing changed". Instead the guest renders a large screen, the compositor
+# scales its interface up to match (1.5x at 1440 rows), and the window opens
+# fullscreen with zoom-to-fit so whatever the host really has is filled edge to
+# edge. Ctrl+Alt+F leaves fullscreen.
 #
-# Override per run: make run DISPLAY_W=2560 DISPLAY_H=1440
+# Override per run: make run DISPLAY_W=3840 DISPLAY_H=2160
 HOST_PX := $(shell tools/hostsize.sh)
-ifneq ($(HOST_PX),)
-DISPLAY_W ?= $(shell expr $(word 1,$(subst x, ,$(HOST_PX))) - 24)
-DISPLAY_H ?= $(shell expr $(word 2,$(subst x, ,$(HOST_PX))) - 120)
-else
-DISPLAY_W ?= 1600
-DISPLAY_H ?= 1000
-endif
+DISPLAY_W ?= 2560
+DISPLAY_H ?= 1440
 
 # Shared QEMU invocation. virtio-vga is what gives the guest /dev/dri/card0,
 # which haimanager will render onto via DRM/KMS.
@@ -111,8 +107,8 @@ pack: build
 # compositor would come up with no clients. It substitutes a stand-in start menu
 # and a stand-in agentdesk, and drops out the moment either is written.
 run: pack
-	@echo "==> Booting Agentware in QEMU at $(DISPLAY_W)x$(DISPLAY_H) (host reports $(if $(HOST_PX),$(HOST_PX),nothing))..."
-	$(QEMU) -display gtk,zoom-to-fit=off -serial stdio \
+	@echo "==> Booting Agentware fullscreen: guest $(DISPLAY_W)x$(DISPLAY_H), host desktop $(if $(HOST_PX),$(HOST_PX),unknown). Ctrl+Alt+F to un-fullscreen."
+	$(QEMU) -display gtk,zoom-to-fit=on,full-screen=on -serial stdio \
 		-append "console=tty0 console=ttyS0,115200 agentware.demo"
 
 # Headless boot that exercises the supervisor end to end and powers itself off.

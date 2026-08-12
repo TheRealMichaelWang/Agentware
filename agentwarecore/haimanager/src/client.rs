@@ -714,7 +714,7 @@ impl Client {
         let furthest = (scroller.content - scroller.viewport).max(0);
         // Positive delta is a push away from the human, which moves the content
         // down and the viewport up.
-        let next = (scroller.offset - delta * ui::WHEEL_STEP).clamp(0, furthest);
+        let next = (scroller.offset - delta * ui::wheel_step()).clamp(0, furthest);
         if next == scroller.offset {
             return false;
         }

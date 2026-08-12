@@ -71,6 +71,14 @@ fn main() {
     };
     log(&format!("display up: {width}x{height} mode {:?}", display.mode_name()));
 
+    // The interface scale is fixed before anything is measured or drawn. The
+    // default keeps 960 rows of logical space whatever the mode: a taller
+    // monitor gets larger type and chrome rather than an emptier desk.
+    // `agentware.scale=1.25` on the kernel command line overrides it.
+    let scale = interface_scale(height as i32);
+    ui::set_scale(scale);
+    log(&format!("interface scale {scale}"));
+
     let mut input = Input::new(width as i32, height as i32);
 
     let fonts = match Fonts::load() {
@@ -474,6 +482,21 @@ fn register() -> Result<UnixStream, String> {
     }
 
     Ok(stream)
+}
+
+/// The interface scale for a display this many rows tall.
+///
+/// Quarter steps, because scaled metrics land on cleaner pixel boundaries than
+/// an arbitrary ratio and nobody can see the difference between 1.5 and 1.47.
+fn interface_scale(height: i32) -> f32 {
+    if let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline")
+        && let Some(word) = cmdline.split_whitespace().find_map(|word| word.strip_prefix("agentware.scale="))
+        && let Ok(asked) = word.parse::<f32>()
+    {
+        return asked.clamp(1.0, 3.0);
+    }
+
+    ((height as f32 / 960.0) * 4.0).round().max(4.0) / 4.0
 }
 
 /// Sleep forever without burning a core. Only reached on a fatal error, where

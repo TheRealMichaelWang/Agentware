@@ -59,7 +59,7 @@ use crate::paint::{Canvas, Rect, rgb};
 use crate::ui::{self, Focus, Frame, Layout, Regions};
 
 /// Height of the navigation bar, which sits above every workspace.
-pub const NAV_HEIGHT: i32 = 32;
+fn nav_height() -> i32 { ui::sc(32) }
 /// The agentdesk's taskbar region is parked at zero height for now. The strip
 /// duplicated what the dock does and spent a full-width band saying so. The
 /// region stays in the protocol and the layout path, so an agentdesk may still
@@ -67,21 +67,21 @@ pub const NAV_HEIGHT: i32 = 32;
 /// there is a design worth giving room to.
 const TASKBAR_HEIGHT: i32 = 0;
 /// Width of the handle left behind when the pane is collapsed.
-const PANE_HANDLE: i32 = 12;
+fn pane_handle_w() -> i32 { ui::sc(12) }
 /// Height of the title bar the compositor draws around an application window.
-const WINDOW_TITLE: i32 = 24;
+fn window_title_h() -> i32 { ui::sc(24) }
 /// How far each successive window is offset, so none opens exactly on another.
-const CASCADE: i32 = 26;
-const WINDOW_MARGIN: i32 = 14;
+fn cascade() -> i32 { ui::sc(26) }
+fn window_margin() -> i32 { ui::sc(14) }
 /// Radius of the close, minimize and maximize dots.
-const LIGHT: i32 = 5;
+fn light_r() -> i32 { ui::sc(5) }
 /// Centre of the first dot, from the left edge of the title bar.
-const LIGHT_INSET: i32 = 14;
+fn light_inset() -> i32 { ui::sc(14) }
 /// Distance between dot centres.
-const LIGHT_STEP: i32 = 17;
+fn light_step() -> i32 { ui::sc(17) }
 /// The strip along the bottom of the apps region holding every open window.
-const DOCK_HEIGHT: i32 = 26;
-const DOCK_PILL: i32 = 104;
+fn dock_height() -> i32 { ui::sc(26) }
+fn dock_pill() -> i32 { ui::sc(104) }
 
 /// What a point in a title bar means.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -249,15 +249,15 @@ impl Screen {
     // ---- geometry ----------------------------------------------------------
 
     fn nav_rect(&self) -> Rect {
-        Rect::new(self.bounds.x, self.bounds.y, self.bounds.w, NAV_HEIGHT)
+        Rect::new(self.bounds.x, self.bounds.y, self.bounds.w, nav_height())
     }
 
     fn workspace_area(&self) -> Rect {
         Rect::new(
             self.bounds.x,
-            self.bounds.y + NAV_HEIGHT,
+            self.bounds.y + nav_height(),
             self.bounds.w,
-            self.bounds.h - NAV_HEIGHT,
+            self.bounds.h - nav_height(),
         )
     }
 
@@ -274,7 +274,7 @@ impl Screen {
         // Proportional, with bounds. A fixed width was a third of a small
         // screen and a sliver of a large one; a conversation column wants to be
         // a modest sixth of either.
-        let pane = if collapsed { 0 } else { (area.w * 17 / 100).clamp(240, 320) };
+        let pane = if collapsed { 0 } else { (area.w * 17 / 100).clamp(ui::sc(240), ui::sc(320)) };
         Regions::carve(area, TASKBAR_HEIGHT, pane)
     }
 
@@ -283,11 +283,11 @@ impl Screen {
         let regions = self.regions_for(at);
         let body = regions.pane;
         let x = if body.w == 0 {
-            self.workspace_area().x + self.workspace_area().w - PANE_HANDLE
+            self.workspace_area().x + self.workspace_area().w - pane_handle_w()
         } else {
-            body.x - PANE_HANDLE / 2
+            body.x - pane_handle_w() / 2
         };
-        Rect::new(x, body.y + body.h / 2 - 26, PANE_HANDLE, 52)
+        Rect::new(x, body.y + body.h / 2 - 26, pane_handle_w(), 52)
     }
 
     pub fn toggle_pane(&mut self, fonts: &Fonts) -> bool {
@@ -305,7 +305,7 @@ impl Screen {
         if self.dock_pills(at).is_empty() {
             return apps;
         }
-        Rect::new(apps.x, apps.y, apps.w, apps.h - DOCK_HEIGHT - 8)
+        Rect::new(apps.x, apps.y, apps.w, apps.h - dock_height() - 8)
     }
 
     /// Where a window opens, before the human has an opinion about it.
@@ -317,12 +317,12 @@ impl Screen {
     fn opening_rect(&self, at: usize, opened: usize) -> Rect {
         let area = self.window_area(at);
         // Wraps after a few, so the tenth window is not off the bottom corner.
-        let step = CASCADE * (opened % 5) as i32;
+        let step = cascade() * (opened % 5) as i32;
         Rect::new(
-            area.x + WINDOW_MARGIN + step,
-            area.y + WINDOW_MARGIN + step,
-            (area.w - WINDOW_MARGIN * 2 - CASCADE).max(360),
-            (area.h - WINDOW_MARGIN * 2 - CASCADE).max(260),
+            area.x + window_margin() + step,
+            area.y + window_margin() + step,
+            (area.w - window_margin() * 2 - cascade()).max(ui::sc(360)),
+            (area.h - window_margin() * 2 - cascade()).max(ui::sc(260)),
         )
     }
 
@@ -345,12 +345,12 @@ impl Screen {
             .get(at)
             .map(|workspace| workspace.windows.len())
             .unwrap_or(0) as i32;
-        let width = (DOCK_PILL + 6) * count + 6;
+        let width = (dock_pill() + 6) * count + 6;
         Rect::new(
             apps.x + (apps.w - width) / 2,
-            apps.y + apps.h - DOCK_HEIGHT - 8,
+            apps.y + apps.h - dock_height() - 8,
             width,
-            DOCK_HEIGHT,
+            dock_height(),
         )
     }
 
@@ -369,8 +369,8 @@ impl Screen {
             .windows
             .iter()
             .map(|window| {
-                let pill = Rect::new(x, dock.y + 4, DOCK_PILL, DOCK_HEIGHT - 8);
-                x += DOCK_PILL + 6;
+                let pill = Rect::new(x, dock.y + 4, dock_pill(), dock_height() - 8);
+                x += dock_pill() + 6;
                 (window.fd, pill)
             })
             .collect();
@@ -378,14 +378,14 @@ impl Screen {
         let mut x = dock.x + 6;
         for (_, pill) in &mut pills {
             pill.x = x;
-            x += DOCK_PILL + 6;
+            x += dock_pill() + 6;
         }
         pills
     }
 
     /// What part of a window's title bar a point is on.
     fn title_hit(rect: Rect, x: i32, y: i32) -> Option<Title> {
-        let bar = Rect::new(rect.x, rect.y, rect.w, WINDOW_TITLE);
+        let bar = Rect::new(rect.x, rect.y, rect.w, window_title_h());
         if !bar.contains(x, y) {
             return None;
         }
@@ -394,11 +394,11 @@ impl Screen {
         for (index, action) in
             [Title::Close, Title::Minimize, Title::Maximize].into_iter().enumerate()
         {
-            let cx = bar.x + LIGHT_INSET + LIGHT_STEP * index as i32;
+            let cx = bar.x + light_inset() + light_step() * index as i32;
             let (dx, dy) = (x - cx, y - cy);
             // A little larger than the dot is drawn. A six pixel target is not
             // a target.
-            if dx * dx + dy * dy <= (LIGHT + 4) * (LIGHT + 4) {
+            if dx * dx + dy * dy <= (light_r() + 4) * (light_r() + 4) {
                 return Some(action);
             }
         }
@@ -807,8 +807,8 @@ impl Screen {
             return;
         };
 
-        window.rect.x = (x - grab.0).clamp(area.x - window.rect.w + 120, area.x + area.w - 120);
-        window.rect.y = (y - grab.1).clamp(area.y, area.y + area.h - WINDOW_TITLE);
+        window.rect.x = (x - grab.0).clamp(area.x - window.rect.w + ui::sc(120), area.x + area.w - ui::sc(120));
+        window.rect.y = (y - grab.1).clamp(area.y, area.y + area.h - window_title_h());
         // Dragging a maximized window makes it a normal one again, which is what
         // grabbing hold of something ought to mean.
         window.maximized = false;
@@ -1294,7 +1294,7 @@ impl Screen {
         // the bottom edge, which is why the tabs looked like they were bleeding
         // off the screen.
         let bar = self.nav_rect();
-        let row = fonts.line_height(&Style { size: 11.0, ..Style::default() }) + 12;
+        let row = fonts.line_height(&Style { size: 11.0 * ui::scale(), ..Style::default() }) + 12;
         let inset_y = ((bar.h - row) / 2).max(2);
         let frame = Rect::new(bar.x + 10, bar.y + inset_y, bar.w - 20, bar.h - inset_y * 2);
         self.nav_layout = ui::layout(fonts, &doc, &Frame::Whole(frame), &mut self.nav_scroll);
@@ -1421,11 +1421,11 @@ impl Screen {
         }
 
         let dock = self.dock_rect(self.current);
-        canvas.shadow(dock, ui::RADIUS_SURFACE, 14, 110);
-        canvas.fill_round_rect(dock, ui::RADIUS_SURFACE, ui::SURFACE);
-        canvas.stroke_round_rect(dock, ui::RADIUS_SURFACE, 1, ui::BORDER);
+        canvas.shadow(dock, ui::radius_surface(), ui::sc(14), 110);
+        canvas.fill_round_rect(dock, ui::radius_surface(), ui::SURFACE);
+        canvas.stroke_round_rect(dock, ui::radius_surface(), 1, ui::BORDER);
 
-        let style = Style { size: 12.0, ..Style::default() };
+        let style = Style { size: 12.0 * ui::scale(), ..Style::default() };
         for (fd, pill) in pills {
             let Some(client) = self.client(fd) else { continue };
             let minimized = self
@@ -1434,7 +1434,7 @@ impl Screen {
             let focused = self.focus == Surface::App(fd);
 
             if focused {
-                canvas.fill_round_rect(pill, ui::RADIUS_CONTROL, ui::RAISED);
+                canvas.fill_round_rect(pill, ui::radius_control(), ui::RAISED);
             }
             let ink = if minimized { ui::MUTED } else { ui::TEXT };
             canvas.clipped(pill.inset(2), |canvas| {
@@ -1462,8 +1462,8 @@ impl Screen {
     /// The grip that folds the conversation pane away.
     fn draw_pane_handle(&self, canvas: &mut Canvas) {
         let grip = self.pane_handle(self.current);
-        canvas.fill_round_rect(grip, PANE_HANDLE / 2, ui::RAISED);
-        canvas.stroke_round_rect(grip, PANE_HANDLE / 2, 1, ui::BORDER);
+        canvas.fill_round_rect(grip, pane_handle_w() / 2, ui::RAISED);
+        canvas.stroke_round_rect(grip, pane_handle_w() / 2, 1, ui::BORDER);
         canvas.fill_rect(
             Rect::new(grip.x + grip.w / 2 - 1, grip.y + 14, 2, grip.h - 28),
             ui::MUTED,
@@ -1471,7 +1471,7 @@ impl Screen {
     }
 
     fn draw_empty(&self, canvas: &mut Canvas, fonts: &Fonts) {
-        let style = Style { family: Family::Mono, size: 18.0, ..Style::default() };
+        let style = Style { family: Family::Mono, size: 18.0 * ui::scale(), ..Style::default() };
         let message = "no workspace open";
         let width = fonts.measure(message, &style);
         canvas.draw_text(
@@ -1496,7 +1496,7 @@ impl Screen {
 
     /// A readout of what the compositor is holding, for screenshots.
     fn draw_debug(&self, canvas: &mut Canvas, fonts: &Fonts) {
-        let style = Style { family: Family::Mono, size: 13.0, ..Style::default() };
+        let style = Style { family: Family::Mono, size: 13.0 * ui::scale(), ..Style::default() };
         let height = 20 * (self.clients.len() as i32 + 4);
         let panel = Rect::new(8, self.nav_rect().h + 8, 620, height);
         canvas.fill_rect(panel, ui::SURFACE);
@@ -1536,7 +1536,7 @@ impl Screen {
 
 /// Where an application's own tree goes inside its window.
 fn content_of(rect: Rect) -> Rect {
-    Rect::new(rect.x, rect.y + WINDOW_TITLE, rect.w, rect.h - WINDOW_TITLE)
+    Rect::new(rect.x, rect.y + window_title_h(), rect.w, rect.h - window_title_h())
 }
 
 /// The chrome around an application window.
@@ -1550,18 +1550,18 @@ fn content_of(rect: Rect) -> Rect {
 /// interface, and putting them in the tree would mean every application could
 /// decide whether it was closable.
 fn draw_window(canvas: &mut Canvas, fonts: &Fonts, client: &Client, rect: Rect, focused: bool) {
-    let bar = Rect::new(rect.x, rect.y, rect.w, WINDOW_TITLE);
+    let bar = Rect::new(rect.x, rect.y, rect.w, window_title_h());
 
     // Depth rather than a heavy outline. A focused window sits higher.
-    canvas.shadow(rect, ui::RADIUS_WINDOW, if focused { 22 } else { 12 }, 130);
-    canvas.fill_round_rect(rect, ui::RADIUS_WINDOW, ui::BACKGROUND);
+    canvas.shadow(rect, ui::radius_window(), ui::sc(if focused { 22 } else { 12 }), 130);
+    canvas.fill_round_rect(rect, ui::radius_window(), ui::BACKGROUND);
 
     // The bar is the top of the same rounded shape, clipped to its own height so
     // the two lower corners stay square against the content below.
     canvas.clipped(bar, |canvas| {
         canvas.fill_round_rect(
-            Rect::new(bar.x, bar.y, bar.w, bar.h + ui::RADIUS_WINDOW),
-            ui::RADIUS_WINDOW,
+            Rect::new(bar.x, bar.y, bar.w, bar.h + ui::radius_window()),
+            ui::radius_window(),
             if focused { ui::RAISED } else { ui::SURFACE },
         );
     });
@@ -1571,25 +1571,25 @@ fn draw_window(canvas: &mut Canvas, fonts: &Fonts, client: &Client, rect: Rect, 
         .into_iter()
         .enumerate()
     {
-        let cx = bar.x + LIGHT_INSET + LIGHT_STEP * index as i32;
-        let dot = Rect::new(cx - LIGHT, cy - LIGHT, LIGHT * 2, LIGHT * 2);
+        let cx = bar.x + light_inset() + light_step() * index as i32;
+        let dot = Rect::new(cx - light_r(), cy - light_r(), light_r() * 2, light_r() * 2);
         // Unfocused windows keep the dots but drain them, the way every desktop
         // does, so the focused window is obvious without a coloured border.
-        canvas.fill_round_rect(dot, LIGHT, if focused { colour } else { ui::BORDER });
+        canvas.fill_round_rect(dot, light_r(), if focused { colour } else { ui::BORDER });
     }
 
-    let style = Style { size: 13.0, ..Style::default() };
+    let style = Style { size: 13.0 * ui::scale(), ..Style::default() };
     let ink = if focused { ui::TEXT } else { ui::MUTED };
     let title = client.title();
     let x = bar.x + (bar.w - fonts.measure(title, &style)) / 2;
-    let x = x.max(bar.x + LIGHT_INSET + LIGHT_STEP * 3);
+    let x = x.max(bar.x + light_inset() + light_step() * 3);
     canvas.draw_text(fonts, title, x, cy - fonts.line_height(&style) / 2, &style, ink);
 
     let content = content_of(rect);
     canvas.clipped(content, |canvas| client.draw(canvas, fonts));
 
     canvas.fill_rect(Rect::new(bar.x, bar.y + bar.h - 1, bar.w, 1), ui::BORDER);
-    canvas.stroke_round_rect(rect, ui::RADIUS_WINDOW, 1, ui::BORDER);
+    canvas.stroke_round_rect(rect, ui::radius_window(), 1, ui::BORDER);
 }
 
 /// Keys the compositor keeps for itself, before anything is routed.
