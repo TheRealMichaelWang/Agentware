@@ -26,9 +26,15 @@ DISPLAY_H ?= 1440
 
 # Shared QEMU invocation. virtio-vga is what gives the guest /dev/dri/card0,
 # which haimanager will render onto via DRM/KMS.
+# virtio-tablet is what aligns the host mouse with the guest cursor. A PS/2
+# mouse is relative, so QEMU can only stream deltas and the two pointers drift
+# apart the moment the window is scaled; a tablet is absolute, so the host hands
+# over the position itself. The PS/2 devices stay, because the monitor's
+# injected input and the wheel arrive through them.
 QEMU := qemu-system-x86_64 -enable-kvm -m 4G -cpu host \
 	-kernel $(KERNEL) -initrd $(INITRAMFS_ARCHIVE) \
-	-device virtio-vga,xres=$(DISPLAY_W),yres=$(DISPLAY_H) -no-reboot
+	-device virtio-vga,xres=$(DISPLAY_W),yres=$(DISPLAY_H) \
+	-device virtio-tablet-pci -no-reboot
 
 # ---------------------------------------------------------
 # Default Target
@@ -108,7 +114,7 @@ pack: build
 # and a stand-in agentdesk, and drops out the moment either is written.
 run: pack
 	@echo "==> Booting Agentware fullscreen: guest $(DISPLAY_W)x$(DISPLAY_H), host desktop $(if $(HOST_PX),$(HOST_PX),unknown). Ctrl+Alt+F to un-fullscreen."
-	$(QEMU) -display gtk,zoom-to-fit=on,full-screen=on -serial stdio \
+	$(QEMU) -display gtk,zoom-to-fit=on,full-screen=on,show-cursor=off -serial stdio \
 		-append "console=tty0 console=ttyS0,115200 agentware.demo"
 
 # Headless boot that exercises the supervisor end to end and powers itself off.

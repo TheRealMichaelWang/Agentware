@@ -244,6 +244,13 @@ is the list so it does not get relitigated.
   after it vanishes.
 * **printk prints levels strictly below `console_loglevel`.** Setting it to 6
   suppresses level-6 messages.
+* **A relative mouse can never align with the host cursor.** The PS/2 mouse
+  streams deltas, so the guest integrates its own position and drifts from the
+  host pointer the moment the window is scaled. The virtio tablet reports
+  absolute positions and the two become one; the compositor's `EV_ABS` handling
+  assumes QEMU's fixed 0..32767 range. The PS/2 devices stay for the monitor's
+  injected input. In the screenshot tool, `--do "abs 0.5 0.9 click"` drives the
+  tablet over QMP; `mouse_move` still drives the PS/2 mouse.
 * **QEMU's `mouse_button` wheel bits do not reach a PS/2 guest.** Bit 8 and bit
   16 produce nothing at all. The wheel is the optional third argument to
   `mouse_move`, so `mouse_move 0 0 -1` is one notch down.

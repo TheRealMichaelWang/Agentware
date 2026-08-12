@@ -73,11 +73,21 @@ const RECORD_SIZE: usize = size_of::<Record>();
 // Event types.
 const EV_KEY: u16 = 0x01;
 const EV_REL: u16 = 0x02;
+const EV_ABS: u16 = 0x03;
 
 // Relative axes.
 const REL_X: u16 = 0x00;
 const REL_Y: u16 = 0x01;
 const REL_WHEEL: u16 = 0x08;
+
+// Absolute axes, reported by tablet devices.
+const ABS_X: u16 = 0x00;
+const ABS_Y: u16 = 0x01;
+
+/// The range QEMU's tablets report absolute positions in. Fixed by QEMU rather
+/// than negotiated; a physical tablet would need `EVIOCGABS` to learn its real
+/// range, and this constant is the honest record of the assumption.
+const QEMU_ABS_MAX: i32 = 32767;
 
 // Buttons live above the keyboard's range in the same code space as keys.
 const BTN_LEFT: u16 = 0x110;
@@ -203,6 +213,27 @@ impl Input {
 
     fn translate(&mut self, record: Record, events: &mut Vec<Event>) {
         match record.kind {
+            // A tablet says where the pointer *is*, not how it moved. This is
+            // what keeps the host cursor and the guest cursor as one thing: the
+            // host hands over its position and the compositor draws exactly
+            // there, instead of integrating deltas that drift from the moment
+            // the window is scaled or the pointer leaves and re-enters.
+            EV_ABS => match record.code {
+                ABS_X => {
+                    self.x = (record.value.clamp(0, QEMU_ABS_MAX) * (self.width - 1)
+                        / QEMU_ABS_MAX)
+                        .clamp(0, self.width - 1);
+                    events.push(Event::PointerMoved { x: self.x, y: self.y });
+                }
+                ABS_Y => {
+                    self.y = (record.value.clamp(0, QEMU_ABS_MAX) * (self.height - 1)
+                        / QEMU_ABS_MAX)
+                        .clamp(0, self.height - 1);
+                    events.push(Event::PointerMoved { x: self.x, y: self.y });
+                }
+                _ => {}
+            },
+
             EV_REL => match record.code {
                 REL_X => {
                     // Clamping rather than wrapping: a pointer that leaves one
