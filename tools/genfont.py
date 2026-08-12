@@ -161,7 +161,7 @@ def main():
     out("pub fn glyph(character: char) -> &'static [u8; HEIGHT] {\n")
     out("    let code = character as u32;\n")
     out("    let index = code.wrapping_sub(FIRST as u32) as usize;\n")
-    out("    GLYPHS.get(index).unwrap_or(&GLYPHS[('?' as u8 - FIRST) as usize])\n")
+    out("    GLYPHS.get(index).unwrap_or(&GLYPHS[(b'?' - FIRST) as usize])\n")
     out("}\n")
 
 

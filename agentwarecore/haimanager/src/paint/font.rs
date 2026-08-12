@@ -123,5 +123,5 @@ static GLYPHS: [[u8; HEIGHT]; 95] = [
 pub fn glyph(character: char) -> &'static [u8; HEIGHT] {
     let code = character as u32;
     let index = code.wrapping_sub(FIRST as u32) as usize;
-    GLYPHS.get(index).unwrap_or(&GLYPHS[('?' as u8 - FIRST) as usize])
+    GLYPHS.get(index).unwrap_or(&GLYPHS[(b'?' - FIRST) as usize])
 }
