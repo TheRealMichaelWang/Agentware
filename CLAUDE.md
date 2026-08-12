@@ -1,0 +1,159 @@
+# Agentware
+
+An AI-native operating system userland in Rust, booting on a custom Linux kernel
+with no legacy graphics or input stack. Agents are first-class users: they read
+the interface as a semantic tree and act on it by naming elements, never by
+pixel coordinates.
+
+## Read these first
+
+| Document | Covers |
+| --- | --- |
+| `VISION.md` | What the user experience is meant to be |
+| `ARCHITECTURE.md` | What the processes are and how long they live |
+| `INTERACTIONS.md` | What the processes say to each other |
+| `docs/UIElements.md` | The AWML element catalogue and action vocabulary |
+
+The code carries its reasoning in comments and commit messages. When something
+looks arbitrary, the comment usually says why, and it is usually because the
+obvious alternative was tried and failed.
+
+## Where things are
+
+```
+agentwarecore/          cargo workspace
+  awproto/              the supervisor's wire protocol, shared by everything
+  supervisor/           PID 1: init, service table, spawn broker
+    src/bin/            awtest awstubborn awctl awui: self-test stand-ins
+  haimanager/           the compositor: DRM, input, AWML, layout, paint
+initramfs/              staged image contents (build output, gitignored)
+tools/screenshot.py     boot, inject input, capture the screen as PNG
+kernel-build/           Linux submodule
+```
+
+## State
+
+**Supervisor: complete.** Mounts, signals, reaper, service table with restart
+policy and backoff, readiness gating, control socket, spawn broker, cgroup per
+workspace, descriptor handoff, clean shutdown. `make selftest` exercises all of
+it and powers the machine off; QEMU exiting on its own is the pass signal.
+
+**haimanager: milestones 1 to 4 done.**
+
+1. DRM/KMS bring-up
+2. Software rasterizer, outline fonts via `fontdue`
+3. evdev input, both cursors, event-driven loop
+4. AWML parser, layout, hit testing, agent view
+
+**Remaining:**
+
+5. **Client protocol and tree diffing.** Accept trees on the inherited
+   descriptor, diff against the held tree, preserve ephemeral state across
+   re-renders, send events back carrying the tree version they were generated
+   against.
+6. **Workspace compositing.** The four regions per workspace, the global
+   navigation bar, app windows, routing input to the right client.
+7. **Agent surface.** Queries scoped by connection, the reduced view, intent
+   resolution with visibility and enabled checks, fake cursor animation,
+   rejections.
+
+Nothing else exists yet: no `agentdesk`, no `agent`, no `desktop-main`, no apps.
+The supervisor logs and skips what is not installed rather than crash looping
+against it, so the system boots and is useful without them.
+
+## Building and running
+
+```
+make selftest    # headless supervisor self-test, exits 0 on success
+make run         # boot in a QEMU window
+make pack        # build and pack the initramfs without booting
+```
+
+Builds target `x86_64-unknown-linux-musl`. No sudo is needed: `cpio` records a
+device node's major/minor from `stat` and never opens it.
+
+## Verifying graphics
+
+**Graphics cannot be checked from a serial log.** `tools/screenshot.py` boots the
+guest, optionally injects input through the QEMU monitor, captures the
+framebuffer and writes a PNG, which can then be viewed directly.
+
+```
+tools/screenshot.py out.png --seconds 7 \
+  --do "mouse_move 150 -120" --do "mouse_button 1" \
+  --do "sendkey h" --do "sendkey shift-l"
+```
+
+Use it. Every rendering bug so far was found this way and none would have been
+found any other way: a black screen where every ioctl reported success, four
+glyphs silently rendering as capitals, a list label drawn on top of its first
+item, content flush against the screen edge.
+
+The haimanager also prints its agent view to the kernel log at startup, so the
+reduced schema can be read against the document that produced it.
+
+## Working conventions
+
+**Run things yourself.** Build, boot, screenshot, and check the result. Do not
+hand commands back to be run unless they genuinely need a human, such as an
+interactive login.
+
+**Verify, do not assume.** Every milestone ends with something that proves
+itself: the supervisor's self-test, a screenshot, a printed agent view. If a
+claim cannot be demonstrated, say so rather than asserting it.
+
+**Prose style: no emojis, no em dashes.** Plain, direct writing.
+
+**Commit and push freely**, with messages that explain *why* rather than
+restating the diff. The bug that cost a debugging cycle belongs in the message.
+
+**Do not raise design questions about components that do not exist.** If it is
+not built and not blocking, it is not a question worth asking yet.
+
+**Keep clippy clean.** `cargo clippy --release --target x86_64-unknown-linux-musl
+--all-targets` should be silent.
+
+## Settled decisions, not to be reopened
+
+These were argued through and decided. The reasoning is in the documents; this
+is the list so it does not get relitigated.
+
+* An agentdesk **is** the agent's workspace. The agent process is a separate,
+  per-turn worker that owns nothing durable.
+* Agents never restart. A failed agent is a result to report, not a process to
+  resurrect.
+* Interrupting an agent is `SIGTERM` to a process that owns nothing.
+* A message arriving mid-turn is **queued** by the agentdesk, never refused.
+* Nothing survives a reboot. No persistent storage layer, by choice.
+* The supervisor never sees prompts, conversation, telemetry or markup. It
+  creates sockets and steps out of the way.
+* Identity is a capability, not a claim: the haimanager knows which workspace a
+  connection belongs to because the supervisor said so at handoff.
+* The stop button is drawn by the haimanager and routes to the supervisor, so it
+  works even if the agentdesk is wedged.
+* Applications send the **whole tree** every time; the haimanager diffs it.
+* Agents send **intents**, never events. The haimanager resolves, checks
+  visibility and enabled state, animates the cursor, then synthesizes the event.
+* Element actions are **derived** from type and state, never declared by the
+  application.
+* Applications choose type and colour. All of it is stripped from the agent's
+  view, which is safe because appearance can never carry meaning: descriptions
+  are required and actions are derived.
+
+## Gotchas that cost real time
+
+* **virtio-gpu does not scan out what you wrote.** The host keeps its own copy
+  and only transfers on an explicit dirty call. Without it the screen stays as
+  it was while every ioctl reports success.
+* **`rustix::process::waitpid(None, ..)` is `waitpid(0)`**, meaning any child in
+  the caller's *process group*. The reaper must use `wait()`, which is
+  `waitpid(-1)`. Services call `setsid` and orphans keep their original group,
+  so the wrong one silently collects almost nothing.
+* **`/dev/kmsg` is rate limited** to about ten messages per five seconds unless
+  `printk_devkmsg` is set to `on`. The eleventh line of a boot and everything
+  after it vanishes.
+* **printk prints levels strictly below `console_loglevel`.** Setting it to 6
+  suppresses level-6 messages.
+* **`/dev/input` is not fully populated at startup.** QEMU's PS/2 mouse appears
+  about 300ms after the directory first has entries, so devices must be
+  rescanned rather than enumerated once.
