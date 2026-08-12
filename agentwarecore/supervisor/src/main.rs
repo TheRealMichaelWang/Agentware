@@ -22,14 +22,17 @@ mod early;
 mod klog;
 mod reaper;
 mod selftest;
+mod service;
 mod shutdown;
 mod signals;
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use rustix::event::epoll;
 
 use klog::{kerr, kinfo, kwarn};
+use service::{RestartPolicy, Service, Services};
 use signals::SignalFd;
 
 /// Set once we have confirmed we are PID 1, so the panic hook knows whether it
@@ -40,13 +43,23 @@ static IS_INIT: AtomicBool = AtomicBool::new(false);
 /// readiness pipes) get their own.
 const TOKEN_SIGNALS: u64 = 1;
 
-fn main() {
-    // Before the PID 1 guard: the self-test child is this same binary
-    // re-executed, and it is deliberately not PID 1.
-    if selftest::is_child() {
-        std::process::exit(selftest::CHILD_STATUS);
-    }
+/// The services that make up the Agentware userland.
+///
+/// `ui-manager` comes first: `desktop-main` draws through it, so starting them
+/// the other way round means the desktop fails against a compositor that is not
+/// listening yet. Neither binary exists today, and the service table logs and
+/// skips what is not installed rather than crash looping against it.
+///
+/// Ordering here is a stand-in for a real readiness protocol, which arrives with
+/// fd passing in milestone 4.
+fn system_services() -> Vec<Service> {
+    vec![
+        Service::new("ui-manager", "/bin/ui-manager", &[], RestartPolicy::Always),
+        Service::new("desktop-main", "/bin/desktop-main", &[], RestartPolicy::Always),
+    ]
+}
 
+fn main() {
     install_panic_hook();
 
     if std::process::id() != 1 {
@@ -95,15 +108,19 @@ fn main() {
         }
     };
 
+    // Stage 4.
+    let selftest = selftest::requested();
+    let mut services = Services::new(if selftest {
+        selftest::services()
+    } else {
+        system_services()
+    });
+    services.start_all();
+
     kinfo!("supervisor ready");
 
-    // Stage 4 will start ui-manager and desktop-main here.
-    if selftest::requested() {
-        selftest::spawn();
-    }
-
     // Stage 5.
-    main_loop(signalfd)
+    main_loop(signalfd, services, selftest)
 }
 
 /// Wait for events and dispatch them, forever.
@@ -112,7 +129,7 @@ fn main() {
 /// in one epoll set: signals via signalfd today, the control socket and service
 /// readiness pipes later. There is no polling and no busy loop, the process is
 /// asleep in `epoll_wait` whenever nothing is happening.
-fn main_loop(mut signalfd: SignalFd) -> ! {
+fn main_loop(mut signalfd: SignalFd, mut services: Services, selftest: bool) -> ! {
     let epoll = match epoll::create(epoll::CreateFlags::CLOEXEC) {
         Ok(fd) => fd,
         Err(err) => {
@@ -137,7 +154,20 @@ fn main_loop(mut signalfd: SignalFd) -> ! {
     }; 16];
 
     loop {
-        let count = match epoll::wait(&epoll, &mut events, None) {
+        // Start anything whose backoff has expired, and find out when the next
+        // one is due. That deadline becomes the epoll timeout, so waiting out a
+        // backoff costs no extra file descriptor and no polling: the loop simply
+        // sleeps until either an event arrives or a restart falls due.
+        let deadline = services.tick();
+
+        if selftest && services.all_settled() {
+            kinfo!("selftest: every service reached a final state");
+            shutdown::shutdown(shutdown::Action::PowerOff, &mut services);
+        }
+
+        let timeout = deadline.map(|at| to_timespec(at.saturating_duration_since(Instant::now())));
+
+        let count = match epoll::wait(&epoll, &mut events, timeout.as_ref()) {
             Ok(count) => count,
             // Interrupted before any event was ready. Go around again.
             Err(rustix::io::Errno::INTR) => continue,
@@ -147,6 +177,8 @@ fn main_loop(mut signalfd: SignalFd) -> ! {
             }
         };
 
+        // A count of zero means the timeout expired, which is not an event: the
+        // next tick at the top of the loop is what handles it.
         for event in &events[..count] {
             // `epoll::Event` is packed on x86_64, so read the field out by
             // value rather than borrowing it.
@@ -154,7 +186,7 @@ fn main_loop(mut signalfd: SignalFd) -> ! {
             match token {
                 TOKEN_SIGNALS => {
                     for signal in signalfd.drain() {
-                        handle_signal(signal);
+                        handle_signal(signal, &mut services);
                     }
                 }
                 other => kwarn!("event on unknown epoll token {other}"),
@@ -163,7 +195,14 @@ fn main_loop(mut signalfd: SignalFd) -> ! {
     }
 }
 
-fn handle_signal(signal: libc::c_int) {
+fn to_timespec(duration: std::time::Duration) -> rustix::event::Timespec {
+    rustix::event::Timespec {
+        tv_sec: duration.as_secs() as _,
+        tv_nsec: duration.subsec_nanos() as _,
+    }
+}
+
+fn handle_signal(signal: libc::c_int, services: &mut Services) {
     match signal {
         // A child terminated. This is almost always a process the supervisor
         // never started: an orphaned grandchild re-parented to PID 1. Once the
@@ -172,24 +211,26 @@ fn handle_signal(signal: libc::c_int) {
         libc::SIGCHLD => {
             for (pid, exit) in reaper::reap_all() {
                 let pid = pid.as_raw_nonzero().get();
-                kinfo!("reaped pid {pid}: {exit}");
 
-                if selftest::is_finished(pid, &exit) {
-                    shutdown::shutdown(shutdown::Action::PowerOff);
+                // Anything the table does not claim is an orphaned grandchild
+                // that was re-parented to PID 1. It needed reaping, but it has
+                // no restart policy attached.
+                if !services.note_exit(pid, &exit) {
+                    kinfo!("reaped orphan pid {pid}: {exit}");
                 }
             }
         }
 
         // Ctrl-Alt-Del, courtesy of disable_ctrl_alt_del turning the kernel's
         // immediate reset into a signal we can act on.
-        libc::SIGINT => shutdown::shutdown(shutdown::Action::Reboot),
+        libc::SIGINT => shutdown::shutdown(shutdown::Action::Reboot, services),
 
-        libc::SIGUSR2 => shutdown::shutdown(shutdown::Action::Reboot),
+        libc::SIGUSR2 => shutdown::shutdown(shutdown::Action::Reboot, services),
 
         // Orderly poweroff. SIGPWR is the kernel telling us the power supply is
         // about to fail, so it gets the same treatment with more urgency.
         libc::SIGTERM | libc::SIGUSR1 | libc::SIGPWR => {
-            shutdown::shutdown(shutdown::Action::PowerOff)
+            shutdown::shutdown(shutdown::Action::PowerOff, services)
         }
 
         libc::SIGHUP => kinfo!("ignoring {}", signals::name(signal)),

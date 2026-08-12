@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use rustix::system::{RebootCommand, reboot};
 
 use crate::klog::{kinfo, kwarn};
+use crate::service::Services;
 use crate::{early, reaper};
 
 /// How long processes get between `SIGTERM` and `SIGKILL`.
@@ -38,12 +39,14 @@ impl Action {
 
 /// Shut the system down. Never returns.
 ///
-/// Once the service table exists, this should first stop named services in
-/// reverse dependency order (agents, then agentdesks, then desktop-main, then
-/// ui-manager) so each gets a chance to save state before the blanket signal
-/// below. Until then, the blanket signal is the whole story.
-pub fn shutdown(action: Action) -> ! {
+/// Named services are stopped first, in reverse table order, so each gets a
+/// chance to save state and so `desktop-main` goes down before the `ui-manager`
+/// it draws through. The blanket signal that follows catches everything else:
+/// orphans, agent processes, anything the table does not know about.
+pub fn shutdown(action: Action, services: &mut Services) -> ! {
     kinfo!("shutdown requested, {}", action.label());
+
+    services.stop_all();
 
     // kill(-1) hits every process we have permission to signal. The kernel
     // exempts PID 1, so this cannot kill the supervisor.

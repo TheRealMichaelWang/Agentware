@@ -43,16 +43,16 @@ pub fn emit(level: u8, args: fmt::Arguments<'_>) {
     let mut line = String::with_capacity(96);
     let _ = fmt::write(&mut line, args);
 
-    if let Ok(mut slot) = KMSG.lock() {
-        if let Some(file) = slot.as_mut() {
-            let record = format!("<{level}>supervisor: {line}\n");
-            if file.write_all(record.as_bytes()).is_ok() {
-                return;
-            }
-            // The device went away. Drop it and fall through to stderr so we
-            // do not lose every message from here on.
-            *slot = None;
+    if let Ok(mut slot) = KMSG.lock()
+        && let Some(file) = slot.as_mut()
+    {
+        let record = format!("<{level}>supervisor: {line}\n");
+        if file.write_all(record.as_bytes()).is_ok() {
+            return;
         }
+        // The device went away. Drop it and fall through to stderr so we do not
+        // lose every message from here on.
+        *slot = None;
     }
 
     eprintln!("supervisor: {line}");

@@ -13,6 +13,14 @@
 
 use rustix::process::{self, Pid, WaitOptions, WaitStatus};
 
+// A note on which call to use, because the wrong one fails silently and
+// intermittently. `rustix::process::wait` is `waitpid(-1)`: any child at all.
+// `rustix::process::waitpid(None, ..)` is `waitpid(0)`: any child *in the
+// caller's process group*. The reaper must use the former. Services call
+// `setsid` and so leave the supervisor's process group, and orphans
+// re-parented to PID 1 keep whatever group they already had, so `waitpid(0)`
+// would quietly collect almost nothing and leave zombies behind.
+
 use crate::klog::kinfo;
 
 /// How a child ended.
@@ -44,7 +52,7 @@ pub fn reap_all() -> Vec<(Pid, Exit)> {
     let mut reaped = Vec::new();
 
     loop {
-        match process::waitpid(None, WaitOptions::NOHANG) {
+        match process::wait(WaitOptions::NOHANG) {
             // A child was collected.
             Ok(Some((pid, status))) => {
                 if let Some(exit) = classify(status) {
@@ -69,7 +77,7 @@ pub fn reap_all() -> Vec<(Pid, Exit)> {
 /// the process table drained on its own.
 pub fn wait_for_all_to_exit(deadline: std::time::Instant) -> bool {
     loop {
-        match process::waitpid(None, WaitOptions::NOHANG) {
+        match process::wait(WaitOptions::NOHANG) {
             Ok(Some((pid, status))) => {
                 if let Some(exit) = classify(status) {
                     kinfo!("pid {} {}", pid.as_raw_nonzero(), exit);

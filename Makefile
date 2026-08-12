@@ -54,8 +54,14 @@ pack: build
 		sudo mknod -m 600 $(FS_DIR)/dev/console c 5 1; \
 	fi
 	
-	# 3. Copy the compiled Rust binary
+	# 3. Copy the compiled Rust binaries
 	cp $(AW_CORE_DIR)/supervisor/target/$(TARGET)/release/supervisor $(FS_DIR)/init
+
+	# 3b. awtest is a stand-in service used by `make selftest` to exercise the
+	# service table. Harmless to ship; nothing starts it without the selftest
+	# flag on the kernel command line.
+	mkdir -p $(FS_DIR)/bin
+	cp $(AW_CORE_DIR)/supervisor/target/$(TARGET)/release/awtest $(FS_DIR)/bin/awtest
 	
 	# 4. Pack the filesystem.
 	#

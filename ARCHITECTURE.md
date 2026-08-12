@@ -4,10 +4,11 @@ Agentware is a highly modular, multi-process operating system userland written i
 
 ## Project Layout
 The `agentwarecore` repository is structured to separate the boot-critical supervisor from the graphical and application subsystems:
-* `supervisor/` - The PID 1 bare-metal init system.
+* `supervisor/` - The PID 1 bare-metal init system and spawn broker.
 * `ui-manager/` - The core window manager and DOM parsing engine.
-* `desktop-main/` - The primary human-facing shell and prompt interface.
-* `agentdesk/` - The isolated desktop environment spun up for individual agents.
+* `desktop-main/` - The start menu: a prompt bar, a button for creating an empty agentdesk, and the list of open ones. It launches workspaces, never apps.
+* `agentdesk/` - The workspace process. One per open agentdesk, owning that workspace's apps, conversation history, and UI state.
+* `agent/` - The per-turn worker. Spawned to execute one prompt and gone when that prompt is finished.
 * `apps/` - First-party system applications natively compatible with the UI markup language.
 
 ## The Supervisor (PID 1)
@@ -15,15 +16,84 @@ The Supervisor is the absolute root of the userland.
 * Runs as process ID 1 immediately after the Linux kernel finishes booting.
 * Responsible for hardware initialization, mounting virtual filesystems (`/dev`, `/proc`, `/sys`), and bootstrapping the `ui-manager` and `desktop-main` processes.
 * Monitors the health of all sub-processes and acts as the grim reaper for zombie processes to prevent resource leaks.
+* Acts as the **spawn broker**: every agentdesk and every agent in the system is forked by the Supervisor, on request, and is therefore a direct child of PID 1.
+
+The Supervisor deliberately stays small. It does not parse UI markup, touch the display, or know anything about what an agent is doing. It is the one process that is not permitted to crash, so it owns only what nothing else can: the process tree, signals, and shutdown.
 
 ## UI Manager & Window Manager
 Agentware completely reimagines the display server. It does not use pixels or legacy framebuffers for input and application state.
 * **Markup-Based UI:** Instead of pushing pixel arrays, applications output a special, proprietary UI markup language (similar to a DOM). 
 * **Deterministic Rendering:** The UI Manager parses this markup and natively renders it to the screen via the kernel's DRM/KMS subsystem.
 * **Semantic Agent Input:** Because the UI is a structured DOM rather than a flat image, agents do not rely on fragile computer vision or pixel coordinates. They read the exact semantic structure of the UI and interact by targeting specific UI element IDs, driving the "fake cursor" visually to those exact nodes.
+* **Serializable Workspaces:** Because a workspace is a markup tree rather than a framebuffer, its entire visual state can be written out and rebuilt exactly. This is what makes suspending and restoring an idle agentdesk tractable.
+
+## The Lifetime Model
+The single most important structural decision in Agentware is that an agentdesk and an agent are not the same thing, and do not live for the same length of time. Three tiers, from longest lived to shortest:
+
+| Tier | Lives | Owns |
+| --- | --- | --- |
+| **Agentdesk** | Until the human closes it, or until reboot | Identity, conversation history, open apps, workspace UI state |
+| **Apps** | Until closed within their agentdesk | Their own documents and view state |
+| **Agent** | One turn | Nothing durable |
+
+Nothing outlives the machine. Agentware has no persistent storage layer: the entire userland runs from a RAM-backed initramfs, and a reboot wipes every agentdesk. The system starts each boot with exactly one empty workspace. This is a deliberate simplification rather than an unfinished one, and it removes session restore, on-disk state, and filesystem consistency from the design entirely.
+
+An agentdesk with no prompt in flight has **no agent process at all**. It is a workspace with apps in it. When a prompt arrives, whether at creation time or as a follow-up long afterwards, the Supervisor forks an agent, hands it the accumulated history plus the new message, and that process exits when the turn is complete.
+
+The agent is therefore a stateless worker. This is not an optimization, it is what makes several hard promises cheap to keep:
+
+* **Interruption is a signal.** VISION.md guarantees the human can stop an agent at any exact moment. With a long-lived agent that requires cancellation plumbed through every tool call. With a per-turn agent it is `SIGTERM` to a process that owns nothing. The workspace, apps, and history live elsewhere and survive untouched.
+* **Crashes are contained.** An agent that dies mid-turn takes nothing with it. The agentdesk keeps its apps and history and surfaces an error the human can act on.
+* **Agents never restart.** A failed agent is a *result* to report, not a process to resurrect. Restarting one would silently re-run side effects it had already performed, which is the opposite of what the user asked for.
+* **Idle costs nothing.** A hundred open agentdesks cost a hundred workspaces and zero resident agent processes.
+
+## Workspace Ownership and Teardown
+Apps are per-workspace instances, not singletons. The same app may be open in a dozen agentdesks at once, and each one is a separate process belonging to exactly one workspace. Closing an agentdesk must therefore take its apps with it, or every closed workspace leaks processes for the lifetime of the machine.
+
+The boundary that makes this reliable is a **cgroup per agentdesk**. The Supervisor creates one when it forks the workspace, and every app it later forks into that workspace is placed in the same cgroup. This is preferred over process groups because a process can leave a process group on its own (`setsid`, `setpgid`) but cannot leave its cgroup, so a misbehaving or double-forking app cannot escape the boundary that owns it.
+
+Closing an agentdesk reuses the same escalation the Supervisor already applies at system shutdown, scoped to one workspace:
+
+1. `SIGTERM` the agentdesk, so it can detach cleanly from `ui-manager` and release its workspace.
+2. `SIGTERM` its apps, so they can flush open documents to the filesystem.
+3. After a grace period, `cgroup.kill` as the backstop, which terminates everything remaining in the cgroup atomically.
+4. Reap. Every process involved is a direct child of PID 1, so the existing reaper collects them all with no special case.
+
+Step 4 is the reason apps are forked by the Supervisor rather than by the agentdesk that requested them. If a workspace forked its own apps and was itself killed first, those apps would orphan mid-teardown and outlive the thing that owned them.
+
+The per-agentdesk cgroup earns its keep twice more. It is where resource limits go, which is how a runaway agent is capped without affecting other workspaces. And it provides per-workspace memory accounting, which is exactly the signal needed to decide which idle agentdesk to suspend next.
+
+## Workspace Suspension
+Open agentdesks accumulate the way browser tabs do. An agentdesk that has not been viewed in a long time can have its app processes discarded entirely, with the workspace serialized to its markup tree and rebuilt on the human's return. The DOM-based rendering model is what makes this practical: restoring a suspended workspace is re-parsing markup, not replaying GPU state.
+
+Suspension is a memory optimization, not a persistence mechanism. The serialized tree and the conversation history stay in RAM for as long as the machine is on, and die with it like everything else. The win is still large: a markup tree costs a fraction of the app processes and agent context it replaces, which is what lets a machine hold many more open agentdesks than it could hold live ones.
+
+## The Spawn Broker
+`desktop-main` and the agentdesks do not fork processes themselves. They ask the Supervisor over a control socket at `/run/agentware/sup.sock`:
+
+```
+CreateDesk { prompt: Option<text> } -> desk_id
+OpenApp    { desk_id, app }         -> forks an app process into that workspace
+SendPrompt { desk_id, text }        -> spawns a per-turn agent for that desk
+Interrupt  { desk_id }              -> SIGTERM the desk's current agent
+CloseDesk  { desk_id }              -> tear down the desk and everything in it
+```
+
+`CreateDesk` carries a prompt or nothing, matching the start menu's two buttons. Apps never enter a workspace at creation time; they arrive later through `OpenApp`, requested by the agentdesk's own launcher on behalf of either the human or the agent.
+
+Brokering through PID 1 rather than forking locally buys four things:
+
+* **Process tree ownership.** If `desktop-main` forked agentdesks, a crash of `desktop-main` would orphan every open workspace to PID 1 with no record attached, leaving them unnameable and unmanageable. As children of the Supervisor they are first-class entries in its service table from the start.
+* **Privilege separation.** Sandboxing an agent requires namespaces and cgroups, which require privilege. With the broker at PID 1, `desktop-main` needs none.
+* **File descriptor passing.** The Supervisor can create a `socketpair` to `ui-manager` and hand one end to a new agentdesk at spawn time via `SCM_RIGHTS`. This removes the startup race and means a sandboxed process never needs filesystem access to the compositor socket.
+* **One owner of lifetime.** The Supervisor already reaps and already tracks process state. A second spawner would mean two components tracking lifetime, and they would drift apart.
+
+What deliberately does **not** cross this socket is agent telemetry. The stream of thoughts and tool calls that fills the side pane is high-volume application data and flows directly from the agent to its agentdesk. Every byte routed through PID 1 is a byte that can wedge the one process that must never wedge.
 
 ## Process Isolation & Lifecycle
 Every major component in Agentware is strictly isolated in its own process space to guarantee system stability.
-* **Main Desktop Process:** The primary desktop (containing the central prompt bar) runs as a persistent, standalone process directly under the Supervisor.
-* **Agent and Agentdesk Processes:** When a human issues a prompt, the system forks entirely new, isolated processes for both the AI Agent and its corresponding `agentdesk` graphical shell. 
-* **Sandboxed Execution:** If an agent crashes, gets stuck in a loop, or fails, its specific `agentdesk` process can be killed and restarted by the supervisor without affecting the main desktop or any other agents running in parallel.
+* **Home Screen Process:** `desktop-main` runs as a persistent, standalone process directly under the Supervisor. It is a launcher, so it holds no user work and losing it costs nothing but the menu.
+* **Agentdesk Processes:** Each open workspace is its own process, forked by the Supervisor on request and placed in its own cgroup along with its apps. If one crashes, gets stuck, or is closed, no other workspace is affected.
+* **App Processes:** One per app *per workspace*. The same app open in several agentdesks is several independent processes, each owned by exactly one workspace and torn down with it.
+* **Agent Processes:** Short-lived and frequent, one per turn. Because they perform computer use on a live workspace, they are the correct place to apply sandboxing (`CLONE_NEWPID`, `CLONE_NEWNS`, cgroup limits) as the isolation model matures.
+* **Restart Policy by Kind:** `ui-manager` and `desktop-main` restart forever with exponential backoff, since the machine is unusable without them. Agentdesks and agents do not silently restart, because doing so would destroy conversation state or repeat work the human did not ask for twice.
