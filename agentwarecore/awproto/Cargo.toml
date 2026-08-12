@@ -1,0 +1,9 @@
+[package]
+name = "awproto"
+version = "0.1.0"
+edition = "2024"
+
+# The wire contract, in its own crate because three components speak it: the
+# supervisor that serves it, the haimanager that registers on it, and the client
+# binaries that drive it. Defining it once is what stops the socket path, the
+# handoff environment variables and the role names drifting apart.

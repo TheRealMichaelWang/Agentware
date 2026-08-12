@@ -1,0 +1,6 @@
+# Build outputs. The initramfs and everything in it is produced by `make pack`
+# from the sources in agentwarecore, so none of it belongs in the repository.
+target/
+initramfs.cpio.gz
+initramfs/init
+initramfs/bin/

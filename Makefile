@@ -4,8 +4,9 @@ INITRAMFS_ARCHIVE := initramfs.cpio.gz
 FS_DIR := initramfs
 AW_CORE_DIR := agentwarecore
 TARGET := x86_64-unknown-linux-musl
+BIN_DIR := $(AW_CORE_DIR)/target/$(TARGET)/release
 
-.PHONY: all build buildcore buildsupervisor pack run selftest clean
+.PHONY: all build buildcore pack run selftest clean
 
 # Shared QEMU invocation. virtio-vga is what gives the guest /dev/dri/card0,
 # which haimanager will render onto via DRM/KMS.
@@ -22,15 +23,11 @@ all: run
 # Build Targets
 # ---------------------------------------------------------
 
-# 1. Build the PID 1 Supervisor
-buildsupervisor:
-	@echo "==> Building Supervisor..."
-	cd $(AW_CORE_DIR)/supervisor && cargo build --release --target $(TARGET)
-
-# 2. Build Agentware Core (Supervisor + Future Display Server/Agent Harnesses)
-buildcore: buildsupervisor
-	@echo "==> Agentware Core build complete."
-	# (Future) Add 'builddisplayserver' as a dependency above
+# 1. Build every crate in the agentwarecore workspace: awproto, the supervisor
+# and its stand-in binaries, and the haimanager.
+buildcore:
+	@echo "==> Building Agentware Core..."
+	cd $(AW_CORE_DIR) && cargo build --release --target $(TARGET)
 
 # 3. Build All Userland (Core + Future 1st-party apps/tools)
 build: buildcore
@@ -45,8 +42,8 @@ build: buildcore
 pack: build
 	@echo "==> Packing initramfs..."
 	
-	# 1. Create the /dev directory
-	mkdir -p $(FS_DIR)/dev
+	# 1. Create the directories the image needs
+	mkdir -p $(FS_DIR)/dev $(FS_DIR)/bin
 	
 	# 2. Create the console device node (Requires sudo)
 	@if [ ! -c $(FS_DIR)/dev/console ]; then \
@@ -55,7 +52,8 @@ pack: build
 	fi
 	
 	# 3. Copy the compiled Rust binaries
-	cp $(AW_CORE_DIR)/supervisor/target/$(TARGET)/release/supervisor $(FS_DIR)/init
+	cp $(BIN_DIR)/supervisor $(FS_DIR)/init
+	cp $(BIN_DIR)/haimanager $(FS_DIR)/bin/haimanager
 
 	# 3b. Stand-in binaries used by `make selftest` to exercise the service
 	# table and the control socket. Harmless to ship; nothing starts them
@@ -64,11 +62,10 @@ pack: build
 	#   awstubborn  an app that ignores SIGTERM, to force the cgroup.kill path
 	#   awctl       the control socket client
 	#   awui        a stand-in compositor that receives passed descriptors
-	mkdir -p $(FS_DIR)/bin
-	cp $(AW_CORE_DIR)/supervisor/target/$(TARGET)/release/awtest $(FS_DIR)/bin/awtest
-	cp $(AW_CORE_DIR)/supervisor/target/$(TARGET)/release/awstubborn $(FS_DIR)/bin/awstubborn
-	cp $(AW_CORE_DIR)/supervisor/target/$(TARGET)/release/awctl $(FS_DIR)/bin/awctl
-	cp $(AW_CORE_DIR)/supervisor/target/$(TARGET)/release/awui $(FS_DIR)/bin/awui
+	cp $(BIN_DIR)/awtest $(FS_DIR)/bin/awtest
+	cp $(BIN_DIR)/awstubborn $(FS_DIR)/bin/awstubborn
+	cp $(BIN_DIR)/awctl $(FS_DIR)/bin/awctl
+	cp $(BIN_DIR)/awui $(FS_DIR)/bin/awui
 	
 	# 4. Pack the filesystem.
 	#
@@ -97,6 +94,6 @@ selftest: pack
 # ---------------------------------------------------------
 clean:
 	@echo "==> Cleaning build artifacts..."
-	cd $(AW_CORE_DIR)/supervisor && cargo clean
+	cd $(AW_CORE_DIR) && cargo clean
 	rm -f $(INITRAMFS_ARCHIVE)
 	rm -f $(FS_DIR)/init

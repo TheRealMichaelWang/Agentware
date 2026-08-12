@@ -1,0 +1,14 @@
+[package]
+name = "haimanager"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# The DRM ioctl structures are hand-declared in `drm/mod.rs` rather than pulled
+# from a crate. They are stable kernel uapi, the set we need is small, and the
+# haimanager is the process that owns the screen: a black screen with no error
+# is the worst thing to debug, so the ioctl layer is worth being able to read in
+# full.
+libc = "0.2"
+rustix = { version = "1.1.4", features = ["event", "fs", "net", "process"] }
+awproto = { path = "../awproto" }

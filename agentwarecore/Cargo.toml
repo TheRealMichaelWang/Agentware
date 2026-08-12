@@ -1,0 +1,13 @@
+[workspace]
+resolver = "3"
+members = ["awproto", "supervisor", "haimanager"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+# A panic that unwinds out of main in PID 1 makes the kernel panic. The panic
+# hook parks the supervisor before it can get this far, but abort keeps every
+# binary small and removes the unwinding machinery entirely.
+panic = "abort"

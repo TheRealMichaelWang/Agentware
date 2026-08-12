@@ -18,24 +18,4 @@ rustix = { version = "1.1.4", features = [
 # Used only by `signals.rs`. rustix deliberately does not wrap signalfd or
 # sigprocmask, so that one module drops to raw libc.
 libc = "0.2"
-
-[profile.release]
-opt-level = "z"
-lto = true
-codegen-units = 1
-strip = true
-# A panic that unwinds out of main in PID 1 makes the kernel panic. The panic
-# hook in main.rs parks the process before it can get this far, but abort keeps
-# the binary small and removes the unwinding machinery entirely.
-panic = "abort"
-
-# The wire contract lives in a library so the supervisor and the stand-in
-# binaries share one definition. Binaries under src/bin are separate crate roots
-# and cannot reach the supervisor's own modules, so without this each one
-# reimplements the framing and re-types the socket path, the environment
-# variable and the role name as literals. The haimanager rename showed exactly
-# how that goes wrong: the strings that happened to match a search were updated
-# and the ones that did not were silently left behind.
-[lib]
-name = "awproto"
-path = "src/wire.rs"
+awproto = { path = "../awproto" }

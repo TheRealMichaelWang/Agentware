@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Boot Agentware in QEMU, capture the screen, and write a PNG.
+
+Graphics work needs to be looked at, and a serial log cannot show whether the
+picture is right. This drives QEMU's monitor to take a `screendump`, which
+produces a PPM, and converts it to PNG so it can be viewed directly.
+
+Usage: tools/screenshot.py OUT.png [--seconds N] [--append "KERNEL CMDLINE"]
+"""
+
+import argparse
+import os
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import zlib
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+KERNEL = os.path.join(ROOT, "kernel-build/arch/x86/boot/bzImage")
+INITRAMFS = os.path.join(ROOT, "initramfs.cpio.gz")
+
+
+def qemu(monitor_path, serial_path, append):
+    return subprocess.Popen(
+        [
+            "qemu-system-x86_64", "-enable-kvm", "-m", "4G", "-cpu", "host",
+            "-kernel", KERNEL, "-initrd", INITRAMFS,
+            "-device", "virtio-vga", "-no-reboot",
+            "-display", "none",
+            "-serial", "file:" + serial_path,
+            "-monitor", "unix:%s,server,nowait" % monitor_path,
+            "-append", append,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.STDOUT,
+    )
+
+
+def monitor_command(path, command, deadline=20.0):
+    """Send one command to the QEMU monitor and return what it says back."""
+    started = time.time()
+    while True:
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(5.0)
+            sock.connect(path)
+            break
+        except (FileNotFoundError, ConnectionRefusedError):
+            if time.time() - started > deadline:
+                raise
+            time.sleep(0.1)
+
+    with sock:
+        time.sleep(0.3)               # let the banner arrive
+        try:
+            sock.recv(65536)
+        except socket.timeout:
+            pass
+        sock.sendall((command + "\n").encode())
+        time.sleep(0.8)               # let the command run
+        try:
+            return sock.recv(65536).decode(errors="replace")
+        except socket.timeout:
+            return ""
+
+
+def read_ppm(path):
+    """Parse a binary PPM (P6). QEMU writes nothing else."""
+    with open(path, "rb") as handle:
+        data = handle.read()
+
+    fields = []
+    offset = 0
+    while len(fields) < 4:
+        while offset < len(data) and data[offset : offset + 1].isspace():
+            offset += 1
+        if data[offset : offset + 1] == b"#":
+            while data[offset : offset + 1] not in (b"\n", b""):
+                offset += 1
+            continue
+        start = offset
+        while offset < len(data) and not data[offset : offset + 1].isspace():
+            offset += 1
+        fields.append(data[start:offset])
+
+    magic, width, height, maxval = fields
+    if magic != b"P6":
+        raise ValueError("expected a P6 PPM, got %r" % magic)
+    if int(maxval) != 255:
+        raise ValueError("only 8-bit PPMs are supported")
+
+    offset += 1  # the single whitespace byte after maxval
+    width, height = int(width), int(height)
+    return width, height, data[offset : offset + width * height * 3]
+
+
+def write_png(path, width, height, rgb):
+    """Minimal PNG encoder: one IHDR, one IDAT, one IEND, no filtering."""
+
+    def chunk(kind, payload):
+        body = kind + payload
+        return (
+            struct.pack(">I", len(payload))
+            + body
+            + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+        )
+
+    raw = bytearray()
+    for y in range(height):
+        raw.append(0)  # filter type 0, none
+        raw += rgb[y * width * 3 : (y + 1) * width * 3]
+
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    with open(path, "wb") as handle:
+        handle.write(b"\x89PNG\r\n\x1a\n")
+        handle.write(chunk(b"IHDR", header))
+        handle.write(chunk(b"IDAT", zlib.compress(bytes(raw), 6)))
+        handle.write(chunk(b"IEND", b""))
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("output")
+    parser.add_argument("--seconds", type=float, default=6.0,
+                        help="how long to let the guest boot before capturing")
+    parser.add_argument("--append", default="console=ttyS0,115200",
+                        help="kernel command line")
+    parser.add_argument("--serial", default=None,
+                        help="where to write the serial log")
+    args = parser.parse_args()
+
+    workdir = tempfile.mkdtemp(prefix="agentware-shot-")
+    monitor_path = os.path.join(workdir, "monitor.sock")
+    ppm_path = os.path.join(workdir, "screen.ppm")
+    serial_path = args.serial or os.path.join(workdir, "serial.log")
+
+    guest = qemu(monitor_path, serial_path, args.append)
+    try:
+        time.sleep(args.seconds)
+        if guest.poll() is not None:
+            print("qemu exited early (status %s)" % guest.returncode, file=sys.stderr)
+
+        reply = monitor_command(monitor_path, "screendump %s" % ppm_path)
+        if not os.path.exists(ppm_path):
+            print("no screendump produced. monitor said: %s" % reply.strip(), file=sys.stderr)
+            return 1
+
+        width, height, rgb = read_ppm(ppm_path)
+        write_png(args.output, width, height, rgb)
+        print("captured %dx%d -> %s" % (width, height, args.output))
+
+        if os.path.exists(serial_path):
+            print("--- serial tail ---")
+            with open(serial_path, errors="replace") as handle:
+                for line in handle.read().splitlines()[-25:]:
+                    print(line)
+        return 0
+    finally:
+        guest.kill()
+        guest.wait()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
