@@ -332,6 +332,12 @@ pub struct Focus {
     /// one place on a screen, the place keystrokes go, so its phase is screen
     /// state rather than a property of every window that remembers a focus.
     pub caret_visible: bool,
+    /// The scroll container whose bar is currently showing, if any.
+    ///
+    /// Scrollbars auto-hide: one appears while its content is being moved and
+    /// lingers briefly after, which is what lets it sit over the content's edge
+    /// without permanently covering anything.
+    pub scrollbar: Option<usize>,
 }
 
 pub struct Layout {
@@ -750,23 +756,50 @@ pub fn paint_subtree(
 /// Drawn after a scroll container's children so it sits above them, and only
 /// when there is something out of sight: a bar on content that fits would say
 /// something untrue.
-fn paint_scrollbar(canvas: &mut Canvas, layout: &Layout, index: usize) {
-    let Some(scroller) = layout.scrollers.iter().find(|s| s.node == index) else {
-        return;
-    };
+/// The track and thumb of a scroll container's bar, or `None` when the content
+/// fits and there is nothing to indicate.
+///
+/// One function, used by both painting and hit testing, so the thumb the hand
+/// grabs is exactly the thumb the eye sees. Two copies of this arithmetic would
+/// drift, and a scrollbar that moves under a click it does not answer to is the
+/// kind of bug nobody files and everybody feels.
+pub fn scrollbar_geometry(rect: Rect, scroller: &Scroller) -> Option<(Rect, Rect)> {
     if scroller.content <= scroller.viewport || scroller.viewport <= 0 {
-        return;
+        return None;
     }
 
-    let rect = layout.rects[index];
-    let track = Rect::new(rect.x + rect.w - scrollbar_w() - 2, rect.y, scrollbar_w(), rect.h);
-    canvas.fill_rect(track, SURFACE);
-
-    let span = (track.h * scroller.viewport / scroller.content).max(16);
+    let track = Rect::new(
+        rect.x + rect.w - scrollbar_w() - sc(2),
+        rect.y + sc(2),
+        scrollbar_w(),
+        rect.h - sc(4),
+    );
+    let span = (track.h * scroller.viewport / scroller.content).max(sc(24));
     let travel = track.h - span;
     let furthest = (scroller.content - scroller.viewport).max(1);
     let top = track.y + travel * scroller.offset / furthest;
-    canvas.fill_rect(Rect::new(track.x, top, track.w, span), BORDER);
+    Some((track, Rect::new(track.x, top, track.w, span)))
+}
+
+/// A thin indicator beside content that overflows.
+///
+/// Drawn after a scroll container's children so it sits above them, and only
+/// while [`Focus::scrollbar`] says this container's content is being moved: the
+/// bar hugs the content's edge, so earning its keep means leaving when the
+/// scrolling stops.
+fn paint_scrollbar(canvas: &mut Canvas, layout: &Layout, index: usize, lit: Option<usize>) {
+    if lit != Some(index) {
+        return;
+    }
+    let Some(scroller) = layout.scrollers.iter().find(|s| s.node == index) else {
+        return;
+    };
+    let Some((track, thumb)) = scrollbar_geometry(layout.rects[index], scroller) else {
+        return;
+    };
+    // No track drawn, only the thumb. A permanent groove down the side of
+    // every scrollable thing is most of what makes a list look heavy.
+    canvas.fill_round_rect(thumb, track.w / 2, MUTED);
 }
 
 fn paint_node(
@@ -988,7 +1021,7 @@ fn paint_node(
     }
 
     if node.tag == Tag::Scroll {
-        canvas.clipped(clip, |canvas| paint_scrollbar(canvas, layout, index));
+        canvas.clipped(clip, |canvas| paint_scrollbar(canvas, layout, index, focus.scrollbar));
     }
 }
 

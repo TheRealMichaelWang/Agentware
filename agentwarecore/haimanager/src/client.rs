@@ -63,6 +63,9 @@ use crate::ui::{self, Focus, Frame, Layout};
 /// memory in the one process that owns the screen.
 const MAX_BACKLOG: usize = 256 * 1024;
 
+/// How long a scrollbar stays on screen after its content last moved.
+const SCROLLBAR_LINGER: Duration = Duration::from_millis(900);
+
 /// How long a control stays visibly pressed.
 ///
 /// Long enough to be seen in a screenshot and by a human watching an agent
@@ -137,6 +140,13 @@ pub struct Client {
     /// compositor before painting: only the client keystrokes actually go to
     /// gets a caret at all, and its phase comes from the screen's blink clock.
     pub caret_on: bool,
+    /// The scroll container whose bar is showing: its key, and when its content
+    /// last moved. The bar hides itself once this goes stale.
+    scroll_shown: Option<(String, Instant)>,
+    /// A scrollbar thumb being dragged: the container's key, and where inside
+    /// the thumb it was grabbed, so the thumb tracks the hand rather than
+    /// jumping to centre itself under it.
+    scroll_drag: Option<(String, i32)>,
     /// The control currently showing a press, and when it started.
     ///
     /// Ephemeral in the strictest sense: it lasts a sixth of a second and never
@@ -183,6 +193,8 @@ impl Client {
             editing: HashMap::new(),
             scroll: HashMap::new(),
             caret_on: false,
+            scroll_shown: None,
+            scroll_drag: None,
             press: None,
         })
     }
@@ -401,15 +413,30 @@ impl Client {
     /// Where the compositor believes focus and the caret are, in this tree.
     fn focus_state(&self) -> Focus {
         let Some(doc) = &self.doc else { return Focus::default() };
-        let Some(key) = &self.focus else { return Focus::default() };
-        let node = doc.index_of(key);
-        let caret = self.editing.get(key).map_or(0, |state| state.caret);
+
+        // Press and scrollbar do not depend on anything being focused. The
+        // first version returned early when no control held focus, which
+        // silently kept scrollbars from ever appearing in a window that had
+        // not been clicked into yet.
         let pressed = self
             .press
             .as_ref()
             .filter(|(_, since)| since.elapsed() < PRESS)
             .and_then(|(key, _)| doc.index_of(key));
-        Focus { node, caret, pressed, caret_visible: self.caret_on }
+        let scrollbar = self
+            .scroll_shown
+            .as_ref()
+            .filter(|(_, since)| since.elapsed() < SCROLLBAR_LINGER)
+            .and_then(|(key, _)| doc.index_of(key));
+
+        let (node, caret) = match &self.focus {
+            Some(key) => (
+                doc.index_of(key),
+                self.editing.get(key).map_or(0, |state| state.caret),
+            ),
+            None => (None, 0),
+        };
+        Focus { node, caret, pressed, caret_visible: self.caret_on, scrollbar }
     }
 
     /// Whether keystrokes to this client would land in a text control, which is
@@ -427,6 +454,77 @@ impl Client {
         self.press
             .as_ref()
             .is_some_and(|(_, since)| since.elapsed() < PRESS)
+            // The lingering scrollbar needs one more frame to disappear in;
+            // keeping frames coming until it expires is what delivers it.
+            || self
+                .scroll_shown
+                .as_ref()
+                .is_some_and(|(_, since)| since.elapsed() < SCROLLBAR_LINGER)
+    }
+
+    /// Whether a scrollbar thumb is currently being dragged.
+    pub fn scroll_dragging(&self) -> bool {
+        self.scroll_drag.is_some()
+    }
+
+    /// Take hold of a scrollbar if the point is on one.
+    ///
+    /// Checked before the ordinary hit test, because the bar overlays content:
+    /// a press on the thumb must grab it, not select the list row underneath.
+    /// A press on the track jumps the thumb there first, then drags it.
+    fn grab_scrollbar(&mut self, fonts: &Fonts, x: i32, y: i32) -> bool {
+        let Some(doc) = &self.doc else { return false };
+        // Only a visible bar is grabbable. An invisible one that still caught
+        // clicks would make the content's right edge mysteriously dead.
+        let lit = self.focus_state().scrollbar;
+
+        for scroller in self.layout.scrollers.iter().rev() {
+            if lit != Some(scroller.node) {
+                continue;
+            }
+            let rect = self.layout.rect_of(scroller.node);
+            let Some((track, thumb)) = ui::scrollbar_geometry(rect, scroller) else { continue };
+            // The whole track answers, a little widened, because a hairline
+            // thumb is a cruel target.
+            let target = Rect::new(track.x - ui::sc(4), track.y, track.w + ui::sc(8), track.h);
+            if !target.contains(x, y) {
+                continue;
+            }
+
+            let key = doc.key(scroller.node).to_owned();
+            let grab = if thumb.contains(x, y) { y - thumb.y } else { thumb.h / 2 };
+            self.scroll_drag = Some((key, grab));
+            self.drag_scroll(fonts, y);
+            return true;
+        }
+        false
+    }
+
+    /// Follow the hand while a thumb is held.
+    pub fn drag_scroll(&mut self, fonts: &Fonts, y: i32) -> bool {
+        let Some((key, grab)) = self.scroll_drag.clone() else { return false };
+        let Some(doc) = &self.doc else { return false };
+        let Some(node) = doc.index_of(&key) else { return false };
+        let Some(scroller) = self.layout.scrollers.iter().find(|s| s.node == node) else {
+            return false;
+        };
+
+        let rect = self.layout.rect_of(node);
+        let Some((track, thumb)) = ui::scrollbar_geometry(rect, scroller) else { return false };
+        let travel = (track.h - thumb.h).max(1);
+        let furthest = (scroller.content - scroller.viewport).max(0);
+        let offset = ((y - grab - track.y) * furthest / travel).clamp(0, furthest);
+
+        if offset != scroller.offset {
+            self.scroll.insert(key.clone(), offset);
+            self.relayout(fonts);
+        }
+        self.scroll_shown = Some((key, Instant::now()));
+        true
+    }
+
+    pub fn end_scroll_drag(&mut self) {
+        self.scroll_drag = None;
     }
 
     pub fn draw(&self, canvas: &mut Canvas, fonts: &Fonts) {
@@ -474,6 +572,10 @@ impl Client {
     /// agent path being the same path is what stops it becoming a second
     /// implementation that can disagree.
     fn click(&mut self, fonts: &Fonts, x: i32, y: i32) -> bool {
+        if self.grab_scrollbar(fonts, x, y) {
+            return true;
+        }
+
         let Some(doc) = &self.doc else { return false };
         let Some(index) = self.layout.hit(&doc.tree, x, y) else {
             // Clicking the gap between two controls is a real thing to have
@@ -724,7 +826,10 @@ impl Client {
 
         let key = doc.key(container).to_owned();
         let was = self.scroll.get(&key).copied().unwrap_or(0);
-        self.scroll.insert(key, was + shift);
+        self.scroll.insert(key.clone(), was + shift);
+        // The bar lights up for the agent's scrolling exactly as it does for
+        // the human's wheel, so the human watching sees where the view moved.
+        self.scroll_shown = Some((key, Instant::now()));
         self.relayout(fonts);
         self.note = format!("scrolled to reveal {}", self.label());
         true
@@ -749,7 +854,8 @@ impl Client {
             return false;
         }
 
-        self.scroll.insert(key, next);
+        self.scroll.insert(key.clone(), next);
+        self.scroll_shown = Some((key, Instant::now()));
         self.relayout(fonts);
         self.note = format!("scrolled to {next} of {furthest}");
         true

@@ -219,6 +219,9 @@ pub struct Screen {
     requests: Vec<Vec<String>>,
     notes: Vec<String>,
     drag: Option<Drag>,
+    /// The client whose scrollbar thumb is being dragged, so pointer motion
+    /// keeps reaching it even when the pointer leaves the bar.
+    scroll_drag: Option<RawFd>,
 
     /// The intent being performed, if any.
     flight: Option<Flight>,
@@ -259,6 +262,7 @@ impl Screen {
             requests: Vec::new(),
             notes: Vec::new(),
             drag: None,
+            scroll_drag: None,
             flight: None,
             queued: VecDeque::new(),
             agent_cursor: None,
@@ -709,14 +713,24 @@ impl Screen {
     pub fn handle(&mut self, fonts: &Fonts, event: Event) -> bool {
         match event {
             // The cursor is the compositor's, so a move is a repaint and nothing
-            // else, unless a window is being carried.
+            // else, unless a window or a scrollbar is being carried.
             Event::PointerMoved { x, y } => {
                 self.drag_to(fonts, x, y);
+                if let Some(fd) = self.scroll_drag
+                    && let Some(client) = self.client_mut(fd)
+                {
+                    client.drag_scroll(fonts, y);
+                }
                 true
             }
 
             Event::ButtonReleased { button: Button::Left, .. } => {
                 self.drag = None;
+                if let Some(fd) = self.scroll_drag.take()
+                    && let Some(client) = self.client_mut(fd)
+                {
+                    client.end_scroll_drag();
+                }
                 false
             }
 
@@ -838,7 +852,12 @@ impl Screen {
                 }
                 self.raise(self.current, fd);
                 self.focus = Surface::App(fd);
-                self.route_to(fd, fonts, Event::ButtonPressed { button: Button::Left, x, y })
+                let dirty =
+                    self.route_to(fd, fonts, Event::ButtonPressed { button: Button::Left, x, y });
+                if self.client(fd).is_some_and(Client::scroll_dragging) {
+                    self.scroll_drag = Some(fd);
+                }
+                dirty
             }
 
             Surface::Desk => {
@@ -861,7 +880,15 @@ impl Screen {
                 }
 
                 self.focus = Surface::Desk;
-                self.route_desk(fonts, Event::ButtonPressed { button: Button::Left, x, y })
+                let desk = self.workspaces.get(self.current).and_then(|w| w.desk);
+                let dirty =
+                    self.route_desk(fonts, Event::ButtonPressed { button: Button::Left, x, y });
+                if let Some(fd) = desk
+                    && self.client(fd).is_some_and(Client::scroll_dragging)
+                {
+                    self.scroll_drag = Some(fd);
+                }
+                dirty
             }
         }
     }
