@@ -105,6 +105,15 @@ struct Drag {
 /// claim rather than something on screen.
 const FLIGHT: Duration = Duration::from_millis(600);
 
+/// How long the conversation pane takes to fold away or return.
+const PANE_FOLD: Duration = Duration::from_millis(200);
+
+/// Half a caret blink: lit for this long, dark for this long.
+///
+/// Restarted by every keystroke, so the caret is solid while someone is typing
+/// and only blinks while the field is waiting.
+const BLINK: Duration = Duration::from_millis(530);
+
 /// Time between characters when an agent enters text.
 ///
 /// An agent that set a field's value in one step would produce something no
@@ -179,6 +188,13 @@ struct Workspace {
     /// button is: the pane is most of the screen, and a wedged workspace must
     /// not be able to keep it.
     pane_collapsed: bool,
+    /// How far along the fold is, 0 fully open to 1 fully away.
+    ///
+    /// Kept separate from the target so the pane travels rather than teleports.
+    /// A third of the screen appearing in one frame reads as a glitch even when
+    /// it is exactly what was asked for; the same change over a fifth of a
+    /// second reads as a thing moving.
+    pane_t: f32,
 }
 
 pub struct Screen {
@@ -213,6 +229,13 @@ pub struct Screen {
     /// Where the agent's pointer is, and whose workspace it is in. Kept after a
     /// flight lands, so the human can see what was just touched.
     agent_cursor: Option<(u32, i32, i32)>,
+    /// When the last animation frame was advanced, for time-based motion.
+    last_frame: Instant,
+    /// When the caret last had a reason to be visible: a keystroke, a click
+    /// into text, or an agent typing. Phase is measured from here.
+    blink_epoch: Instant,
+    /// The phase most recently painted, so a flip is worth exactly one frame.
+    blink_shown: bool,
     /// Whether anything was mid-animation on the previous pass.
     ///
     /// Only used to produce one final frame after the last one finishes. Without
@@ -239,6 +262,9 @@ impl Screen {
             flight: None,
             queued: VecDeque::new(),
             agent_cursor: None,
+            last_frame: Instant::now(),
+            blink_epoch: Instant::now(),
+            blink_shown: true,
             animated: false,
         }
     }
@@ -263,16 +289,88 @@ impl Screen {
     }
 
     fn regions_for(&self, at: usize) -> Regions {
-        let collapsed = self
+        let fold = self
             .workspaces
             .get(at)
-            .is_some_and(|workspace| workspace.pane_collapsed);
+            .map(|workspace| workspace.pane_t)
+            .unwrap_or(0.0);
         let area = self.workspace_area();
         // Proportional, with bounds. A fixed width was a third of a small
         // screen and a sliver of a large one; a conversation column wants to be
         // a modest sixth of either.
-        let pane = if collapsed { 0 } else { (area.w * 17 / 100).clamp(ui::sc(240), ui::sc(320)) };
+        let full = (area.w * 17 / 100).clamp(ui::sc(240), ui::sc(320));
+        // Smoothstepped, so the pane leaves and arrives gently instead of at
+        // full speed. The eased value drives the actual layout: the windows and
+        // the desk are genuinely mid-way, not sliding pictures of themselves.
+        let open = 1.0 - fold;
+        let eased = open * open * (3.0 - 2.0 * open);
+        let pane = (full as f32 * eased).round() as i32;
         Regions::carve(area, TASKBAR_HEIGHT, pane)
+    }
+
+    /// Advance every pane that is not where it is meant to be.
+    fn advance_panes(&mut self, fonts: &Fonts) -> bool {
+        let now = Instant::now();
+        // Clamped, because the clock keeps running while nothing animates and
+        // the first frame after an idle hour must not teleport the pane.
+        let dt = now.duration_since(self.last_frame).as_secs_f32().min(0.05);
+        self.last_frame = now;
+
+        let mut moved = false;
+        for workspace in &mut self.workspaces {
+            let target = if workspace.pane_collapsed { 1.0 } else { 0.0 };
+            if (workspace.pane_t - target).abs() > f32::EPSILON {
+                let step = dt / PANE_FOLD.as_secs_f32();
+                workspace.pane_t = if workspace.pane_t < target {
+                    (workspace.pane_t + step).min(target)
+                } else {
+                    (workspace.pane_t - step).max(target)
+                };
+                moved = true;
+            }
+        }
+
+        if moved {
+            // The layout follows the motion for real: the desk's pane narrows,
+            // and a maximized window widens into the room it frees.
+            self.reframe(fonts);
+        }
+        moved
+    }
+
+    /// Which client keystrokes currently land in.
+    fn keyboard_client(&self) -> Option<RawFd> {
+        match self.focus {
+            Surface::App(fd) => Some(fd),
+            Surface::Desk => self.workspaces.get(self.current).and_then(|w| w.desk),
+            Surface::Nav => None,
+        }
+    }
+
+    /// True while the caret is in the lit half of its blink.
+    fn caret_phase(&self) -> bool {
+        (self.blink_epoch.elapsed().as_millis() / BLINK.as_millis()).is_multiple_of(2)
+    }
+
+    /// How long until the caret next changes phase, if one is blinking.
+    ///
+    /// This is the event loop's wake-up, so an idle desk with no caret sleeps
+    /// exactly as it did before: no caret, no deadline, no frames.
+    pub fn until_blink(&self) -> Option<Duration> {
+        let fd = self.keyboard_client()?;
+        if !self.client(fd).is_some_and(Client::focused_text) {
+            return None;
+        }
+        let period = BLINK.as_millis();
+        let into = self.blink_epoch.elapsed().as_millis() % period;
+        Some(Duration::from_millis((period - into) as u64 + 1))
+    }
+
+    fn panes_moving(&self) -> bool {
+        self.workspaces.iter().any(|workspace| {
+            let target = if workspace.pane_collapsed { 1.0 } else { 0.0 };
+            (workspace.pane_t - target).abs() > f32::EPSILON
+        })
     }
 
     /// The grip that folds the conversation pane away, on its leading edge.
@@ -290,8 +388,10 @@ impl Screen {
     pub fn toggle_pane(&mut self, fonts: &Fonts) -> bool {
         let at = self.current;
         let Some(workspace) = self.workspaces.get_mut(at) else { return false };
+        // Only the target flips; the motion belongs to the ticks. Toggling
+        // mid-flight turns the pane around from wherever it currently is.
         workspace.pane_collapsed = !workspace.pane_collapsed;
-        self.reframe(fonts);
+        let _ = fonts;
         true
     }
 
@@ -567,6 +667,7 @@ impl Screen {
             agent: None,
             opened: 0,
             pane_collapsed: false,
+            pane_t: 0.0,
         });
         self.workspaces.len() - 1
     }
@@ -619,7 +720,10 @@ impl Screen {
                 false
             }
 
-            Event::ButtonPressed { button: Button::Left, x, y } => self.click(fonts, x, y),
+            Event::ButtonPressed { button: Button::Left, x, y } => {
+                self.blink_epoch = Instant::now();
+                self.click(fonts, x, y)
+            }
 
             Event::Scrolled { delta, x, y } => match self.surface_at(x, y) {
                 Some(Surface::App(fd)) => self.route_to(fd, fonts, event),
@@ -630,7 +734,16 @@ impl Screen {
                 }
             },
 
-            Event::KeyPressed(_) | Event::KeyReleased(_) => match self.focus {
+            Event::KeyPressed(_) => {
+                self.blink_epoch = Instant::now();
+                match self.focus {
+                    Surface::App(fd) => self.route_to(fd, fonts, event),
+                    Surface::Desk => self.route_desk(fonts, event),
+                    Surface::Nav => false,
+                }
+            }
+
+            Event::KeyReleased(_) => match self.focus {
                 Surface::App(fd) => self.route_to(fd, fonts, event),
                 Surface::Desk => self.route_desk(fonts, event),
                 Surface::Nav => false,
@@ -638,6 +751,28 @@ impl Screen {
 
             _ => false,
         }
+    }
+
+    /// What the pointer should look like over a point.
+    fn pointer_shape(&self, x: i32, y: i32) -> cursor::Shape {
+        let over_text = match self.surface_at(x, y) {
+            Some(Surface::App(fd)) => {
+                // The title bar is chrome, not content, whatever sits under it.
+                let in_title = self
+                    .window(self.current, fd)
+                    .is_some_and(|window| y < window.rect.y + window_title_h());
+                !in_title && self.client(fd).is_some_and(|client| client.text_at(x, y))
+            }
+            Some(Surface::Desk) => self
+                .workspaces
+                .get(self.current)
+                .and_then(|workspace| workspace.desk)
+                .and_then(|fd| self.client(fd))
+                .is_some_and(|client| client.text_at(x, y)),
+            _ => false,
+        };
+
+        if over_text { cursor::Shape::Beam } else { cursor::Shape::Arrow }
     }
 
     /// Which surface owns a point.
@@ -1108,7 +1243,9 @@ impl Screen {
     /// True while something is mid-animation, so the loop should wake for
     /// frames rather than sleeping until the next event.
     pub fn wants_frame(&self) -> bool {
-        self.flight.is_some() || self.clients.iter().any(Client::animating)
+        self.flight.is_some()
+            || self.panes_moving()
+            || self.clients.iter().any(Client::animating)
     }
 
     /// Advance whatever is moving.
@@ -1120,7 +1257,20 @@ impl Screen {
         let settling = self.animated && !busy;
         self.animated = busy;
 
-        let Some(flight) = &self.flight else { return busy || settling };
+        let panes = self.advance_panes(fonts);
+
+        // A blink transition is worth one frame, and only when a caret is
+        // actually on screen to blink.
+        let mut blinked = false;
+        if self.until_blink().is_some() {
+            let phase = self.caret_phase();
+            if phase != self.blink_shown {
+                self.blink_shown = phase;
+                blinked = true;
+            }
+        }
+
+        let Some(flight) = &self.flight else { return busy || settling || panes || blinked };
 
         match flight.stage {
             Stage::Travelling => {
@@ -1181,7 +1331,9 @@ impl Screen {
         };
 
         // Every keystroke is its own event, exactly as a human's would be, so an
-        // application sees a value growing rather than one appearing.
+        // application sees a value growing rather than one appearing, and the
+        // caret stays solid exactly as it does under a human's typing.
+        self.blink_epoch = Instant::now();
         let outcome = self.apply(fonts, app, &target, &action, &prefix);
         if outcome.is_some() || done + 1 >= total {
             let Some(flight) = self.flight.take() else { return false };
@@ -1347,6 +1499,16 @@ impl Screen {
             self.build_nav(fonts);
         }
 
+        // The caret belongs to wherever keystrokes go, and nowhere else. Other
+        // windows keep their remembered focus ring, but a bar that blinks in a
+        // window that cannot hear the keyboard would be a lie.
+        let keyboard = self.keyboard_client();
+        let phase = self.caret_phase();
+        self.blink_shown = phase;
+        for client in &mut self.clients {
+            client.caret_on = keyboard == Some(client.fd()) && phase;
+        }
+
         canvas.clear(ui::BACKGROUND);
 
         match self.workspaces.get(self.current) {
@@ -1366,11 +1528,11 @@ impl Screen {
         if let Some((desk, x, y)) = self.agent_cursor
             && self.workspaces.get(self.current).is_some_and(|w| w.id == desk)
         {
-            cursor::draw(canvas, x, y, cursor::Kind::Agent);
+            cursor::draw(canvas, x, y, cursor::Kind::Agent, cursor::Shape::Arrow);
         }
 
         let (x, y) = pointer;
-        cursor::draw(canvas, x, y, cursor::Kind::Human);
+        cursor::draw(canvas, x, y, cursor::Kind::Human, self.pointer_shape(x, y));
     }
 
     /// Wallpaper, then windows, then the pane and the taskbar over them.

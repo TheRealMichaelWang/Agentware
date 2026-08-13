@@ -163,7 +163,22 @@ fn run(
             }
         }
 
-        let waiting = if screen.wants_frame() { &frame } else { &rescan_every };
+        // Three tempos: animation frames while something moves, the next caret
+        // blink while a text field waits, and the slow device rescan otherwise.
+        // The blink deadline matters: without it the caret would only change
+        // when something else happened to wake the loop.
+        let blink;
+        let waiting = if screen.wants_frame() {
+            &frame
+        } else if let Some(until) = screen.until_blink() {
+            blink = rustix::event::Timespec {
+                tv_sec: until.as_secs().min(1) as _,
+                tv_nsec: until.subsec_nanos() as _,
+            };
+            &blink
+        } else {
+            &rescan_every
+        };
         let count = match epoll::wait(&epoll, &mut events, Some(waiting)) {
             Ok(count) => count,
             Err(rustix::io::Errno::INTR) => continue,

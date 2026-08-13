@@ -133,6 +133,10 @@ pub struct Client {
     focus: Option<String>,
     editing: HashMap<String, Editing>,
     scroll: HashMap<String, i32>,
+    /// Whether this client's caret is drawn lit right now. Written by the
+    /// compositor before painting: only the client keystrokes actually go to
+    /// gets a caret at all, and its phase comes from the screen's blink clock.
+    pub caret_on: bool,
     /// The control currently showing a press, and when it started.
     ///
     /// Ephemeral in the strictest sense: it lasts a sixth of a second and never
@@ -178,6 +182,7 @@ impl Client {
             focus: None,
             editing: HashMap::new(),
             scroll: HashMap::new(),
+            caret_on: false,
             press: None,
         })
     }
@@ -404,7 +409,16 @@ impl Client {
             .as_ref()
             .filter(|(_, since)| since.elapsed() < PRESS)
             .and_then(|(key, _)| doc.index_of(key));
-        Focus { node, caret, pressed }
+        Focus { node, caret, pressed, caret_visible: self.caret_on }
+    }
+
+    /// Whether keystrokes to this client would land in a text control, which is
+    /// what decides if there is a caret to blink at all.
+    pub fn focused_text(&self) -> bool {
+        let Some(doc) = &self.doc else { return false };
+        let Some(key) = &self.focus else { return false };
+        doc.index_of(key)
+            .is_some_and(|index| matches!(doc.tree.node(index).tag, Tag::Field | Tag::Editor))
     }
 
     /// True while something on this client is mid-animation, so the loop should
@@ -620,6 +634,22 @@ impl Client {
 
         self.note = format!("{action} on {id}");
         Ok(())
+    }
+
+    /// Whether a point is over an enabled text control, for the pointer shape.
+    ///
+    /// The compositor decides the shape from the same hit test that would route
+    /// a click, so the beam appears exactly where clicking would place a caret
+    /// and nowhere else.
+    pub fn text_at(&self, x: i32, y: i32) -> bool {
+        let Some(doc) = &self.doc else { return false };
+        match self.layout.hit(&doc.tree, x, y) {
+            Some(index) => {
+                matches!(doc.tree.node(index).tag, Tag::Field | Tag::Editor)
+                    && !doc.tree.node(index).disabled()
+            }
+            None => false,
+        }
     }
 
     /// Resolve an id the way an agent names one.

@@ -41,37 +41,54 @@ struct Mask {
     data: Vec<u8>,
 }
 
-/// Per-pixel coverage of the arrow at the interface scale, computed once.
+/// Rasterize a shape given in logical coordinates, at the interface scale.
 ///
-/// The polygon is multiplied by the scale before rasterizing, so a scaled
-/// cursor is the shape drawn larger, not the small mask blown up.
-fn mask() -> &'static Mask {
-    static MASK: OnceLock<Mask> = OnceLock::new();
-    MASK.get_or_init(|| {
-        let s = crate::ui::scale();
-        let w = (13.0 * s).ceil() as usize;
-        let h = (19.0 * s).ceil() as usize;
-        let mut data = vec![0u8; w * h];
-        for (index, coverage) in data.iter_mut().enumerate() {
-            let (px, py) = ((index % w) as f32, (index / w) as f32);
-            let mut hits = 0;
-            for sy in 0..SUB {
-                for sx in 0..SUB {
-                    let x = px + (sx as f32 + 0.5) / SUB as f32;
-                    let y = py + (sy as f32 + 0.5) / SUB as f32;
-                    if inside(x / s, y / s) {
-                        hits += 1;
-                    }
+/// The test function is asked in logical space and the sampling happens in
+/// pixels, so a scaled cursor is the shape drawn larger, not a small mask
+/// blown up.
+fn build(logical_w: f32, logical_h: f32, inside: impl Fn(f32, f32) -> bool) -> Mask {
+    let s = crate::ui::scale();
+    let w = (logical_w * s).ceil() as usize;
+    let h = (logical_h * s).ceil() as usize;
+    let mut data = vec![0u8; w * h];
+    for (index, coverage) in data.iter_mut().enumerate() {
+        let (px, py) = ((index % w) as f32, (index / w) as f32);
+        let mut hits = 0;
+        for sy in 0..SUB {
+            for sx in 0..SUB {
+                let x = px + (sx as f32 + 0.5) / SUB as f32;
+                let y = py + (sy as f32 + 0.5) / SUB as f32;
+                if inside(x / s, y / s) {
+                    hits += 1;
                 }
             }
-            *coverage = (hits * 255 / (SUB * SUB)) as u8;
         }
-        Mask { w, h, data }
+        *coverage = (hits * 255 / (SUB * SUB)) as u8;
+    }
+    Mask { w, h, data }
+}
+
+fn arrow_mask() -> &'static Mask {
+    static MASK: OnceLock<Mask> = OnceLock::new();
+    MASK.get_or_init(|| build(13.0, 19.0, arrow_inside))
+}
+
+/// The I-beam: a thin stem with serifs, the shape every text field has taught
+/// every hand to expect. Axis-aligned, so the inside test is arithmetic rather
+/// than a polygon walk.
+fn beam_mask() -> &'static Mask {
+    static MASK: OnceLock<Mask> = OnceLock::new();
+    MASK.get_or_init(|| {
+        build(7.0, 16.0, |x, y| {
+            let stem = (x - 3.5).abs() <= 0.8;
+            let serif = !(2.0..14.0).contains(&y) && (0.5..6.5).contains(&x);
+            stem || serif
+        })
     })
 }
 
 /// Even-odd point-in-polygon test against the arrow.
-fn inside(x: f32, y: f32) -> bool {
+fn arrow_inside(x: f32, y: f32) -> bool {
     let mut winding = false;
     let count = ARROW.len();
     for at in 0..count {
@@ -93,12 +110,32 @@ pub enum Kind {
     Agent,
 }
 
-pub fn draw(canvas: &mut Canvas, x: i32, y: i32, kind: Kind) {
+/// What the pointer is shaped like, decided by what it is over.
+///
+/// The shape is the compositor's promise about what a click will do here: an
+/// arrow acts, a beam places a caret. Applications do not choose it, for the
+/// same reason they do not choose their actions: the promise has to be true.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    Arrow,
+    /// Over editable text.
+    Beam,
+}
+
+pub fn draw(canvas: &mut Canvas, x: i32, y: i32, kind: Kind, shape: Shape) {
     let fill = match kind {
         Kind::Human => HUMAN,
         Kind::Agent => AGENT,
     };
-    let mask = mask();
+    // The arrow's hotspot is its tip at the top left; the beam's is its middle,
+    // because it marks where the caret would land rather than pointing at it.
+    let (mask, x, y) = match shape {
+        Shape::Arrow => (arrow_mask(), x, y),
+        Shape::Beam => {
+            let mask = beam_mask();
+            (mask, x - mask.w as i32 / 2, y - mask.h as i32 / 2)
+        }
+    };
 
     // The agent's pointer carries a halo, so a still screenshot of an agent
     // mid-action is unambiguous even in greyscale.

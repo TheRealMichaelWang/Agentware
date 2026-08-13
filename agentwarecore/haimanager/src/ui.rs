@@ -326,6 +326,12 @@ pub struct Focus {
     /// click has to produce the second one or its actions are invisible except
     /// for their consequences.
     pub pressed: Option<usize>,
+    /// Whether the caret is in the lit half of its blink.
+    ///
+    /// The clock lives in the compositor, not here: a caret blinks in exactly
+    /// one place on a screen, the place keystrokes go, so its phase is screen
+    /// state rather than a property of every window that remembers a focus.
+    pub caret_visible: bool,
 }
 
 pub struct Layout {
@@ -897,7 +903,7 @@ fn paint_node(
                     inner.draw_text(fonts, &content, x, top, &style, color);
                 }
 
-                if !focused {
+                if !focused || !focus.caret_visible {
                     return;
                 }
 
