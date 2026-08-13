@@ -274,6 +274,36 @@ pub fn dirty_fb(fd: BorrowedFd<'_>, fb_id: u32) -> std::io::Result<()> {
     unsafe { call(fd, 0xB1, &mut req) }
 }
 
+/// One damaged rectangle, `drm_clip_rect` in the uapi: half-open, exclusive at
+/// `x2`/`y2`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ClipRect {
+    pub x1: u16,
+    pub y1: u16,
+    pub x2: u16,
+    pub y2: u16,
+}
+
+/// Mark only parts of the framebuffer dirty, in one call.
+///
+/// This is most of what makes a small change cheap on virtual hardware: the
+/// host only transfers and re-encodes what the clips cover. One call for all
+/// of a frame's damage also matters in itself, because every dirty is a host
+/// flush and a flush is a chance for the host to present whatever half-state
+/// the framebuffer is in.
+pub fn dirty_fb_rects(fd: BorrowedFd<'_>, fb_id: u32, clips: &[ClipRect]) -> std::io::Result<()> {
+    let mut req = FbDirty {
+        fb_id,
+        flags: 0,
+        color: 0,
+        num_clips: clips.len() as u32,
+        clips_ptr: clips.as_ptr() as u64,
+    };
+    // SAFETY: 0xB1 is MODE_DIRTYFB; the clip array outlives the call.
+    unsafe { call(fd, 0xB1, &mut req) }
+}
+
 /// Swap the displayed framebuffer at the next vertical blank.
 #[repr(C)]
 pub struct PageFlip {

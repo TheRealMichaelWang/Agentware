@@ -144,10 +144,35 @@ fn run(
     // look for new ones rather than enumerating once and hoping.
     let rescan_every = rustix::event::Timespec { tv_sec: 1, tv_nsec: 0 };
 
+    // Where the cursors were last stamped, so a pointer move can put the scene
+    // back before stamping them anew.
+    let mut overlay_rects: Vec<Rect> = Vec::new();
+
+    // Presents of any kind are capped near 120Hz. Every flush is a host round
+    // trip, and both a tablet and a window drag can produce work far faster
+    // than a display shows it; flushing per event is how light work still
+    // manages to feel heavy. Deferred work wakes the loop through the timeout
+    // below instead of being dropped.
+    const PRESENT_MIN: std::time::Duration = std::time::Duration::from_millis(8);
+    let mut last_present = std::time::Instant::now();
+    let mut scene_pending = false;
+    let mut overlay_pending = false;
+
+    // Frame cost accounting, reported once a second while frames happen. The
+    // difference between "feels sluggish" and a fix is a number.
+    let mut stat_paint = std::time::Duration::ZERO;
+    let mut stat_blit = std::time::Duration::ZERO;
+    let mut stat_worst = std::time::Duration::ZERO;
+    let mut stat_frames: u32 = 0;
+    let mut stat_since = std::time::Instant::now();
+
     // While the agent's cursor is travelling there is an animation to run, and
     // an animation is the one thing an event-driven loop cannot wait for. This
     // is the only case in which the compositor wakes without being asked to.
     let frame = rustix::event::Timespec { tv_sec: 0, tv_nsec: 16_000_000 };
+
+    let stamped = compose_overlay(display, canvas, input, screen, &mut overlay_rects);
+    let _ = display.flush_rects(&stamped);
 
     loop {
         for index in input.rescan() {
@@ -168,8 +193,16 @@ fn run(
         // The blink deadline matters: without it the caret would only change
         // when something else happened to wake the loop.
         let blink;
+        let defer;
         let waiting = if screen.wants_frame() {
             &frame
+        } else if scene_pending || overlay_pending {
+            let remaining = PRESENT_MIN.saturating_sub(last_present.elapsed());
+            defer = rustix::event::Timespec {
+                tv_sec: 0,
+                tv_nsec: remaining.subsec_nanos().max(1_000_000) as _,
+            };
+            &defer
         } else if let Some(until) = screen.until_blink() {
             blink = rustix::event::Timespec {
                 tv_sec: until.as_secs().min(1) as _,
@@ -188,9 +221,15 @@ fn run(
             }
         };
 
-        let mut dirty = screen.tick(fonts);
+        let tick_dirty = screen.tick(fonts);
+        let mut dirty = tick_dirty;
+        let mut only_pointer = !tick_dirty;
         for event in &events[..count] {
             let token = event.data.u64();
+            if token < TOKEN_INPUT_BASE {
+                // The supervisor connection: handoffs change the scene.
+                only_pointer = false;
+            }
 
             match token {
                 TOKEN_SUPERVISOR => {
@@ -211,6 +250,7 @@ fn run(
                 }
 
                 token if token >= TOKEN_CLIENT_BASE => {
+                    only_pointer = false;
                     let fd = (token - TOKEN_CLIENT_BASE) as RawFd;
                     let Some(progress) = screen.readable(fd, fonts) else { continue };
 
@@ -253,6 +293,9 @@ fn run(
                 token if token >= TOKEN_INPUT_BASE => {
                     let index = (token - TOKEN_INPUT_BASE) as usize;
                     for event in input.read_device(index) {
+                        if !matches!(event, Event::PointerMoved { .. }) {
+                            only_pointer = false;
+                        }
                         dirty |= route(fonts, screen, event);
                     }
                 }
@@ -288,10 +331,161 @@ fn run(
             dirty = true;
         }
 
-        if dirty {
-            redraw(display, canvas, fonts, input, screen);
+        // Presenting, atomically: everything for the frame goes into the
+        // framebuffer first and the host is told once, so no in-between state
+        // can flicker onto the screen. Scene work capped like the overlay; a
+        // wake inside the window defers through the timeout above. A pure
+        // window drag repaints only the region the window swept, shadows and
+        // all, instead of the screen.
+        dirty |= std::mem::take(&mut scene_pending);
+        let overlay = screen.take_overlay_dirty() || std::mem::take(&mut overlay_pending);
+        let ready = last_present.elapsed() >= PRESENT_MIN;
+
+        if !ready {
+            scene_pending = dirty;
+            overlay_pending = overlay && !dirty;
+        } else if dirty {
+            let damage = screen.take_drag_damage();
+            match damage.filter(|_| only_pointer) {
+                Some(region) => {
+                    let region = region.intersect(&canvas.bounds());
+                    if let Some(region) = region {
+                        let t0 = std::time::Instant::now();
+                        canvas.clipped(region, |scene| screen.draw(scene, fonts, input.pointer()));
+                        let t1 = std::time::Instant::now();
+                        display.blit_region(canvas, region);
+                        stat_paint += t1 - t0;
+                        stat_blit += t1.elapsed();
+                        stat_worst = stat_worst.max(t1 - t0);
+                        stat_frames += 1;
+                        let mut flushes =
+                            compose_overlay(display, canvas, input, screen, &mut overlay_rects);
+                        flushes.push(region);
+                        if let Err(err) = display.flush_rects(&flushes) {
+                            log(&format!("could not flush a drag frame: {err}"));
+                        }
+                    }
+                }
+                None => {
+                    let t0 = std::time::Instant::now();
+                    screen.draw(canvas, fonts, input.pointer());
+                    let t1 = std::time::Instant::now();
+                    display.blit_full(canvas);
+                    stat_paint += t1 - t0;
+                    stat_blit += t1.elapsed();
+                    stat_worst = stat_worst.max(t1 - t0);
+                    stat_frames += 1;
+                    overlay_rects.clear();
+                    compose_overlay(display, canvas, input, screen, &mut overlay_rects);
+                    if let Err(err) = display.flush() {
+                        log(&format!("could not present: {err}"));
+                    }
+                }
+            }
+            last_present = std::time::Instant::now();
+
+            if stat_since.elapsed().as_secs() >= 1 && stat_frames > 0 {
+                log(&format!(
+                    "frames: {} in {}ms, paint avg {:.1}ms worst {:.1}ms, blit avg {:.1}ms",
+                    stat_frames,
+                    stat_since.elapsed().as_millis(),
+                    stat_paint.as_secs_f32() * 1000.0 / stat_frames as f32,
+                    stat_worst.as_secs_f32() * 1000.0,
+                    stat_blit.as_secs_f32() * 1000.0 / stat_frames as f32,
+                ));
+                stat_paint = std::time::Duration::ZERO;
+                stat_blit = std::time::Duration::ZERO;
+                stat_worst = std::time::Duration::ZERO;
+                stat_frames = 0;
+                stat_since = std::time::Instant::now();
+            }
+        } else if overlay {
+            let flushes = compose_overlay(display, canvas, input, screen, &mut overlay_rects);
+            if let Err(err) = display.flush_rects(&flushes) {
+                log(&format!("could not flush the overlay: {err}"));
+            }
+            last_present = std::time::Instant::now();
         }
     }
+}
+
+/// Whether two rectangles touch or overlap, for merging damage.
+fn touching(a: Rect, b: Rect) -> bool {
+    a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
+}
+
+fn union(a: Rect, b: Rect) -> Rect {
+    let x0 = a.x.min(b.x);
+    let y0 = a.y.min(b.y);
+    let x1 = (a.x + a.w).max(b.x + b.w);
+    let y1 = (a.y + a.h).max(b.y + b.h);
+    Rect::new(x0, y0, x1 - x0, y1 - y0)
+}
+
+/// Move the cursors from wherever they were to wherever they are, atomically.
+///
+/// The old and new cursor rectangles are merged into damage regions, each
+/// region is composed *complete* off screen (scene, then every cursor that
+/// intersects it), blitted, and only then is the host told anything changed,
+/// in one call carrying every clip. The first version erased and stamped as
+/// separate flushes, and the host was free to present the instant in between:
+/// a cursor that existed in every composed frame and still flickered.
+fn compose_overlay(
+    display: &mut drm::Display,
+    scene: &Canvas,
+    input: &Input,
+    screen: &Screen,
+    prev: &mut Vec<Rect>,
+) -> Vec<Rect> {
+    let mut cursors: Vec<(i32, i32, cursor::Kind, cursor::Shape)> = Vec::new();
+    if let Some((x, y)) = screen.agent_pointer() {
+        cursors.push((x, y, cursor::Kind::Agent, cursor::Shape::Arrow));
+    }
+    let (x, y) = input.pointer();
+    cursors.push((x, y, cursor::Kind::Human, screen.pointer_shape(x, y)));
+
+    let mut fresh: Vec<Rect> = Vec::new();
+    for &(x, y, kind, shape) in &cursors {
+        if let Some(rect) = cursor::bounds(x, y, kind, shape).intersect(&scene.bounds()) {
+            fresh.push(rect);
+        }
+    }
+
+    // Damage is everything a cursor is leaving plus everything one is entering,
+    // merged where they touch so a small move is one region.
+    let mut regions: Vec<Rect> = prev.drain(..).chain(fresh.iter().copied()).collect();
+    loop {
+        let mut merged = false;
+        'outer: for a in 0..regions.len() {
+            for b in a + 1..regions.len() {
+                if touching(regions[a], regions[b]) {
+                    let joined = union(regions[a], regions[b]);
+                    regions.swap_remove(b);
+                    regions[a] = joined;
+                    merged = true;
+                    break 'outer;
+                }
+            }
+        }
+        if !merged {
+            break;
+        }
+    }
+
+    for region in &regions {
+        let Some(region) = region.intersect(&scene.bounds()) else { continue };
+        let mut patch = Canvas::new(region.w as usize, region.h as usize);
+        patch.copy_from(scene, region.x, region.y);
+        for &(x, y, kind, shape) in &cursors {
+            if touching(cursor::bounds(x, y, kind, shape), region) {
+                cursor::draw(&mut patch, x - region.x, y - region.y, kind, shape);
+            }
+        }
+        display.blit_patch(&patch, region.x, region.y);
+    }
+
+    *prev = fresh;
+    regions
 }
 
 /// Take a descriptor the supervisor pushed and start watching it.

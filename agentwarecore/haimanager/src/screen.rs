@@ -277,6 +277,15 @@ pub struct Screen {
     /// Where the agent's pointer is, and whose workspace it is in. Kept after a
     /// flight lands, so the human can see what was just touched.
     agent_cursor: Option<(u32, i32, i32)>,
+    /// The overlay wants restamping: a pointer moved without the scene changing.
+    overlay_dirty: bool,
+    /// The region a window drag disturbed this pass: where the window was and
+    /// where it now is, shadows included. `None` means no drag damage.
+    drag_damage: Option<Rect>,
+    /// What the pointer was last over, at the granularity that changes pixels:
+    /// its shape, and any hover-lit window control. Motion that does not change
+    /// this signature repaints nothing but the cursor patch.
+    hover: (u8, Option<(RawFd, u8)>),
     /// When the last animation frame was advanced, for time-based motion.
     last_frame: Instant,
     /// When the caret last had a reason to be visible: a keystroke, a click
@@ -313,6 +322,9 @@ impl Screen {
             flight: None,
             queued: VecDeque::new(),
             agent_cursor: None,
+            overlay_dirty: false,
+            drag_damage: None,
+            hover: (0, None),
             last_frame: Instant::now(),
             blink_epoch: Instant::now(),
             blink_shown: true,
@@ -766,14 +778,34 @@ impl Screen {
             // The cursor is the compositor's, so a move is a repaint and nothing
             // else, unless a window or a scrollbar is being carried.
             Event::PointerMoved { x, y } => {
-                self.drag_to(fonts, x, y);
-                self.nav_drag_motion(fonts, x);
+                self.overlay_dirty = true;
+
+                let mut scene = false;
+                if self.drag.is_some() {
+                    self.drag_to(fonts, x, y);
+                    scene = true;
+                }
+                if self.tab_drag.is_some() {
+                    self.nav_drag_motion(fonts, x);
+                    scene = true;
+                }
                 if let Some(fd) = self.scroll_drag
                     && let Some(client) = self.client_mut(fd)
                 {
                     client.drag_scroll(fonts, y);
+                    scene = true;
                 }
-                true
+
+                // Hover feedback lives in the scene, so crossing on or off a
+                // lit control is a scene change; sweeping across inert pixels
+                // is not, and that is the difference between a pointer that
+                // costs patches and one that costs frames.
+                let hover = self.hover_signature(x, y);
+                if hover != self.hover {
+                    self.hover = hover;
+                    scene = true;
+                }
+                scene
             }
 
             Event::ButtonReleased { button: Button::Left, .. } => {
@@ -820,7 +852,7 @@ impl Screen {
     }
 
     /// What the pointer should look like over a point.
-    fn pointer_shape(&self, x: i32, y: i32) -> cursor::Shape {
+    pub fn pointer_shape(&self, x: i32, y: i32) -> cursor::Shape {
         // A resize in progress keeps its cursor wherever the pointer strays:
         // the hand is still holding the edge, so the shape still tells the
         // truth about what motion does.
@@ -873,6 +905,51 @@ impl Screen {
         };
 
         if over_text { cursor::Shape::Beam } else { cursor::Shape::Arrow }
+    }
+
+    /// The pointer-dependent pixels under a point, compressed to a comparison.
+    fn hover_signature(&self, x: i32, y: i32) -> (u8, Option<(RawFd, u8)>) {
+        let shape = match self.pointer_shape(x, y) {
+            cursor::Shape::Arrow => 0,
+            cursor::Shape::Beam => 1,
+            cursor::Shape::ResizeH => 2,
+            cursor::Shape::ResizeV => 3,
+            cursor::Shape::ResizeDiag => 4,
+        };
+
+        let button = match self.surface_at(x, y) {
+            Some(Surface::App(fd)) => self
+                .window(self.current, fd)
+                .and_then(|window| {
+                    Self::title_buttons(window.rect)
+                        .into_iter()
+                        .enumerate()
+                        .find(|(_, (_, rect))| rect.contains(x, y))
+                })
+                .map(|(index, _)| (fd, index as u8)),
+            _ => None,
+        };
+
+        (shape, button)
+    }
+
+    /// The overlay pass asking whether the pointer outran the scene.
+    pub fn take_overlay_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.overlay_dirty)
+    }
+
+    /// The window-drag damage accumulated since the last present, if any.
+    pub fn take_drag_damage(&mut self) -> Option<Rect> {
+        self.drag_damage.take()
+    }
+
+    /// The agent's pointer, when it is in the workspace on screen.
+    pub fn agent_pointer(&self) -> Option<(i32, i32)> {
+        let (desk, x, y) = self.agent_cursor?;
+        self.workspaces
+            .get(self.current)
+            .filter(|workspace| workspace.id == desk)
+            .map(|_| (x, y))
     }
 
     /// Which surface owns a point.
@@ -1088,6 +1165,7 @@ impl Screen {
             self.drag = None;
             return;
         };
+        let before = window.rect;
 
         match self.drag.as_ref().map(|drag| &drag.mode) {
             Some(DragMode::Move { grab }) => {
@@ -1109,6 +1187,26 @@ impl Screen {
         // Dragging a maximized window, by the bar or by an edge, makes it a
         // normal one again, which is what grabbing hold of it ought to mean.
         window.maximized = false;
+
+        // Where it was plus where it is, grown by the shadow's reach, so a
+        // pointer-driven repaint can touch only this instead of the screen.
+        let after = window.rect;
+        let margin = ui::sc(28);
+        let x0 = before.x.min(after.x) - margin;
+        let y0 = before.y.min(after.y) - margin;
+        let x1 = (before.x + before.w).max(after.x + after.w) + margin;
+        let y1 = (before.y + before.h).max(after.y + after.h) + margin;
+        let hit = Rect::new(x0, y0, x1 - x0, y1 - y0);
+        self.drag_damage = Some(match self.drag_damage {
+            Some(held) => {
+                let x0 = held.x.min(hit.x);
+                let y0 = held.y.min(hit.y);
+                let x1 = (held.x + held.w).max(hit.x + hit.w);
+                let y1 = (held.y + held.h).max(hit.y + hit.h);
+                Rect::new(x0, y0, x1 - x0, y1 - y0)
+            }
+            None => hit,
+        });
         self.reframe(fonts);
     }
 
@@ -1475,13 +1573,15 @@ impl Screen {
                 }
 
                 // Eased, because a pointer that moves at a constant speed and
-                // stops dead does not read as a pointer.
+                // stops dead does not read as a pointer. Travel only moves the
+                // overlay: the scene under the flying cursor is not changing.
                 let t = elapsed.as_secs_f32() / FLIGHT.as_secs_f32();
                 let eased = 1.0 - (1.0 - t).powi(3);
                 let x = flight.from.0 + ((flight.to.0 - flight.from.0) as f32 * eased) as i32;
                 let y = flight.from.1 + ((flight.to.1 - flight.from.1) as f32 * eased) as i32;
                 self.agent_cursor = Some((flight.desk, x, y));
-                true
+                self.overlay_dirty = true;
+                false
             }
 
             Stage::Typing { done, next } => {
@@ -1878,7 +1978,7 @@ impl Screen {
             client.caret_on = keyboard == Some(client.fd()) && phase;
         }
 
-        canvas.clear(ui::BACKGROUND);
+        canvas.fill_rect(canvas.bounds(), ui::BACKGROUND);
 
         match self.workspaces.get(self.current) {
             Some(_) => self.draw_workspace(canvas, fonts, pointer),
@@ -1891,17 +1991,10 @@ impl Screen {
             self.draw_debug(canvas, fonts);
         }
 
-        // The agent's pointer is drawn only in the workspace it is working in.
-        // Showing it elsewhere would say an agent was acting on a screen it is
-        // not touching.
-        if let Some((desk, x, y)) = self.agent_cursor
-            && self.workspaces.get(self.current).is_some_and(|w| w.id == desk)
-        {
-            cursor::draw(canvas, x, y, cursor::Kind::Agent, cursor::Shape::Arrow);
-        }
-
-        let (x, y) = pointer;
-        cursor::draw(canvas, x, y, cursor::Kind::Human, self.pointer_shape(x, y));
+        // Cursors are deliberately absent. They live in an overlay the event
+        // loop stamps as small patches over this scene, because a pointer that
+        // forces the whole screen through the rasterizer and the host encoder
+        // on every twitch is most of what "sluggish" is made of.
     }
 
     /// Wallpaper, then windows, then the pane and the taskbar over them.

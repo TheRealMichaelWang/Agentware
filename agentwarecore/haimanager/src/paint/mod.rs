@@ -44,6 +44,41 @@ fn disc_coverage(px: i32, py: i32, cx: f32, cy: f32, radius: f32) -> u8 {
     (coverage * 255.0) as u8
 }
 
+/// One shadow corner quadrant at full quality, cached per configuration.
+///
+/// The tile is the top-left corner of a canonical rounded rectangle, computed
+/// with the same signed-distance falloff the per-pixel version used, so the
+/// cached shadow is pixel-identical to the one it replaced.
+fn corner_tile(radius: i32, blur: i32, strength: u8) -> std::sync::Arc<Vec<u8>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    type TileCache = Mutex<HashMap<(i32, i32, u8), Arc<Vec<u8>>>>;
+    static TILES: OnceLock<TileCache> = OnceLock::new();
+
+    let tiles = TILES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut tiles = tiles.lock().unwrap();
+    if let Some(tile) = tiles.get(&(radius, blur, strength)) {
+        return tile.clone();
+    }
+
+    let side = (radius + blur * 2) as usize;
+    // A canonical rectangle whose top-left corner the tile covers: its corner
+    // sits at (blur, blur) and it is large enough that no other edge is felt.
+    let canon = Rect::new(blur, blur, (radius + blur) * 8, (radius + blur) * 8);
+    let mut tile = vec![0u8; side * side];
+    for (index, alpha) in tile.iter_mut().enumerate() {
+        let (x, y) = ((index % side) as f32, (index / side) as f32);
+        let distance = round_rect_distance(x, y, canon, radius as f32);
+        if distance > 0.0 && distance < blur as f32 {
+            let fade = 1.0 - distance / blur as f32;
+            *alpha = (strength as f32 * fade * fade) as u8;
+        }
+    }
+    let tile = Arc::new(tile);
+    tiles.insert((radius, blur, strength), tile.clone());
+    tile
+}
+
 /// Signed distance from a point to a rounded rectangle. Negative inside.
 fn round_rect_distance(px: f32, py: f32, rect: Rect, radius: f32) -> f32 {
     let cx = rect.x as f32 + rect.w as f32 / 2.0;
@@ -337,39 +372,77 @@ impl Canvas {
     /// A soft shadow cast by a rounded rectangle.
     ///
     /// Depth is what separates a window from the desktop behind it without a
-    /// heavy border doing the work, and a heavy border is most of what makes an
-    /// interface look blocky.
-    ///
-    /// Only the band outside the shape is touched. The interior is skipped
-    /// entirely because whatever cast the shadow is about to be drawn over it,
-    /// so the cost is a perimeter rather than an area.
+    /// heavy border doing the work. It is also drawn on every scene repaint of
+    /// every window, which is why none of it computes geometry per pixel any
+    /// more: the straight edges use one alpha per row or column, and the
+    /// corners come from a tile rasterized once per (radius, blur, strength)
+    /// and cached. The measured cost of the original, a square root per pixel
+    /// over the whole band, was a visible share of every drag frame.
     pub fn shadow(&mut self, rect: Rect, radius: i32, blur: i32, strength: u8) {
-        // Offset downward: a light source above is what every interface assumes,
-        // and a shadow centred on its shape reads as a glow instead.
+        if blur <= 0 {
+            return;
+        }
+        // Offset downward: a light source above is what every interface
+        // assumes, and a shadow centred on its shape reads as a glow instead.
         let cast = Rect::new(rect.x, rect.y + blur / 3, rect.w, rect.h);
-        let inside = cast.inset(radius + 1);
-        let area = Rect::new(
-            cast.x - blur,
-            cast.y - blur,
-            cast.w + blur * 2,
-            cast.h + blur * 2,
-        );
-        let Some(area) = self.clip.intersect(&area) else { return };
 
-        for y in area.y..area.y + area.h {
-            for x in area.x..area.x + area.w {
-                if inside.contains(x, y) {
-                    continue;
-                }
-                let distance = round_rect_distance(x as f32, y as f32, cast, radius as f32);
-                if distance <= 0.0 || distance >= blur as f32 {
-                    continue;
-                }
-                // Squared falloff, which is closer to how a real penumbra fades
-                // than a straight ramp and costs one multiply.
-                let fade = 1.0 - distance / blur as f32;
-                self.blend(x, y, 0x000000, (strength as f32 * fade * fade) as u8);
+        // One alpha per distance from the edge, shared by all four strips.
+        let falloff: Vec<u8> = (0..blur)
+            .map(|d| {
+                let fade = 1.0 - (d as f32 + 0.5) / blur as f32;
+                (strength as f32 * fade * fade) as u8
+            })
+            .collect();
+
+        let cs = radius + blur;
+        let (left, right) = (cast.x + cs, cast.x + cast.w - cs);
+        let (top, bottom) = (cast.y + cs, cast.y + cast.h - cs);
+
+        // Edge strips: constant alpha along the edge, falloff across it.
+        for (d, &alpha) in falloff.iter().enumerate() {
+            if alpha == 0 {
+                continue;
             }
+            let d = d as i32;
+            self.blend_run_h(left, right, cast.y - 1 - d, alpha);
+            self.blend_run_h(left, right, cast.y + cast.h + d, alpha);
+            self.blend_run_v(cast.x - 1 - d, top, bottom, alpha);
+            self.blend_run_v(cast.x + cast.w + d, top, bottom, alpha);
+        }
+
+        // Corner tiles, mirrored from one cached quadrant.
+        let tile = corner_tile(radius, blur, strength);
+        let side = (cs + blur) as usize;
+        for (corner_x, corner_y, flip_x, flip_y) in [
+            (cast.x - blur, cast.y - blur, false, false),
+            (cast.x + cast.w - cs, cast.y - blur, true, false),
+            (cast.x - blur, cast.y + cast.h - cs, false, true),
+            (cast.x + cast.w - cs, cast.y + cast.h - cs, true, true),
+        ] {
+            for ty in 0..side {
+                for tx in 0..side {
+                    let sx = if flip_x { side - 1 - tx } else { tx };
+                    let sy = if flip_y { side - 1 - ty } else { ty };
+                    let alpha = tile[sy * side + sx];
+                    if alpha > 0 {
+                        self.blend(corner_x + tx as i32, corner_y + ty as i32, 0x000000, alpha);
+                    }
+                }
+            }
+        }
+    }
+
+    /// A horizontal run of one shadow alpha.
+    fn blend_run_h(&mut self, x0: i32, x1: i32, y: i32, alpha: u8) {
+        for x in x0.max(self.clip.x)..x1.min(self.clip.x + self.clip.w) {
+            self.blend(x, y, 0x000000, alpha);
+        }
+    }
+
+    /// A vertical run of one shadow alpha.
+    fn blend_run_v(&mut self, x: i32, y0: i32, y1: i32, alpha: u8) {
+        for y in y0.max(self.clip.y)..y1.min(self.clip.y + self.clip.h) {
+            self.blend(x, y, 0x000000, alpha);
         }
     }
 
@@ -388,6 +461,27 @@ impl Canvas {
             let x = (ax + (bx - ax) * f).round() as i32;
             let y = (ay + (by - ay) * f).round() as i32;
             self.fill_rect(Rect::new(x - t / 2, y - t / 2, t, t), color);
+        }
+    }
+
+    /// Fill this canvas from a region of another, for cutting overlay patches
+    /// out of the painted scene.
+    pub fn copy_from(&mut self, source: &Canvas, src_x: i32, src_y: i32) {
+        for y in 0..self.height {
+            let sy = src_y + y;
+            if sy < 0 || sy >= source.height {
+                continue;
+            }
+            let from = (src_x.max(0)).min(source.width);
+            let to = (src_x + self.width).clamp(0, source.width);
+            if from >= to {
+                continue;
+            }
+            let dst_off = (y * self.width + (from - src_x)) as usize;
+            let src_off = (sy * source.width + from) as usize;
+            let count = (to - from) as usize;
+            self.pixels[dst_off..dst_off + count]
+                .copy_from_slice(&source.pixels[src_off..src_off + count]);
         }
     }
 

@@ -115,6 +115,14 @@ impl Display {
     /// framebuffer is marked dirty, without which virtual hardware never
     /// transfers it; see [`uapi::FbDirty`].
     pub fn present_canvas(&mut self, canvas: &crate::paint::Canvas) -> io::Result<()> {
+        self.blit_full(canvas);
+        self.flush()
+    }
+
+    /// Copy the whole canvas into the framebuffer without telling the host.
+    /// The caller flushes once everything for the frame, cursors included, is
+    /// in place; a flush in the middle is a frame the host may show.
+    pub fn blit_full(&mut self, canvas: &crate::paint::Canvas) {
         let stride = self.front.stride;
         let width = self.front.width.min(canvas.width() as usize);
         let height = self.front.height.min(canvas.height() as usize);
@@ -124,8 +132,28 @@ impl Display {
             let start = y * stride;
             pixels[start..start + width].copy_from_slice(&row[..width]);
         }
+    }
 
-        self.flush()
+    /// Copy one region of a full-screen canvas into the framebuffer, again
+    /// without flushing: the partial-repaint path for window drags.
+    pub fn blit_region(&mut self, canvas: &crate::paint::Canvas, rect: crate::paint::Rect) {
+        let stride = self.front.stride;
+        let fb_w = self.front.width as i32;
+        let fb_h = self.front.height as i32;
+        let x0 = rect.x.clamp(0, fb_w);
+        let y0 = rect.y.clamp(0, fb_h);
+        let x1 = (rect.x + rect.w).clamp(0, fb_w);
+        let y1 = (rect.y + rect.h).clamp(0, fb_h);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+
+        let pixels = self.front.pixels();
+        for (y, row) in canvas.rows().enumerate().take(y1 as usize).skip(y0 as usize) {
+            let start = y * stride + x0 as usize;
+            pixels[start..start + (x1 - x0) as usize]
+                .copy_from_slice(&row[x0 as usize..x1 as usize]);
+        }
     }
 
     /// Push what has been drawn to the screen.
@@ -134,6 +162,68 @@ impl Display {
     /// [`uapi::FbDirty`] for why writing the mapping is not by itself enough.
     pub fn flush(&mut self) -> io::Result<()> {
         uapi::dirty_fb(self.card.as_fd(), self.front.fb_id)
+    }
+
+    /// Copy a small canvas into the framebuffer at a position, without marking
+    /// anything dirty.
+    ///
+    /// The dirty call is separate on purpose. A frame's overlay may be several
+    /// patches, and every one of them has to be in the framebuffer before the
+    /// host is told anything changed, or the host can present the moment
+    /// between an erase and a stamp: a cursor that exists on every frame we
+    /// composed but flickers on screen anyway.
+    pub fn blit_patch(&mut self, patch: &crate::paint::Canvas, dst_x: i32, dst_y: i32) {
+        let stride = self.front.stride;
+        let fb_w = self.front.width as i32;
+        let fb_h = self.front.height as i32;
+
+        let x0 = dst_x.max(0);
+        let y0 = dst_y.max(0);
+        let x1 = (dst_x + patch.width()).min(fb_w);
+        let y1 = (dst_y + patch.height()).min(fb_h);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+
+        let pixels = self.front.pixels();
+        for (row_index, row) in patch.rows().enumerate() {
+            let y = dst_y + row_index as i32;
+            if y < y0 || y >= y1 {
+                continue;
+            }
+            let src_from = (x0 - dst_x) as usize;
+            let src_to = (x1 - dst_x) as usize;
+            let start = y as usize * stride + x0 as usize;
+            pixels[start..start + (src_to - src_from)].copy_from_slice(&row[src_from..src_to]);
+        }
+    }
+
+    /// Tell the host which rectangles changed, once, after all of them have.
+    pub fn flush_rects(&mut self, rects: &[crate::paint::Rect]) -> io::Result<()> {
+        if rects.is_empty() {
+            return Ok(());
+        }
+        let fb_w = self.front.width as i32;
+        let fb_h = self.front.height as i32;
+        let clips: Vec<uapi::ClipRect> = rects
+            .iter()
+            .filter_map(|rect| {
+                let x0 = rect.x.clamp(0, fb_w);
+                let y0 = rect.y.clamp(0, fb_h);
+                let x1 = (rect.x + rect.w).clamp(0, fb_w);
+                let y1 = (rect.y + rect.h).clamp(0, fb_h);
+                (x0 < x1 && y0 < y1).then_some(uapi::ClipRect {
+                    x1: x0 as u16,
+                    y1: y0 as u16,
+                    x2: x1 as u16,
+                    y2: y1 as u16,
+                })
+            })
+            .collect();
+        if clips.is_empty() {
+            return Ok(());
+        }
+        uapi::dirty_fb_rects(self.card.as_fd(), self.front.fb_id, &clips)
     }
 
     /// Point the CRTC at our framebuffer.

@@ -166,6 +166,35 @@ pub enum Shape {
     ResizeDiag,
 }
 
+/// The rectangle a cursor occupies on screen, outline and halo included, so an
+/// overlay pass knows exactly what to restore and repaint.
+pub fn bounds(x: i32, y: i32, kind: Kind, shape: Shape) -> Rect {
+    let mask = match shape {
+        Shape::Arrow => arrow_mask(),
+        Shape::Beam => beam_mask(),
+        Shape::ResizeH => hresize_mask(),
+        Shape::ResizeV => vresize_mask(),
+        Shape::ResizeDiag => dresize_mask(),
+    };
+    let (w, h) = (mask.w as i32, mask.h as i32);
+    let (left, top) = match shape {
+        Shape::Arrow => (x, y),
+        _ => (x - w / 2, y - h / 2),
+    };
+    // One pixel of outline all round, and the agent's halo beyond that.
+    let mut rect = Rect::new(left - 1, top - 1, w + 2, h + 2);
+    if kind == Kind::Agent {
+        let r = crate::ui::sc(13);
+        let halo = Rect::new(x - r / 2 - 1, y - r / 2 - 1, 2 * r + 3, 2 * r + 5);
+        let x0 = rect.x.min(halo.x);
+        let y0 = rect.y.min(halo.y);
+        let x1 = (rect.x + rect.w).max(halo.x + halo.w);
+        let y1 = (rect.y + rect.h).max(halo.y + halo.h);
+        rect = Rect::new(x0, y0, x1 - x0, y1 - y0);
+    }
+    rect
+}
+
 pub fn draw(canvas: &mut Canvas, x: i32, y: i32, kind: Kind, shape: Shape) {
     let fill = match kind {
         Kind::Human => HUMAN,
