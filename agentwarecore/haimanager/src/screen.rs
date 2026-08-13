@@ -90,12 +90,29 @@ enum Title {
     Drag,
 }
 
-/// A window being moved by the human.
+/// A window being moved or resized by the human.
+///
+/// Only the human: there is no resize in the agent's action vocabulary, and
+/// arrangement is something the compositor does *for* an agent, never something
+/// an agent asks for.
 struct Drag {
     fd: RawFd,
-    /// Where in the window the pointer took hold, so it does not jump.
-    grab: (i32, i32),
+    mode: DragMode,
 }
+
+#[derive(Clone, Copy)]
+enum DragMode {
+    /// Carried by the title bar. Remembers where in the window the pointer took
+    /// hold, so the window does not jump to centre itself under it.
+    Move { grab: (i32, i32) },
+    /// Pulled by an edge. Either axis, or both from the corner.
+    Resize { right: bool, bottom: bool },
+}
+
+/// How close to an edge a press counts as taking hold of it.
+fn resize_band() -> i32 { ui::sc(7) }
+/// Smaller than this and a window is all chrome.
+fn min_window() -> (i32, i32) { (ui::sc(320), ui::sc(200)) }
 
 /// How long the fake cursor takes to travel to what an agent named.
 ///
@@ -769,6 +786,32 @@ impl Screen {
 
     /// What the pointer should look like over a point.
     fn pointer_shape(&self, x: i32, y: i32) -> cursor::Shape {
+        // A resize in progress keeps its cursor wherever the pointer strays:
+        // the hand is still holding the edge, so the shape still tells the
+        // truth about what motion does.
+        let resizing = self.drag.as_ref().and_then(|drag| match drag.mode {
+            DragMode::Resize { right, bottom } => Some((right, bottom)),
+            DragMode::Move { .. } => None,
+        });
+        let hovered = resizing.or_else(|| {
+            if let Some(Surface::App(fd)) = self.surface_at(x, y) {
+                self.window(self.current, fd)
+                    .and_then(|window| Self::resize_hit(window.rect, x, y))
+                    .and_then(|mode| match mode {
+                        DragMode::Resize { right, bottom } => Some((right, bottom)),
+                        DragMode::Move { .. } => None,
+                    })
+            } else {
+                None
+            }
+        });
+        match hovered {
+            Some((true, true)) => return cursor::Shape::ResizeDiag,
+            Some((true, false)) => return cursor::Shape::ResizeH,
+            Some((false, true)) => return cursor::Shape::ResizeV,
+            _ => {}
+        }
+
         let over_text = match self.surface_at(x, y) {
             Some(Surface::App(fd)) => {
                 // The title bar is chrome, not content, whatever sits under it.
@@ -831,6 +874,16 @@ impl Screen {
                 // Window management stays live during a turn. The freeze is
                 // about not fighting an agent for the same tree, and moving a
                 // window out of the way to watch what it is doing is not that.
+                if let Some(mode) = self
+                    .window(self.current, fd)
+                    .and_then(|window| Self::resize_hit(window.rect, x, y))
+                {
+                    self.raise(self.current, fd);
+                    self.focus = Surface::App(fd);
+                    self.drag = Some(Drag { fd, mode });
+                    return true;
+                }
+
                 let title = self
                     .window(self.current, fd)
                     .and_then(|window| Self::title_hit(window.rect, x, y));
@@ -908,7 +961,7 @@ impl Screen {
         match action {
             Title::Drag => {
                 let rect = self.workspaces[at].windows[index].rect;
-                self.drag = Some(Drag { fd, grab: (x - rect.x, y - rect.y) });
+                self.drag = Some(Drag { fd, mode: DragMode::Move { grab: (x - rect.x, y - rect.y) } });
                 true
             }
 
@@ -957,15 +1010,32 @@ impl Screen {
         }
     }
 
-    /// Carry a window with the pointer.
+    /// A press on a window's resize edges, if it is one.
+    fn resize_hit(rect: Rect, x: i32, y: i32) -> Option<DragMode> {
+        let band = resize_band();
+        let right = x >= rect.x + rect.w - band;
+        let bottom = y >= rect.y + rect.h - band;
+        // The right band starts below the title bar, or it would fight the
+        // close button for the corner nobody wants to lose.
+        let right = right && y > rect.y + window_title_h();
+        if right || bottom {
+            Some(DragMode::Resize { right, bottom })
+        } else {
+            None
+        }
+    }
+
+    /// Carry a window with the pointer: move it, or pull an edge.
     ///
-    /// Clamped so the title bar can always be reached again. A window dragged
-    /// entirely off the bottom of its region is a window the human has lost.
+    /// Movement is clamped so the title bar can always be reached again. A
+    /// window dragged entirely off the bottom of its region is a window the
+    /// human has lost.
     fn drag_to(&mut self, fonts: &Fonts, x: i32, y: i32) {
         let Some(drag) = &self.drag else { return };
-        let (fd, grab) = (drag.fd, drag.grab);
+        let fd = drag.fd;
         let at = self.current;
         let area = self.window_area(at);
+        let (min_w, min_h) = min_window();
 
         let Some(window) = self
             .workspaces
@@ -976,10 +1046,25 @@ impl Screen {
             return;
         };
 
-        window.rect.x = (x - grab.0).clamp(area.x - window.rect.w + ui::sc(120), area.x + area.w - ui::sc(120));
-        window.rect.y = (y - grab.1).clamp(area.y, area.y + area.h - window_title_h());
-        // Dragging a maximized window makes it a normal one again, which is what
-        // grabbing hold of something ought to mean.
+        match self.drag.as_ref().map(|drag| &drag.mode) {
+            Some(DragMode::Move { grab }) => {
+                window.rect.x = (x - grab.0)
+                    .clamp(area.x - window.rect.w + ui::sc(120), area.x + area.w - ui::sc(120));
+                window.rect.y = (y - grab.1).clamp(area.y, area.y + area.h - window_title_h());
+            }
+            Some(DragMode::Resize { right, bottom }) => {
+                if *right {
+                    window.rect.w = (x - window.rect.x).clamp(min_w, area.x + area.w - window.rect.x);
+                }
+                if *bottom {
+                    window.rect.h = (y - window.rect.y).clamp(min_h, area.y + area.h - window.rect.y);
+                }
+            }
+            None => return,
+        }
+
+        // Dragging a maximized window, by the bar or by an edge, makes it a
+        // normal one again, which is what grabbing hold of it ought to mean.
         window.maximized = false;
         self.reframe(fonts);
     }
@@ -1179,6 +1264,49 @@ impl Screen {
         self.workspaces.get(at)?.windows.iter().find(|w| w.fd == fd)
     }
 
+    /// Set the stage for an agent's intent: its target fills the apps region
+    /// and every other window in the workspace is put away.
+    ///
+    /// This is the translation the design promises. An agent names a control,
+    /// never a window: whether its target was covered, minimized, or shuffled
+    /// behind something is not the agent's problem and not something it can ask
+    /// about, so the compositor makes the question impossible instead of
+    /// answering it with rejections. The human watching gets the clearest view
+    /// of the one app being driven, and the dock shows where the rest went.
+    /// The reverse can never happen: there is no resize or arrange in the
+    /// intent vocabulary for an agent to ask with.
+    fn arrange_for_agent(&mut self, fonts: &Fonts, at: usize, fd: RawFd) {
+        let area = self.window_area(at).inset(ui::sc(6));
+        let Some(workspace) = self.workspaces.get_mut(at) else { return };
+
+        let mut changed = false;
+        for window in &mut workspace.windows {
+            if window.fd == fd {
+                if window.minimized {
+                    window.minimized = false;
+                    changed = true;
+                }
+                if !window.maximized {
+                    window.restored = window.rect;
+                    window.maximized = true;
+                    changed = true;
+                }
+                if window.rect != area {
+                    window.rect = area;
+                    changed = true;
+                }
+            } else if !window.minimized {
+                window.minimized = true;
+                changed = true;
+            }
+        }
+
+        self.raise(at, fd);
+        if changed {
+            self.reframe(fonts);
+        }
+    }
+
     /// Check an intent and start the cursor moving, or say why not.
     fn begin(&mut self, fonts: &Fonts, from: RawFd, fields: &[String]) -> bool {
         let field = |at: usize| fields.get(at).map(String::as_str).unwrap_or("");
@@ -1196,6 +1324,10 @@ impl Screen {
             return false;
         };
 
+        // The stage is set before anything is measured, so every check below
+        // runs against the geometry the action will actually happen in.
+        self.arrange_for_agent(fonts, at, app_fd);
+
         let Some(client) = self.client(app_fd) else {
             self.refuse(from, &app, &target, agent::REASON_NO_SUCH_APP);
             return false;
@@ -1206,12 +1338,11 @@ impl Screen {
         };
 
         // `scroll-into-view` is the one action the compositor performs itself,
-        // and the one that targets any node rather than only a control. It is
-        // also the way out of both ways a node can be unreachable: it scrolls
-        // the container, and it brings a covered window forward. The agent says
-        // what it wants to be true and not how to bring it about.
+        // and the one that targets any node rather than only a control. With
+        // arrangement automatic, scrolling is the one way a node can still be
+        // out of sight, and this is the way out. The agent says what it wants
+        // to be true and not how to bring it about.
         if action == "scroll-into-view" {
-            self.raise(at, app_fd);
             let moved = self
                 .client_mut(app_fd)
                 .map(|client| client.reveal(fonts, index))
@@ -1237,13 +1368,6 @@ impl Screen {
 
         let rect = client.rect_of(index);
         let to = (rect.x + rect.w / 2, rect.y + rect.h / 2);
-
-        // Behind another window. The test is literally "would a human clicking
-        // here have hit this", which is the standard every intent is held to.
-        if self.topmost_at(at, to.0, to.1) != Some(app_fd) {
-            self.refuse(from, &app, &target, agent::REASON_NOT_VISIBLE);
-            return false;
-        }
 
         let desk = self.workspaces[at].id;
         let from_point = self.agent_cursor.filter(|(d, _, _)| *d == desk).map_or(

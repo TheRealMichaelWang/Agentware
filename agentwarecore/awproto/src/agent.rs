@@ -22,10 +22,13 @@
 //! agent may only produce the first.
 //!
 //! The compositor turns one into the other, and in between does everything that
-//! makes the action legitimate: resolve the id to a rectangle, verify the node
-//! exists and is visible and not covered and is enabled, move the fake cursor
-//! there so the human sees what is about to happen, and only then synthesize
-//! exactly the event a human would have produced.
+//! makes the action legitimate: arrange the target's window to the front,
+//! maximized, with its siblings put away, resolve the id to a rectangle, verify
+//! the node exists and is visible and is enabled, move the fake cursor there so
+//! the human sees what is about to happen, and only then synthesize exactly the
+//! event a human would have produced. Arrangement is always the compositor's:
+//! an agent cannot move, resize or raise a window, because no such intent
+//! exists.
 //!
 //! If an agent could emit the event directly, every one of those steps would be
 //! skippable. It could click a disabled button, or one scrolled off screen, or
@@ -63,8 +66,9 @@ pub const REASON_NO_SUCH_APP: &str = "no-such-app";
 /// The application is open, but nothing in it answers to that id.
 pub const REASON_NO_SUCH_NODE: &str = "no-such-node";
 pub const REASON_DISABLED: &str = "disabled";
-/// Scrolled out of its container, or behind another window. `scroll-into-view`
-/// is the way out of both.
+/// Scrolled out of its container, which `scroll-into-view` remedies. Being
+/// behind another window is not a reason an agent can ever receive: acting on
+/// an app arranges its window to the front first.
 pub const REASON_NOT_VISIBLE: &str = "not-visible";
 /// The element does not offer that action in its current state. The action list
 /// in the view is the authority, and it is derived rather than declared.

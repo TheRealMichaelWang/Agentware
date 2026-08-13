@@ -75,10 +75,11 @@ This is the distinction the whole input model rests on.
 
 They are different schemas and the agent may only produce the first. The haimanager turns one into the other, and in between does everything that makes the action legitimate:
 
-1. Resolve the node ID to a screen rectangle.
-2. Verify the node exists, is visible, is not covered, and is enabled.
-3. Animate the fake cursor to it, so the human sees what is about to happen.
-4. Synthesize exactly the event a human click would have produced.
+1. Arrange the stage: the target's window comes to the front maximized, and the workspace's other windows are minimized. An agent names controls, never windows, so whether its target was covered is a question the haimanager makes impossible rather than one it answers with rejections. Only the human arranges and resizes windows; no intent exists for either.
+2. Resolve the node ID to a screen rectangle.
+3. Verify the node exists, is visible within its own window, and is enabled.
+4. Animate the fake cursor to it, so the human sees what is about to happen.
+5. Synthesize exactly the event a human click would have produced.
 
 Step 4 is more literal than it sounds. Text is entered one character at a time, at roughly a keystroke's interval, so an application receives seventeen events for a seventeen character address exactly as it would from a person. Setting the value in one step would produce something no human could have produced, and would also be unreadable to a human watching. `check` and `uncheck` become a `toggle` only when the state actually has to move, for the same reason: that is the event a person pressing the box would have generated.
 

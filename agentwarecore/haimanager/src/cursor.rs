@@ -68,6 +68,44 @@ fn build(logical_w: f32, logical_h: f32, inside: impl Fn(f32, f32) -> bool) -> M
     Mask { w, h, data }
 }
 
+/// A double-headed arrow along the x axis, in an 18x10 logical box.
+///
+/// The one definition all three resize cursors come from: the vertical variant
+/// transposes it and the diagonal rotates it, so the heads and shaft can never
+/// disagree between the three.
+fn double_arrow_inside(x: f32, y: f32) -> bool {
+    let (w, cy) = (18.0, 5.0);
+    let dy = (y - cy).abs();
+    let shaft = dy <= 1.1 && (3.0..=w - 3.0).contains(&x);
+    let left = (0.5..=5.5).contains(&x) && dy <= (x - 0.5) * 0.85;
+    let right = (w - 5.5..=w - 0.5).contains(&x) && dy <= (w - 0.5 - x) * 0.85;
+    shaft || left || right
+}
+
+fn hresize_mask() -> &'static Mask {
+    static MASK: OnceLock<Mask> = OnceLock::new();
+    MASK.get_or_init(|| build(18.0, 10.0, double_arrow_inside))
+}
+
+fn vresize_mask() -> &'static Mask {
+    static MASK: OnceLock<Mask> = OnceLock::new();
+    MASK.get_or_init(|| build(10.0, 18.0, |x, y| double_arrow_inside(y, x)))
+}
+
+fn dresize_mask() -> &'static Mask {
+    static MASK: OnceLock<Mask> = OnceLock::new();
+    MASK.get_or_init(|| {
+        build(16.0, 16.0, |x, y| {
+            // Rotate 45 degrees about the box centre and test the horizontal
+            // arrow. The axis runs top-left to bottom-right, which is the
+            // direction the bottom-right corner actually pulls.
+            let u = ((x - 8.0) + (y - 8.0)) * std::f32::consts::FRAC_1_SQRT_2;
+            let v = ((y - 8.0) - (x - 8.0)) * std::f32::consts::FRAC_1_SQRT_2;
+            double_arrow_inside(u + 9.0, v + 5.0)
+        })
+    })
+}
+
 fn arrow_mask() -> &'static Mask {
     static MASK: OnceLock<Mask> = OnceLock::new();
     MASK.get_or_init(|| build(13.0, 19.0, arrow_inside))
@@ -120,6 +158,12 @@ pub enum Shape {
     Arrow,
     /// Over editable text.
     Beam,
+    /// Over a window's right edge: pulls width.
+    ResizeH,
+    /// Over a window's bottom edge: pulls height.
+    ResizeV,
+    /// Over the corner where the two meet: pulls both.
+    ResizeDiag,
 }
 
 pub fn draw(canvas: &mut Canvas, x: i32, y: i32, kind: Kind, shape: Shape) {
@@ -127,12 +171,20 @@ pub fn draw(canvas: &mut Canvas, x: i32, y: i32, kind: Kind, shape: Shape) {
         Kind::Human => HUMAN,
         Kind::Agent => AGENT,
     };
-    // The arrow's hotspot is its tip at the top left; the beam's is its middle,
-    // because it marks where the caret would land rather than pointing at it.
+    // The arrow's hotspot is its tip at the top left; every other shape marks a
+    // place rather than pointing at one, so its hotspot is its middle.
     let (mask, x, y) = match shape {
         Shape::Arrow => (arrow_mask(), x, y),
         Shape::Beam => {
             let mask = beam_mask();
+            (mask, x - mask.w as i32 / 2, y - mask.h as i32 / 2)
+        }
+        Shape::ResizeH | Shape::ResizeV | Shape::ResizeDiag => {
+            let mask = match shape {
+                Shape::ResizeH => hresize_mask(),
+                Shape::ResizeV => vresize_mask(),
+                _ => dresize_mask(),
+            };
             (mask, x - mask.w as i32 / 2, y - mask.h as i32 / 2)
         }
     };

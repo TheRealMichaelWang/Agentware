@@ -60,15 +60,13 @@ fn main() {
     // so a run that behaves differently is visible in the log rather than
     // needing to be reasoned about.
     let script: &[(&str, &str, &str, &str, &str)] = &[
-        // The compose window opened first and the notes window is on top of it,
-        // so nothing in it can be reached. This is the reliable way to show a
-        // `not-visible` rejection: it depends on one window covering another,
-        // which is true at any display size, rather than on a list being longer
-        // than the window it is in, which is not.
-        ("awapp", "click", "discard", "", "not-visible"),
-        // `scroll-into-view` is the way out of that, and of a node scrolled off
-        // its own container. The agent says what it wants to be true rather than
-        // how to bring it about, and the compositor raises the window.
+        // The compose window opened behind the notes window, and this agent
+        // does not know and cannot ask. Acting on an app brings it forward,
+        // maximizes it, and puts the workspace's other windows away: window
+        // arrangement is translation the compositor performs, never something
+        // an agent reasons about. So a click into a covered window simply
+        // works, and there is no covered-window rejection left to demonstrate.
+        ("awapp", "click", "discard", "", "done"),
         ("awapp", "scroll-into-view", "to", "", "done"),
         ("awapp", "type-text", "to", "alice@example.com", "done"),
         ("awapp", "type-text", "body", "Sent by an agent.", "done"),
