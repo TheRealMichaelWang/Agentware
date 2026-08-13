@@ -714,6 +714,14 @@ fn natural_width(fonts: &Fonts, tree: &Tree, index: usize) -> i32 {
     let node = tree.node(index);
     let style = style_at(tree, index);
 
+    // A compositor-internal sizing hint, in physical pixels, not part of the
+    // application catalogue. It exists for chrome the compositor builds about
+    // geometry it already knows: the tab rename field takes the width of the
+    // tab it replaces instead of jumping to the fallback below.
+    if let Some(width) = node.attr("width").and_then(|value| value.parse::<i32>().ok()) {
+        return width.max(sc(40));
+    }
+
     match node.tag {
         Tag::Text | Tag::Icon => fonts.measure(label_of(node), &style),
         Tag::Button => fonts.measure(label_of(node), &style) + button_pad() * 2,

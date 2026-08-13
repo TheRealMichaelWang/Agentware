@@ -109,6 +109,22 @@ enum DragMode {
     Resize { right: bool, bottom: bool },
 }
 
+/// A tab held down, not yet known to be a click or a drag.
+struct TabDrag {
+    /// The workspace id, which survives the reordering the drag itself causes.
+    id: u32,
+    start_x: i32,
+    /// Where inside the tab the pointer took hold, so the ghost rides under
+    /// the hand instead of snapping its corner to it.
+    grab_dx: i32,
+    /// The pointer's latest x, for drawing the ghost.
+    at_x: i32,
+    moved: bool,
+}
+
+/// The width of the close glyph zone at a tab's right end.
+fn tab_close_w() -> i32 { ui::sc(20) }
+
 /// How close to an edge a press counts as taking hold of it.
 fn resize_band() -> i32 { ui::sc(7) }
 /// Smaller than this and a window is all chrome.
@@ -205,6 +221,11 @@ struct Workspace {
     /// button is: the pane is most of the screen, and a wedged workspace must
     /// not be able to keep it.
     pane_collapsed: bool,
+    /// What the human renamed this agentdesk to, if they have. The default is
+    /// derived from the id. Chrome state, so it lives here: the agentdesk
+    /// process does not know its own tab's name any more than an app knows
+    /// where its window is.
+    name: Option<String>,
     /// How far along the fold is, 0 fully open to 1 fully away.
     ///
     /// Kept separate from the target so the pane travels rather than teleports.
@@ -239,6 +260,13 @@ pub struct Screen {
     /// The client whose scrollbar thumb is being dragged, so pointer motion
     /// keeps reaching it even when the pointer leaves the bar.
     scroll_drag: Option<RawFd>,
+    /// A tab held by the pointer. Whether it becomes a drag or a click is
+    /// decided by whether it moves before it is released.
+    tab_drag: Option<TabDrag>,
+    /// The agentdesk tab being renamed: its workspace index, the text so far,
+    /// and the width of the tab it replaced, so entering the editor does not
+    /// change the tab's size under the click that opened it.
+    renaming: Option<(usize, String, i32)>,
 
     /// The intent being performed, if any.
     flight: Option<Flight>,
@@ -280,6 +308,8 @@ impl Screen {
             notes: Vec::new(),
             drag: None,
             scroll_drag: None,
+            tab_drag: None,
+            renaming: None,
             flight: None,
             queued: VecDeque::new(),
             agent_cursor: None,
@@ -378,8 +408,11 @@ impl Screen {
     /// This is the event loop's wake-up, so an idle desk with no caret sleeps
     /// exactly as it did before: no caret, no deadline, no frames.
     pub fn until_blink(&self) -> Option<Duration> {
-        let fd = self.keyboard_client()?;
-        if !self.client(fd).is_some_and(Client::focused_text) {
+        let in_client = self
+            .keyboard_client()
+            .and_then(|fd| self.client(fd))
+            .is_some_and(Client::focused_text);
+        if !in_client && self.renaming.is_none() {
             return None;
         }
         let period = BLINK.as_millis();
@@ -688,6 +721,7 @@ impl Screen {
             agent: None,
             opened: 0,
             pane_collapsed: false,
+            name: None,
             pane_t: 0.0,
         });
         self.workspaces.len() - 1
@@ -733,6 +767,7 @@ impl Screen {
             // else, unless a window or a scrollbar is being carried.
             Event::PointerMoved { x, y } => {
                 self.drag_to(fonts, x, y);
+                self.nav_drag_motion(fonts, x);
                 if let Some(fd) = self.scroll_drag
                     && let Some(client) = self.client_mut(fd)
                 {
@@ -748,7 +783,7 @@ impl Screen {
                 {
                     client.end_scroll_drag();
                 }
-                false
+                self.nav_release(fonts)
             }
 
             Event::ButtonPressed { button: Button::Left, x, y } => {
@@ -765,12 +800,12 @@ impl Screen {
                 }
             },
 
-            Event::KeyPressed(_) => {
+            Event::KeyPressed(key) => {
                 self.blink_epoch = Instant::now();
                 match self.focus {
                     Surface::App(fd) => self.route_to(fd, fonts, event),
                     Surface::Desk => self.route_desk(fonts, event),
-                    Surface::Nav => false,
+                    Surface::Nav => self.nav_key(fonts, key),
                 }
             }
 
@@ -810,6 +845,14 @@ impl Screen {
             Some((true, false)) => return cursor::Shape::ResizeH,
             Some((false, true)) => return cursor::Shape::ResizeV,
             _ => {}
+        }
+
+        if self.renaming.is_some()
+            && let Some(doc) = &self.nav
+            && let Some(index) = doc.index_of("#nav-rename")
+            && self.nav_layout.rect_of(index).contains(x, y)
+        {
+            return cursor::Shape::Beam;
         }
 
         let over_text = match self.surface_at(x, y) {
@@ -1570,11 +1613,26 @@ impl Screen {
         );
 
         for (at, workspace) in self.workspaces.iter().enumerate() {
+            if let Some((renaming, buffer, width)) = &self.renaming
+                && *renaming == at
+            {
+                out.push_str(&format!(
+                    "    <field id=\"nav-rename\" value=\"{value}\" width=\"{width}\" \
+                     description=\"The name being typed for this agentdesk\"/>\n",
+                    value = awproto::display::escape(buffer),
+                ));
+                continue;
+            }
+
+            // Trailing spaces reserve the room the close glyph is drawn into.
+            // The glyph is compositor paint over the button, the way window
+            // controls are, so the label must leave it a landing zone.
             let busy = if workspace.agent.is_some() { " *" } else { "" };
             out.push_str(&format!(
-                "    <button id=\"nav-desk-{id}\" label=\"Workspace {id}{busy}\"{emphasis} \
-                 description=\"Switches to workspace {id}\"/>\n",
+                "    <button id=\"nav-desk-{id}\" label=\"{name}{busy}    \"{emphasis} \
+                 description=\"Switches to this agentdesk\"/>\n",
                 id = workspace.id,
+                name = awproto::display::escape(&self.tab_name(workspace)),
                 emphasis = if at == self.current { " emphasis=\"primary\"" } else { "" },
             ));
         }
@@ -1611,13 +1669,48 @@ impl Screen {
         self.nav = Some(doc);
     }
 
+    /// An agentdesk tab's display name.
+    fn tab_name(&self, workspace: &Workspace) -> String {
+        workspace
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("Agentdesk {}", workspace.id))
+    }
+
+    /// The tabs as laid out, in display order.
+    fn nav_tab_rects(&self) -> Vec<(u32, Rect)> {
+        let Some(doc) = &self.nav else { return Vec::new() };
+        (0..doc.tree.nodes.len())
+            .filter_map(|index| {
+                let id = doc.tree.node(index).id()?;
+                let number = id.strip_prefix("nav-desk-")?.parse().ok()?;
+                Some((number, self.nav_layout.rect_of(index)))
+            })
+            .collect()
+    }
+
+    /// A press in the navigation bar. Tabs defer their action to the release,
+    /// because until then a press does not know whether it is a click or the
+    /// start of a drag; everything else acts immediately.
     fn click_nav(&mut self, fonts: &Fonts, x: i32, y: i32) -> bool {
         if self.nav.is_none() {
             self.build_nav(fonts);
         }
         let Some(doc) = &self.nav else { return false };
-        let Some(index) = self.nav_layout.hit(&doc.tree, x, y) else { return true };
-        let Some(id) = doc.tree.node(index).id().map(str::to_owned) else { return true };
+        let Some(index) = self.nav_layout.hit(&doc.tree, x, y) else {
+            self.commit_rename(fonts);
+            return true;
+        };
+        let rect = self.nav_layout.rect_of(index);
+        let Some(id) = doc.tree.node(index).id().map(str::to_owned) else {
+            self.commit_rename(fonts);
+            return true;
+        };
+
+        // A click anywhere but the rename field settles the rename first.
+        if id != "nav-rename" {
+            self.commit_rename(fonts);
+        }
 
         if id == "nav-stop" {
             // Straight to PID 1. This is the one control that must work when the
@@ -1635,12 +1728,137 @@ impl Screen {
 
         if let Some(number) = id.strip_prefix("nav-desk-")
             && let Ok(wanted) = number.parse::<u32>()
-            && let Some(at) = self.workspaces.iter().position(|w| w.id == wanted)
         {
-            return self.switch(at) || true;
+            // The close glyph occupies the tab's right end.
+            if x >= rect.x + rect.w - tab_close_w() {
+                self.requests.push(vec!["close-desk".into(), wanted.to_string()]);
+                self.notes.push(format!("workspace {wanted}: close requested from its tab"));
+                return true;
+            }
+            self.tab_drag = Some(TabDrag {
+                id: wanted,
+                start_x: x,
+                grab_dx: x - rect.x,
+                at_x: x,
+                moved: false,
+            });
+            return true;
         }
 
         true
+    }
+
+    /// A release over the bar: a tab that never moved was a click, and a click
+    /// on the tab already in front means the human wants to rename it.
+    fn nav_release(&mut self, _fonts: &Fonts) -> bool {
+        let Some(held) = self.tab_drag.take() else { return false };
+        if held.moved {
+            return true;
+        }
+        let Some(at) = self.workspaces.iter().position(|w| w.id == held.id) else {
+            return true;
+        };
+
+        if at == self.current {
+            let name = self.tab_name(&self.workspaces[at]);
+            // The editor takes over the tab's exact footprint.
+            let width = self
+                .nav_tab_rects()
+                .iter()
+                .find(|(id, _)| *id == held.id)
+                .map(|(_, rect)| rect.w)
+                .unwrap_or(ui::sc(160));
+            self.renaming = Some((at, name, width));
+            self.focus = Surface::Nav;
+            self.nav = None;
+            return true;
+        }
+        self.switch(at) || true
+    }
+
+    /// Carry a held tab into a new position.
+    ///
+    /// The reorder is applied live rather than shown as a ghost: the tabs are
+    /// cheap to rebuild, and the row rearranging under the hand is its own
+    /// feedback.
+    fn nav_drag_motion(&mut self, fonts: &Fonts, x: i32) {
+        let Some(held) = &mut self.tab_drag else { return };
+        held.at_x = x;
+        if !held.moved && (x - held.start_x).abs() < ui::sc(4) {
+            return;
+        }
+        held.moved = true;
+        let id = held.id;
+
+        // The layout must exist before the slot arithmetic runs. Input arrives
+        // in bursts, several motions to one repaint, and the first version left
+        // the bar torn down after a reorder: every further motion in the same
+        // burst then saw no tabs at all, computed slot zero, and hauled the tab
+        // back to the front. A drag that works one motion at a time and fails
+        // at mouse speed is exactly the kind of bug a paced test misses.
+        if self.nav.is_none() {
+            self.build_nav(fonts);
+        }
+        let tabs = self.nav_tab_rects();
+        // Where the pointer falls among the other tabs' centres is the slot
+        // this one belongs in.
+        let slot = tabs
+            .iter()
+            .filter(|(tab, _)| *tab != id)
+            .filter(|(_, rect)| x > rect.x + rect.w / 2)
+            .count();
+
+        let Some(from) = self.workspaces.iter().position(|w| w.id == id) else { return };
+        if slot == from {
+            return;
+        }
+        let current_id = self.workspaces[self.current].id;
+        let workspace = self.workspaces.remove(from);
+        self.workspaces.insert(slot.min(self.workspaces.len()), workspace);
+        self.current = self
+            .workspaces
+            .iter()
+            .position(|w| w.id == current_id)
+            .unwrap_or(0);
+        // Rebuilt on the spot rather than left for the next repaint, so the
+        // rest of this burst measures against the new order.
+        self.nav = None;
+        self.build_nav(fonts);
+    }
+
+    /// A keystroke while a tab is being renamed.
+    fn nav_key(&mut self, fonts: &Fonts, key: Key) -> bool {
+        let Some((_, buffer, _)) = &mut self.renaming else { return false };
+        match key {
+            Key::Char(c) => buffer.push(c),
+            Key::Backspace => {
+                buffer.pop();
+            }
+            Key::Enter => {
+                self.commit_rename(fonts);
+                return true;
+            }
+            Key::Escape => {
+                self.renaming = None;
+            }
+            _ => return false,
+        }
+        self.nav = None;
+        true
+    }
+
+    /// Settle a rename in progress: the trimmed text becomes the name, and an
+    /// emptied field falls back to the default rather than keeping a blank tab.
+    fn commit_rename(&mut self, fonts: &Fonts) {
+        let Some((at, buffer, _)) = self.renaming.take() else { return };
+        if let Some(workspace) = self.workspaces.get_mut(at) {
+            let trimmed = buffer.trim();
+            workspace.name = if trimmed.is_empty() { None } else { Some(trimmed.to_owned()) };
+            let (id, name) = (workspace.id, self.tab_name(&self.workspaces[at]));
+            self.notes.push(format!("workspace {id} is now named {name:?}"));
+        }
+        self.nav = None;
+        let _ = fonts;
     }
 
     // ---- painting ----------------------------------------------------------
@@ -1667,7 +1885,7 @@ impl Screen {
             None => self.draw_empty(canvas, fonts),
         }
 
-        self.draw_nav(canvas, fonts);
+        self.draw_nav(canvas, fonts, pointer);
 
         if self.debug {
             self.draw_debug(canvas, fonts);
@@ -1804,14 +2022,89 @@ impl Screen {
         );
     }
 
-    fn draw_nav(&self, canvas: &mut Canvas, fonts: &Fonts) {
+    fn draw_nav(&self, canvas: &mut Canvas, fonts: &Fonts, _pointer: (i32, i32)) {
         let rect = self.nav_rect();
         canvas.fill_rect(rect, ui::RAISED);
         let Some(doc) = &self.nav else { return };
+
+        // While a tab is being renamed its field carries the caret, on the same
+        // blink clock as every other caret: solid while keys arrive, blinking
+        // while the field waits.
+        let focus = match &self.renaming {
+            Some((_, buffer, _)) => Focus {
+                node: doc.index_of("#nav-rename"),
+                caret: buffer.chars().count(),
+                caret_visible: self.caret_phase(),
+                ..Focus::default()
+            },
+            None => Focus::default(),
+        };
+
         canvas.clipped(rect, |canvas| {
-            ui::paint_subtree(canvas, fonts, &doc.tree, &self.nav_layout, Document::ROOT, &Focus::default())
+            ui::paint_subtree(canvas, fonts, &doc.tree, &self.nav_layout, Document::ROOT, &focus)
         });
+
+        // Close glyphs, drawn over each tab's reserved right end the way window
+        // controls are drawn over windows: chrome on chrome, not markup.
+        let current_id = self.workspaces.get(self.current).map(|w| w.id);
+        let dragging = self
+            .tab_drag
+            .as_ref()
+            .filter(|held| held.moved)
+            .map(|held| (held.id, held.at_x - held.grab_dx));
+        for (id, tab) in self.nav_tab_rects() {
+            if dragging.is_some_and(|(dragged, _)| dragged == id) {
+                continue;
+            }
+            Self::draw_tab_close(canvas, tab, current_id == Some(id));
+        }
+
+        // The held tab is lifted out of the row and rides under the pointer.
+        // Without this the only feedback was the row rearranging once the
+        // pointer crossed a neighbour's midpoint, which for the first half of
+        // any drag is no feedback at all: the mechanism worked and the
+        // interaction still read as dead.
+        if let Some((id, ghost_x)) = dragging
+            && let Some((_, home)) = self.nav_tab_rects().into_iter().find(|(tab, _)| *tab == id)
+            && let Some(workspace) = self.workspaces.iter().find(|w| w.id == id)
+        {
+            // Blank the tab's resting place so it reads as picked up. The nav
+            // document's own window paints BACKGROUND across the bar, so that
+            // is what the empty slot has to be; RAISED here left a grey patch
+            // over the black.
+            canvas.fill_rect(home, ui::BACKGROUND);
+
+            let ghost = Rect::new(ghost_x, home.y, home.w, home.h);
+            let active = current_id == Some(id);
+            canvas.shadow(ghost, ui::radius_control(), ui::sc(8), 110);
+            canvas.fill_round_rect(ghost, ui::radius_control(), if active { ui::ACCENT } else { ui::PRESSED });
+            let style = Style { size: 11.0 * ui::scale(), ..Style::default() };
+            let label = self.tab_name(workspace);
+            canvas.clipped(ghost.inset(2), |canvas| {
+                canvas.draw_text(
+                    fonts,
+                    &label,
+                    ghost.x + ui::sc(12),
+                    ghost.y + (ghost.h - fonts.line_height(&style)) / 2,
+                    &style,
+                    ui::TEXT,
+                );
+            });
+            Self::draw_tab_close(canvas, ghost, active);
+        }
+
         canvas.fill_rect(Rect::new(rect.x, rect.y + rect.h - 1, rect.w, 1), ui::BORDER);
+    }
+
+    /// The close glyph at a tab's right end.
+    fn draw_tab_close(canvas: &mut Canvas, tab: Rect, active: bool) {
+        let cx = (tab.x + tab.w - tab_close_w() / 2 - ui::sc(2)) as f32;
+        let cy = (tab.y + tab.h / 2) as f32;
+        let r = ui::sc(3) as f32;
+        let ink = if active { ui::TEXT } else { ui::MUTED };
+        let t = ui::sc(1).max(1);
+        canvas.stroke_line(cx - r, cy - r, cx + r, cy + r, t, ink);
+        canvas.stroke_line(cx - r, cy + r, cx + r, cy - r, t, ink);
     }
 
     /// A readout of what the compositor is holding, for screenshots.
