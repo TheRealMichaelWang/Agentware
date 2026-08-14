@@ -1,0 +1,9 @@
+[package]
+name = "awcalc"
+version = "0.1.0"
+edition = "2024"
+
+# An application needs a socket it was handed and a way to format markup, and
+# no access to the display, the input devices or the filesystem.
+[dependencies]
+awproto = { path = "../../agentwarecore/awproto" }

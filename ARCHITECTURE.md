@@ -11,7 +11,8 @@ The `agentwarecore` repository is structured to separate the boot-critical super
 * `startmenu/` - The home screen: a prompt bar, a button for creating an empty agentdesk, and the list of open ones. It launches workspaces, never apps, and holds no workspace of its own.
 * `agentdesk/` - The workspace process. One per open agentdesk, owning that workspace's apps, conversation history, and UI state.
 * `agent/` - The per-turn worker. Spawned to execute one prompt and gone when that prompt is finished.
-* `apps/` - First-party system applications natively compatible with the UI markup language.
+
+First-party applications live in a second workspace, `agentwareapps`, beside `agentwarecore` rather than inside it. Apps are clients of the display protocol, not parts of the system: they link the protocol crate and nothing else, and the separate workspace makes that boundary a directory rather than a convention.
 
 ## The Supervisor (PID 1)
 The Supervisor is the absolute root of the userland.

@@ -477,16 +477,58 @@ impl Screen {
     /// that is partly covered is the case that makes "is this node reachable"
     /// a real question rather than a formality, and that question is what an
     /// agent's intent is checked against.
+    ///
+    /// The size is provisional: the smallest a resize would allow, because at
+    /// this moment the client has not sent a tree and there is nothing to
+    /// measure. [`Self::fit_window`] grows it to its content when the first
+    /// tree arrives, usually before this rectangle is ever painted.
     fn opening_rect(&self, at: usize, opened: usize) -> Rect {
         let area = self.window_area(at);
+        let (min_w, min_h) = min_window();
         // Wraps after a few, so the tenth window is not off the bottom corner.
         let step = cascade() * (opened % 5) as i32;
-        Rect::new(
-            area.x + window_margin() + step,
-            area.y + window_margin() + step,
-            (area.w - window_margin() * 2 - cascade()).max(ui::sc(360)),
-            (area.h - window_margin() * 2 - cascade()).max(ui::sc(260)),
-        )
+        Rect::new(area.x + window_margin() + step, area.y + window_margin() + step, min_w, min_h)
+    }
+
+    /// Size a window to what its content asks for, at the narrowest width a
+    /// resize would allow.
+    ///
+    /// Runs once per client, when its first tree arrives. The width is the
+    /// resize minimum rather than anything measured, because AWML describes
+    /// affordances rather than arrangement and has no natural width to ask for;
+    /// the height is the measure pass at that width plus the title bar, so
+    /// every element is visible without dead room below. The clamp against the
+    /// workspace is what a long list runs into, and its scroll container takes
+    /// over from there.
+    ///
+    /// First trees only. An application that re-renders taller does not get to
+    /// move a window the human may have already taken hold of.
+    fn fit_window(&mut self, fd: RawFd, fonts: &Fonts) {
+        let (min_w, min_h) = min_window();
+        let Some(content) = self.client(fd).and_then(|c| c.natural_height(fonts, min_w)) else {
+            return;
+        };
+        let Some(at) = self
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.windows.iter().any(|window| window.fd == fd))
+        else {
+            return;
+        };
+
+        let area = self.window_area(at);
+        let Some(window) = self.workspaces[at].windows.iter_mut().find(|w| w.fd == fd) else {
+            return;
+        };
+        if window.maximized {
+            return;
+        }
+
+        let room = (area.y + area.h - window.rect.y).max(min_h);
+        window.rect.w = min_w;
+        window.rect.h = (content + window_title_h()).clamp(min_h, room);
+        window.restored = window.rect;
+        self.reframe(fonts);
     }
 
     /// The strip of minimized windows along the bottom of the apps region.
@@ -690,6 +732,9 @@ impl Screen {
 
     pub fn readable(&mut self, fd: RawFd, fonts: &Fonts) -> Option<Progress> {
         let progress = self.client_mut(fd)?.readable(fonts);
+        if progress.first {
+            self.fit_window(fd, fonts);
+        }
         // A workspace's title can change with its tree, and the navigation bar
         // shows it.
         if progress.dirty {

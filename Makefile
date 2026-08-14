@@ -3,10 +3,12 @@ KERNEL := kernel-build/arch/x86/boot/bzImage
 INITRAMFS_ARCHIVE := initramfs.cpio.gz
 FS_DIR := initramfs
 AW_CORE_DIR := agentwarecore
+AW_APPS_DIR := agentwareapps
 TARGET := x86_64-unknown-linux-musl
 BIN_DIR := $(AW_CORE_DIR)/target/$(TARGET)/release
+APPS_BIN_DIR := $(AW_APPS_DIR)/target/$(TARGET)/release
 
-.PHONY: all build buildcore pack run selftest clean
+.PHONY: all build buildcore buildapps pack run selftest clean
 
 # Guest display size. virtio-vga defaults to 1280x800 and the compositor takes
 # the driver's preferred mode, so these two numbers are the whole of it.
@@ -51,10 +53,15 @@ buildcore:
 	@echo "==> Building Agentware Core..."
 	cd $(AW_CORE_DIR) && cargo build --release --target $(TARGET)
 
-# 3. Build All Userland (Core + Future 1st-party apps/tools)
-build: buildcore
+# 2. Build the first-party applications. A separate workspace because apps are
+# clients of the display protocol, not parts of the system.
+buildapps:
+	@echo "==> Building Agentware Apps..."
+	cd $(AW_APPS_DIR) && cargo build --release --target $(TARGET)
+
+# 3. Build All Userland
+build: buildcore buildapps
 	@echo "==> All Userland components built successfully."
-	# (Future) Add 'buildapps' as a dependency above
 
 # ---------------------------------------------------------
 # Packaging & Execution
@@ -77,15 +84,17 @@ pack: build
 	cp $(BIN_DIR)/supervisor $(FS_DIR)/init
 	cp $(BIN_DIR)/haimanager $(FS_DIR)/bin/haimanager
 
-	# 3a. The reference client for the display protocol. It stands in for both
-	# the agentdesk and an application until either exists, which is what gives
-	# the compositor something real to render and diff.
+	# 3a. The stand-in agentdesk, which is what gives the compositor a desk
+	# connection to render and diff until the real one exists.
 	cp $(BIN_DIR)/awapp $(FS_DIR)/bin/awapp
-	# The same binary under a second name, because the spawn broker forks an
-	# app by name with no arguments, so two names is how there are two apps.
-	cp $(BIN_DIR)/awapp $(FS_DIR)/bin/awnotes
 	# The per-turn worker, forked on the agentdesk's request.
 	cp $(BIN_DIR)/awagent $(FS_DIR)/bin/awagent
+	# First-party applications, forked by name by the spawn broker.
+	cp $(APPS_BIN_DIR)/awcalc $(FS_DIR)/bin/awcalc
+	# The old second app name. A previous image's copy would otherwise survive
+	# in the staging directory and keep shipping a binary the build no longer
+	# produces.
+	rm -f $(FS_DIR)/bin/awnotes
 
 	# 3b. Stand-in binaries used by `make selftest` to exercise the service
 	# table and the control socket. Harmless to ship; nothing starts them
@@ -132,5 +141,6 @@ selftest: pack
 clean:
 	@echo "==> Cleaning build artifacts..."
 	cd $(AW_CORE_DIR) && cargo clean
+	cd $(AW_APPS_DIR) && cargo clean
 	rm -f $(INITRAMFS_ARCHIVE)
 	rm -f $(FS_DIR)/init

@@ -26,8 +26,10 @@ agentwarecore/          cargo workspace
   supervisor/           PID 1: init, service table, spawn broker
     src/bin/            awtest awstubborn awctl awui: self-test stand-ins
   haimanager/           the compositor: DRM, input, AWML, layout, paint, clients
-  awapp/                reference client, standing in for apps and the agentdesk
+  awapp/                stand-in agentdesk: the reference desk connection
   awagent/              stand-in per-turn worker: queries, intents, rejections
+agentwareapps/          cargo workspace: first-party applications
+  awcalc/               a calculator, the first real application
 initramfs/              staged image contents (build output, gitignored)
 tools/screenshot.py     boot, inject input, capture the screen as PNG
 kernel-build/           Linux submodule
@@ -50,6 +52,8 @@ it and powers the machine off; QEMU exiting on its own is the pass signal.
 6. Workspace compositing: regions, windows, the navigation bar, input routing
 7. The agent surface: scoped queries, intents, the fake cursor, rejections
 8. Window management, and making an agent's actions visible as they happen
+9. Agentdesk tabs, automatic arrangement for agents, and a presentation path
+   fast enough to feel like one
 
 Milestone 5 in more detail, since the rest builds on it. Clients arrive as
 descriptors the supervisor pushes over the control socket, each tagged with the
@@ -74,22 +78,59 @@ text is typed rather than pasted.
 
 Milestone 7 is the other half of that. An agent sends intents, never events, and
 the compositor resolves each one: find the application in the agent's own
-workspace, find the node, check it is enabled, not scrolled away and not behind
-another window, move the fake cursor there so the human sees it, and only then
-synthesize the event. A human's click and an agent's intent go through one
+workspace, **arrange the stage** (the target's window comes to the front
+maximized and the workspace's other windows are minimized, so a covered target
+is impossible rather than rejected), find the node, check it is enabled and not
+scrolled away, move the fake cursor there so the human sees it, and only then
+synthesize the event. `not-visible` now means exactly one thing, scrolled out of
+view inside the app, and `scroll-into-view` remains its remedy. The reverse can
+never happen: there is no move, resize, raise or arrange in the intent
+vocabulary, so arrangement is done *for* an agent, never *by* one. A human's click and an agent's intent go through one
 `Client::act`, so an application cannot tell them apart and the two paths cannot
-drift. `scroll-into-view` is the way out of both ways a node can be unreachable:
-it scrolls the container and raises the window.
+drift.
+
+Milestone 9, like 8, came from using the thing. The nav tabs are agentdesks:
+named "Agentdesk N" by default, renamed by clicking the active tab's title
+(inline field, same width as the tab, blinking caret, Enter commits, Escape
+cancels, clicking away commits), reordered by dragging (the held tab lifts out
+as a ghost under the pointer; the row reorders live as midpoints are crossed),
+and closed by the ✕ each tab carries, which is a `close-desk` to PID 1. Names
+and order are compositor chrome; the agentdesk process is not told its tab's
+name any more than an app is told where its window is.
+
+The presentation path was rebuilt after "it feels sluggish" was traced with
+numbers rather than guesses (a per-second `frames:` log in the kernel log
+reports paint/blit cost while frames are produced):
+
+* Cursors are an **overlay**, not part of the scene: pointer motion restores
+  and restamps small patches with partial dirty rectangles instead of
+  repainting 2560x1440 in software per twitch.
+* Every present is **atomic**: everything for a frame reaches the framebuffer
+  before one `DIRTYFB` with all the clips, because every flush is a chance for
+  the host to show a half-composed frame, which is what flicker is.
+* Presents are **capped near 120Hz** (`PRESENT_MIN`); work arriving faster is
+  deferred through the epoll timeout, never dropped.
+* A pure window drag repaints only the region the window swept (`drag_damage`),
+  and window shadows come from cached corner tiles plus constant-alpha edge
+  strips instead of a per-pixel square root. Measured on a six-second drag:
+  paint fell from 14ms avg / 34ms worst to 7.1ms avg / 14ms worst.
 
 **Nothing is left of the original plan.** What is missing now is not
 compositor work: `startmenu`, a real `agentdesk` that streams conversation to
-and from an agent, a real `agent` with a model behind it, and applications.
+and from an agent, a real `agent` with a model behind it, and more applications.
 
-Nothing else exists yet: no `agentdesk`, no `agent`, no `startmenu`, no real
-apps. `awapp` stands in for the first and the last of those, and is the reference
-client for the display protocol rather than a product. The supervisor logs and
-skips what is not installed rather than crash looping against it, so the system
-boots and is useful without them.
+First-party applications live in `agentwareapps/`, a separate workspace because
+apps are clients of the display protocol, not parts of the system: they link
+`awproto` and nothing else. `awcalc`, a pocket calculator, is the first and so
+far only one, and doubles as the reference for how an application is written: a
+model and a `render`, hand-written stable ids, no diffing, no ephemeral state.
+The demo agent turn drives it: 12 + 34, one press at a time, and reads back 46.
+
+No `agentdesk`, no `agent`, no `startmenu` exist yet. `awapp` stands in for the
+agentdesk and is the reference client for the desk connection: regions, the
+conversation pane, and the broker requests a workspace makes. The supervisor
+logs and skips what is not installed rather than crash looping against it, so
+the system boots and is useful without them.
 
 ## Building and running
 
@@ -122,8 +163,14 @@ coordinate-scripted captures valid.
 
 Once it is up, F1 cycles workspaces, standing in for the start menu, F2 toggles a
 diagnostic overlay listing every connection and the version it is on, and F3
-folds the conversation pane away. Windows have a title bar with the usual three
-controls and can be dragged; the dock along the bottom switches between them.
+folds the conversation pane away (animated, 200ms smoothstep; also the grip on
+the pane's edge). Windows have a title bar with chevron/brackets/cross controls
+(hover chips; close is danger), can be dragged, and resize from the right edge,
+bottom edge and corner, with double-arrow cursors over the bands. The pointer
+becomes an I-beam over text, and carets blink on a 530ms clock that wakes the
+loop only when a caret exists. Scrollbars hug the content edge, drag (thumb or
+track-jump), and auto-hide 900ms after the content stops moving; the agent's
+`scroll-into-view` lights them the same way.
 
 The agentdesk's `taskbar` region is parked at zero height for now. The strip
 duplicated the dock and spent a full-width band doing it. The region stays in
@@ -212,9 +259,9 @@ is the list so it does not get relitigated.
 * A human's click and an agent's intent end in **one function**. Nothing else may
   synthesize an event, or the two paths drift and the guarantee that an agent can
   only do what a human could have done stops being checkable.
-* `scroll-into-view` is the only remedy for an unreachable node, and it covers
-  both scrolling and raising. The agent expresses what should be true, never the
-  steps.
+* `scroll-into-view` is the only remedy for an unreachable node, which since
+  automatic arrangement means scrolled out of view. The agent expresses what
+  should be true, never the steps.
 * The tree version is the **application's own counter**, stamped by it and echoed
   back on every event. Checking one is then a comparison against a number the app
   already holds, not a mapping it has to maintain.
@@ -226,9 +273,20 @@ is the list so it does not get relitigated.
   visibility and enabled state, animates the cursor, then synthesizes the event.
 * Element actions are **derived** from type and state, never declared by the
   application.
+* An agent **never arranges windows** and cannot ask to: acting on an app
+  maximizes it and minimizes its siblings first, so covering is a question the
+  compositor makes impossible rather than answers. Only the human moves,
+  resizes, reorders or closes anything.
+* The agentdesk stays an ordinary AWML client and **never sends pixels**. Raw
+  pixels belong inside the tree as `image` content when that day comes, never
+  as a client's whole surface.
 * Applications choose type and colour. All of it is stripped from the agent's
   view, which is safe because appearance can never carry meaning: descriptions
   are required and actions are derived.
+
+A `width` attribute on a control is a compositor-internal sizing hint in
+physical pixels (used so the tab rename field keeps its tab's width); it is not
+part of the application catalogue and never reaches an agent.
 
 ## Gotchas that cost real time
 
@@ -240,8 +298,22 @@ is the list so it does not get relitigated.
   `waitpid(-1)`. Services call `setsid` and orphans keep their original group,
   so the wrong one silently collects almost nothing.
 * **`/dev/kmsg` is rate limited** to about ten messages per five seconds unless
-  `printk_devkmsg` is set to `on`. The eleventh line of a boot and everything
-  after it vanishes.
+  `printk.devkmsg=on` is on the kernel command line. The eleventh line of a boot
+  and everything after it vanishes. The `frames:` timing log needs this flag.
+* **`grep -c` exits nonzero on zero matches**, so `cargo build | grep -c error
+  && make pack` silently skips the pack and the guest boots the previous image.
+  One "verified" perf run measured a binary that did not contain the change.
+* **A paced test cannot catch a burst bug.** Input arrives many events per
+  repaint; the tab drag worked when a script sent one motion per frame and
+  failed at mouse speed, because a reorder tore down the nav layout mid-burst.
+  Drive gestures with back-to-back events when testing drags.
+* **Two flushes are a flicker.** Any dirty ioctl is a chance for the host to
+  present the framebuffer as it stands; erase-then-stamp as separate flushes
+  showed cursorless frames. Compose everything, then flush once.
+* **The harness proves mechanisms, not feel.** Pixel-diff verification is blind
+  to dead travel, missing feedback and latency; capture mid-gesture frames, and
+  treat "it works" claims about interaction dynamics as unverified until
+  timing numbers or mid-gesture captures exist.
 * **printk prints levels strictly below `console_loglevel`.** Setting it to 6
   suppresses level-6 messages.
 * **A relative mouse can never align with the host cursor.** The PS/2 mouse

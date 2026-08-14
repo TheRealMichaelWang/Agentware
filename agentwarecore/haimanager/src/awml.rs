@@ -300,7 +300,12 @@ impl<'a> Parser<'a> {
 
     /// Children and text, up to the matching close tag.
     fn content(&mut self, index: usize, tag: Tag, name: &str) -> Result<(), Error> {
-        let mut text = String::new();
+        // Collected as bytes and decoded once at the end. Pushing each byte as
+        // a char reads multi-byte UTF-8 as Latin-1, which turned every non-ASCII
+        // character in element text into two accented ones: `÷` arrived as `Ã·`.
+        // Attribute values never had the bug, which is why it survived until an
+        // application put a non-ASCII string in text content.
+        let mut text = Vec::new();
 
         loop {
             let Some(byte) = self.peek() else {
@@ -308,7 +313,7 @@ impl<'a> Parser<'a> {
             };
 
             if byte != b'<' {
-                text.push(byte as char);
+                text.push(byte);
                 self.at += 1;
                 continue;
             }
@@ -325,7 +330,10 @@ impl<'a> Parser<'a> {
                 }
                 self.at += 1;
 
-                let collapsed = collapse(&text);
+                // The parser's input arrived as `&str`, so this never actually
+                // loses anything; lossy only so a slicing bug shows up as ?
+                // on screen rather than a crash in the compositor.
+                let collapsed = collapse(&String::from_utf8_lossy(&text));
                 // Text belongs to the element that contains it, not to a
                 // synthetic child. Mixed content is not supported: an element
                 // has text or children, and using both is a client bug that

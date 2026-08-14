@@ -7,12 +7,13 @@
 //! graphics cannot be checked from a serial log.
 //!
 //! This substitutes the two pieces that are missing and nothing else. The
-//! agentdesk becomes `awapp desk`, the reference client wearing the workspace's
-//! face, and a small control-socket client stands in for the start menu by
-//! asking for one workspace with one application in it. Everything between those
-//! two ends is the real thing: PID 1 forks both processes into a cgroup, hands
-//! each a socketpair to the compositor, and pushes the other end over the control
-//! socket tagged with the workspace it belongs to.
+//! agentdesk becomes `awapp desk`, the stand-in workspace shell, and a small
+//! control-socket client stands in for the start menu by asking for workspaces.
+//! Everything between those two ends is the real thing: PID 1 forks both
+//! processes into a cgroup, hands each a socketpair to the compositor, and
+//! pushes the other end over the control socket tagged with the workspace it
+//! belongs to. The application each workspace opens is real too: `awcalc`, from
+//! `agentwareapps`, launched through the broker like anything else.
 //!
 //! It goes away when `startmenu` and a real agentdesk exist.
 

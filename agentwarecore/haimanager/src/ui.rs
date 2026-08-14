@@ -709,6 +709,17 @@ impl Placer<'_> {
     }
 }
 
+/// How tall a whole document wants to be at a given width.
+///
+/// This is the measure pass run from the root, and it exists for exactly one
+/// caller: sizing a window to its content when the first tree arrives. A scroll
+/// container measures as its full content here, which is what a clamp against
+/// the workspace is for; the container only actually scrolls once layout gives
+/// it less room than it asked.
+pub fn natural_height(fonts: &Fonts, tree: &Tree, width: i32) -> i32 {
+    measure(fonts, tree, Tree::ROOT, width)
+}
+
 /// How wide a node is when it is not being stretched.
 fn natural_width(fonts: &Fonts, tree: &Tree, index: usize) -> i32 {
     let node = tree.node(index);

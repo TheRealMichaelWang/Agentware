@@ -1,9 +1,15 @@
-//! A stand-in application: the reference client for the display protocol.
+//! A stand-in agentdesk: the reference client for the desk side of the display
+//! protocol.
 //!
-//! Real applications do not exist yet, and until they do nothing exercises the
-//! path a milestone-5 haimanager is built around. This is that path, written the
-//! way an application is meant to be written, so the compositor is being tested
-//! against the contract rather than against a mock shaped to fit it.
+//! A real agentdesk does not exist yet, and until it does nothing exercises the
+//! desk connection: regions, the conversation pane, and the broker requests a
+//! workspace makes on its own behalf. This is that path, written the way a
+//! workspace is meant to be written, so the compositor is tested against the
+//! contract rather than against a mock shaped to fit it.
+//!
+//! Applications are no longer stood in for here. The first real one lives in
+//! `agentwareapps/awcalc`, and this workspace opens it at startup the way a
+//! launcher would: by asking PID 1, never by forking.
 //!
 //! Three things are worth noticing about how little it does.
 //!
@@ -16,16 +22,11 @@
 //! the human's cursor, and this file contains no code to make sure of that,
 //! which is the entire point of putting that state in the compositor.
 //!
-//! **Its ids are written by hand and never change.** `to`, `body`, `send`. They
-//! are what the human's caret is carried across, and what an agent will name to
-//! act. Generating them per frame would break both, silently.
+//! **Its ids are written by hand and never change.** `message`, `send-message`.
+//! They are what the human's caret is carried across. Generating them per frame
+//! would break that, silently.
 //!
-//! Which face it wears comes from the name it was invoked under, because the
-//! spawn broker forks an application by name with no arguments: `awapp` is the
-//! compose window, `awnotes` is a second one so windows overlap. The agentdesk
-//! is the exception, since the supervisor does pass a workspace id to a desk.
-//!
-//! Usage: awapp | awnotes | awapp desk <id>
+//! Usage: awapp desk <id>
 
 use std::fmt::Write as _;
 use std::io::Write as IoWrite;
@@ -33,39 +34,10 @@ use std::io::Write as IoWrite;
 use awproto::broker::Broker;
 use awproto::display::{self, Event, Surface};
 
-/// Which interface this process is standing in for.
-///
-/// The supervisor forks the same binary for both, because what a connection is
-/// allowed to do is decided by the descriptor it was handed, not by the program
-/// on the other end of it.
-#[derive(PartialEq, Eq)]
-enum Face {
-    /// An application window: the thing an agent will read and drive.
-    Compose,
-    /// A second application, so a workspace holds more than one window and
-    /// covering is a real case rather than a hypothetical one.
-    Notes,
-    /// The workspace shell. Chrome, and invisible to agents by construction.
-    Workspace,
-}
-
-struct Draft {
-    id: &'static str,
-    label: &'static str,
-    archived: bool,
-}
-
 struct App {
-    face: Face,
-    /// Which workspace this process belongs to. Only a desk has one.
+    /// Which workspace this process belongs to. A desk has to name it when it
+    /// asks the broker for anything.
     desk: u32,
-    // The compose window's model.
-    to: String,
-    copy_self: bool,
-    body: String,
-    drafts: Vec<Draft>,
-    selected: Option<usize>,
-    // The workspace shell's model.
     message: String,
     transcript: Vec<String>,
     // Shown on screen so the app's own view of what happened can be compared
@@ -73,19 +45,17 @@ struct App {
     status: String,
     /// Applications this workspace has open, for its taskbar.
     open: Vec<&'static str>,
-    /// The control socket, for the workspace face only. An application never
-    /// has one: apps are opened *into* a workspace by the workspace, and an app
-    /// that could fork its own would be outside the boundary that owns it.
+    /// The control socket. An application never has one: apps are opened *into*
+    /// a workspace by the workspace, and an app that could fork its own would be
+    /// outside the boundary that owns it.
     broker: Option<Broker>,
 }
 
 fn main() {
-    let program = std::env::args().next().unwrap_or_default();
-    let face = match std::env::args().nth(1).as_deref() {
-        Some("desk") => Face::Workspace,
-        _ if program.ends_with("awnotes") => Face::Notes,
-        _ => Face::Compose,
-    };
+    if std::env::args().nth(1).as_deref() != Some("desk") {
+        log("usage: awapp desk <id>");
+        std::process::exit(2);
+    }
 
     // A desk is told which workspace it is, because it has to name it when it
     // asks the broker for anything. An application is told nothing: it does not
@@ -100,16 +70,12 @@ fn main() {
         }
     };
 
-    let mut app = App::new(face, desk);
+    let mut app = App::new(desk);
 
     // A workspace opens its own applications. That is what the launcher is, and
     // it is also the only way the taskbar can list them: nothing tells a
     // workspace what is running in it, because it is the thing that asked.
-    if app.face == Face::Workspace {
-        for name in ["awapp", "awnotes"] {
-            app.launch(name);
-        }
-    }
+    app.launch("awcalc");
 
     if let Err(err) = surface.render(&app.render()) {
         log(&format!("could not send the first tree: {err}"));
@@ -143,49 +109,13 @@ fn main() {
 }
 
 impl App {
-    fn new(face: Face, desk: u32) -> Self {
+    fn new(desk: u32) -> Self {
         App {
-            face,
             desk,
-            to: String::new(),
-            copy_self: true,
-            body: String::new(),
-            drafts: vec![
-                Draft { id: "draft-1", label: "Notes from Tuesday", archived: false },
-                Draft { id: "draft-2", label: "Re: budget", archived: false },
-                Draft { id: "draft-3", label: "Holiday plans", archived: true },
-                Draft { id: "draft-4", label: "Conference travel", archived: false },
-                Draft { id: "draft-5", label: "Re: kitchen rota", archived: false },
-                Draft { id: "draft-6", label: "Landlord, again", archived: false },
-                Draft { id: "draft-7", label: "Reading list", archived: false },
-                Draft { id: "draft-8", label: "Invoice 0041", archived: true },
-                Draft { id: "draft-9", label: "Sunday", archived: false },
-                Draft { id: "draft-10", label: "Re: the thing", archived: false },
-                Draft { id: "draft-11", label: "Fwd: warranty", archived: false },
-                Draft { id: "draft-12", label: "Re: Thursday", archived: false },
-                Draft { id: "draft-13", label: "Bike parts", archived: false },
-                Draft { id: "draft-14", label: "Re: the quote", archived: true },
-                Draft { id: "draft-15", label: "Dentist", archived: false },
-                Draft { id: "draft-16", label: "Re: photos", archived: false },
-                Draft { id: "draft-17", label: "Insurance renewal", archived: false },
-                Draft { id: "draft-18", label: "Re: standup notes", archived: false },
-                Draft { id: "draft-19", label: "Recipe", archived: false },
-                Draft { id: "draft-20", label: "Re: the other thing", archived: false },
-                Draft { id: "draft-21", label: "Tickets", archived: false },
-                Draft { id: "draft-22", label: "Re: moving out", archived: true },
-                Draft { id: "draft-23", label: "Book club", archived: false },
-                // The last one is what an agent is sent to fetch, and the
-                // rejection it gets on the way only means anything if the list
-                // is longer than any window it can be shown in. Twenty-four
-                // overflows at 2560x1440, which is the largest display this has
-                // been run at.
-                Draft { id: "draft-24", label: "Re: the thing, again", archived: false },
-            ],
-            selected: Some(1),
             message: String::new(),
             transcript: vec![
-                "you: open the mail app and start a message".into(),
-                "agent: opened Messages, the recipient field is empty".into(),
+                "you: open the calculator and add two numbers".into(),
+                "agent: opened Calculator, the display reads 0".into(),
             ],
             status: "ready".into(),
             open: Vec::new(),
@@ -248,64 +178,6 @@ impl App {
             return true;
         }
 
-        match self.face {
-            Face::Compose | Face::Notes => self.compose_event(event),
-            Face::Workspace => self.workspace_event(event),
-        }
-    }
-
-    fn compose_event(&mut self, event: &Event) -> bool {
-        match (event.target.as_str(), event.action.as_str()) {
-            ("to", display::ACTION_TYPE_TEXT) => {
-                self.to = event.value.clone();
-                self.status = "recipient edited".into();
-            }
-            ("to", display::ACTION_SUBMIT) => self.status = "recipient confirmed".into(),
-
-            ("body", display::ACTION_TYPE_TEXT) => {
-                self.body = event.value.clone();
-                self.status = format!("{} characters of body", self.body.chars().count());
-            }
-
-            ("copy-self", display::ACTION_TOGGLE) => {
-                self.copy_self = !self.copy_self;
-                self.status = format!("copy to self is {}", self.copy_self);
-            }
-
-            ("send", display::ACTION_CLICK) => {
-                self.status = format!("sent to {}", self.to);
-                self.to.clear();
-                self.body.clear();
-            }
-
-            ("discard", display::ACTION_CLICK) => {
-                self.to.clear();
-                self.body.clear();
-                self.status = "draft discarded".into();
-            }
-
-            (target, display::ACTION_CLICK) => {
-                match self.drafts.iter().position(|draft| draft.id == target) {
-                    Some(at) => {
-                        self.selected = Some(at);
-                        self.status = format!("opened {}", self.drafts[at].label);
-                    }
-                    None => {
-                        self.status = format!("nothing here answers to {target}");
-                        return false;
-                    }
-                }
-            }
-
-            _ => {
-                self.status = format!("ignored {} on {}", event.action, event.target);
-                return false;
-            }
-        }
-        true
-    }
-
-    fn workspace_event(&mut self, event: &Event) -> bool {
         let desk = self.desk;
 
         match (event.target.as_str(), event.action.as_str()) {
@@ -335,89 +207,14 @@ impl App {
 
             // The launcher. Apps are forked by PID 1 into this workspace's
             // cgroup, so closing the workspace takes them with it.
-            ("launch-notes", display::ACTION_CLICK) => self.launch("awnotes"),
-            ("launch-mail", display::ACTION_CLICK) => self.launch("awapp"),
+            ("launch-calc", display::ACTION_CLICK) => self.launch("awcalc"),
 
             _ => return false,
         }
         true
     }
 
-    fn render(&self) -> String {
-        match self.face {
-            Face::Compose | Face::Notes => self.render_compose(),
-            Face::Workspace => self.render_workspace(),
-        }
-    }
-
-    /// The whole interface, from the model, every time.
-    ///
-    /// Note what is absent: nothing here says which control has focus, where the
-    /// caret is, or how far the draft list is scrolled. Those belong to the
-    /// compositor, and an application that tried to describe them would be
-    /// fighting it.
-    fn render_compose(&self) -> String {
-        let mut out = String::new();
-        let _ = write!(
-            out,
-            r#"<window title="{title}" font="sans">
-  <vstack gap="lg" grow="true">
-    <text role="caption" color="muted">{status}</text>
-
-    <group label="Recipient">
-      <field id="to" placeholder="name@example.com" value="{to}"
-             description="Address the message will be sent to"/>
-      <checkbox id="copy-self" label="Send me a copy"{copy}
-                description="Also deliver this message to your own inbox"/>
-    </group>
-
-    <group label="Message">
-      <editor id="body" placeholder="Write something" value="{body}"
-              description="Body text of the message being composed"/>
-    </group>
-
-    <hstack gap="sm">
-      <button id="send" label="Send" emphasis="primary"{send}
-              description="Sends the composed message to its recipient"/>
-      <button id="discard" label="Discard" emphasis="danger"
-              description="Throws away the draft without sending it"/>
-      <text grow="true"></text>
-    </hstack>
-
-    <divider/>
-
-    <scroll grow="true">
-      <list id="drafts" label="Saved drafts">
-"#,
-            title = if self.face == Face::Notes { "Notes" } else { "Compose" },
-            status = display::escape(&self.status),
-            to = display::escape(&self.to),
-            body = display::escape(&self.body),
-            copy = if self.copy_self { r#" checked="true""# } else { "" },
-            // The button turns itself off when there is nowhere to send to. The
-            // agent sees the same thing the human does: an element that exists,
-            // says what it would do, and currently offers no actions.
-            send = if self.to.trim().is_empty() { " disabled" } else { "" },
-        );
-
-        for (at, draft) in self.drafts.iter().enumerate() {
-            let _ = write!(
-                out,
-                r#"        <item id="{id}" label="{label}"{selected}{disabled}
-              description="Open the draft named {label}"/>
-"#,
-                id = draft.id,
-                label = display::escape(draft.label),
-                selected = if self.selected == Some(at) { r#" selected="true""# } else { "" },
-                disabled = if draft.archived { " disabled" } else { "" },
-            );
-        }
-
-        out.push_str("      </list>\n    </scroll>\n  </vstack>\n</window>\n");
-        out
-    }
-
-    /// A stand-in for the workspace shell.
+    /// The workspace shell, from the model, every time.
     ///
     /// The top-level nodes declare which region they belong to, and the
     /// compositor honours that only because this arrived on a desk connection.
@@ -427,7 +224,12 @@ impl App {
     /// There is no `region="apps"` here, and there cannot be. That one belongs
     /// to application processes; a workspace claiming it would be drawing over
     /// its own windows.
-    fn render_workspace(&self) -> String {
+    ///
+    /// Note what is absent: nothing here says which control has focus, where the
+    /// caret is, or how far the transcript is scrolled. Those belong to the
+    /// compositor, and an application that tried to describe them would be
+    /// fighting it.
+    fn render(&self) -> String {
         let mut out = String::new();
         let _ = write!(
             out,
@@ -467,8 +269,8 @@ impl App {
 
 /// Log to the kernel ring buffer.
 ///
-/// An application has no console worth writing to: the haimanager owns the
-/// screen and stdout goes to a terminal that is no longer being displayed.
+/// A workspace has no console worth writing to: the haimanager owns the screen
+/// and stdout goes to a terminal that is no longer being displayed.
 fn log(message: &str) {
     let line = format!("<6>awapp: {message}\n");
     if let Ok(mut kmsg) = std::fs::OpenOptions::new().write(true).open("/dev/kmsg") {

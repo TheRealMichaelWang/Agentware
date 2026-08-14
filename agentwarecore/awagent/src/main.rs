@@ -51,53 +51,42 @@ fn main() {
         }
     }
 
-    match link.view("awapp") {
-        Ok(markup) => report("view awapp", &markup),
-        Err(err) => log(&format!("could not read awapp: {err}")),
+    match link.view("awcalc") {
+        Ok(markup) => report("view awcalc", &markup),
+        Err(err) => log(&format!("could not read awcalc: {err}")),
     }
 
-    // The turn. Each line is an intent and the outcome it is expected to have,
-    // so a run that behaves differently is visible in the log rather than
-    // needing to be reasoned about.
+    // The turn: work out 12 + 34 on the calculator, one press at a time, the
+    // way a human would. Each line is an intent and the outcome it is expected
+    // to have, so a run that behaves differently is visible in the log rather
+    // than needing to be reasoned about.
     let script: &[(&str, &str, &str, &str, &str)] = &[
-        // The compose window opened behind the notes window, and this agent
-        // does not know and cannot ask. Acting on an app brings it forward,
-        // maximizes it, and puts the workspace's other windows away: window
-        // arrangement is translation the compositor performs, never something
-        // an agent reasons about. So a click into a covered window simply
-        // works, and there is no covered-window rejection left to demonstrate.
-        ("awapp", "click", "discard", "", "done"),
-        ("awapp", "scroll-into-view", "to", "", "done"),
-        ("awapp", "type-text", "to", "alice@example.com", "done"),
-        ("awapp", "type-text", "body", "Sent by an agent.", "done"),
-        // Already checked, so this produces no event at all. `check` is
-        // unconditional on purpose: an agent that wants a box checked should not
-        // depend on a state it read a moment ago.
-        ("awapp", "check", "copy-self", "", "done"),
-        ("awapp", "click", "send", "", "done"),
-        // Sending cleared the recipient, so the application disabled the button.
-        // A disabled control offers no actions and this is refused.
-        ("awapp", "click", "send", "", "disabled"),
-        // An archived draft, disabled by the application.
-        ("awapp", "click", "draft-3", "", "disabled"),
+        // Nothing has been entered, so the calculator has disabled its equals
+        // button. A disabled control offers no actions and this is refused: the
+        // agent can see that `=` exists and that pressing it now would mean
+        // nothing.
+        ("awcalc", "click", "equals", "", "disabled"),
+        ("awcalc", "click", "digit-1", "", "done"),
+        ("awcalc", "click", "digit-2", "", "done"),
+        ("awcalc", "click", "add", "", "done"),
+        ("awcalc", "click", "digit-3", "", "done"),
+        ("awcalc", "click", "digit-4", "", "done"),
+        // The whole calculator fits on screen, so there is nothing to move and
+        // this succeeds by already being true. The point is the contract: the
+        // agent names the node it wants visible and never a scroll container,
+        // and the compositor works out whether anything has to happen.
+        ("awcalc", "scroll-into-view", "equals", "", "done"),
+        // 12 + 34. The display should read 46 in the view read back below.
+        ("awcalc", "click", "equals", "", "done"),
         // Nothing in that window answers to this name.
-        ("awapp", "click", "no-such-thing", "", "no-such-node"),
+        ("awcalc", "click", "no-such-thing", "", "no-such-node"),
         // The agentdesk's own chrome. Not missing: forbidden, and told apart
         // from missing so the agent does not go looking for it.
         ("workspace", "click", "send-message", "", "not-addressable"),
         // A button offers focus and click, and nothing else. The action list is
         // derived from the element and its state, so this cannot be talked into
-        // existing. Aimed at `discard` rather than `send` because `send` is
-        // disabled by now, and disabled is checked first: a control that cannot
-        // be used at all is a better answer than a list of what it would have
-        // offered.
-        ("awapp", "type-text", "discard", "hello", "unsupported-action"),
-        // The far end of the draft list. Whether this needs scrolling depends on
-        // the size of the display, so the outcome expected is the same either
-        // way and the interesting part is that the compositor works out what to
-        // move without ever being told which container to scroll.
-        ("awapp", "scroll-into-view", "draft-24", "", "done"),
-        ("awapp", "click", "draft-24", "", "done"),
+        // existing.
+        ("awcalc", "type-text", "digit-7", "hello", "unsupported-action"),
     ];
 
     let mut surprises = 0;
@@ -129,9 +118,9 @@ fn main() {
 
     // The last thing it does is read the screen again, because an agent that
     // acts without checking the result is the thing this whole design exists to
-    // make unnecessary.
-    if let Ok(markup) = link.view("awapp") {
-        report("view awapp after the turn", &markup);
+    // make unnecessary. The display should read 46.
+    if let Ok(markup) = link.view("awcalc") {
+        report("view awcalc after the turn", &markup);
     }
 
     if surprises == 0 {

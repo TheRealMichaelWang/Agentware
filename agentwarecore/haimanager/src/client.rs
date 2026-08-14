@@ -160,6 +160,9 @@ pub struct Client {
 pub struct Progress {
     pub gone: bool,
     pub dirty: bool,
+    /// A first tree was installed where there was none. The moment a window can
+    /// be sized to its content, since before this there was nothing to measure.
+    pub first: bool,
     /// Lines worth putting in the kernel log.
     pub log: Vec<String>,
     /// Queries and intents from an agent connection, for the screen to answer.
@@ -229,8 +232,13 @@ impl Client {
 
     /// Drain whatever arrived and apply it.
     pub fn readable(&mut self, fonts: &Fonts) -> Progress {
-        let mut progress =
-            Progress { gone: false, dirty: false, log: Vec::new(), requests: Vec::new() };
+        let mut progress = Progress {
+            gone: false,
+            dirty: false,
+            first: false,
+            log: Vec::new(),
+            requests: Vec::new(),
+        };
         let mut buf = [0u8; 8192];
 
         loop {
@@ -257,8 +265,13 @@ impl Client {
                         // The borrow of `fields` has to end before the tree is
                         // installed, so the markup is copied out first.
                         let source = source.to_owned();
+                        let had_doc = self.doc.is_some();
                         let (dirty, line) = self.apply(fonts, &source, version);
                         progress.dirty |= dirty;
+                        // Checked against the document rather than taken from
+                        // `apply`, so a first tree that failed to parse does not
+                        // count as having arrived.
+                        progress.first |= !had_doc && self.doc.is_some();
                         progress.log.push(line);
                     } else if self.kind == Kind::Agent {
                         progress.requests.push(fields);
@@ -375,6 +388,12 @@ impl Client {
     fn relayout(&mut self, fonts: &Fonts) {
         let Some(doc) = &self.doc else { return };
         self.layout = ui::layout(fonts, doc, &self.frame, &mut self.scroll);
+    }
+
+    /// How tall this client's document wants to be at a given width, or `None`
+    /// before its first tree has arrived.
+    pub fn natural_height(&self, fonts: &Fonts, width: i32) -> Option<i32> {
+        self.doc.as_ref().map(|doc| ui::natural_height(fonts, &doc.tree, width))
     }
 
     /// Move or resize this client's part of the screen.
