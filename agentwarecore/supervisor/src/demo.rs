@@ -43,7 +43,7 @@ pub fn programs() -> Programs {
     Programs {
         desk: (AWAPP.into(), vec!["desk".into()]),
         agent: (AWAGENT.into(), vec![]),
-        app_dir: "/bin".into(),
+        app_dir: "/apps".into(),
     }
 }
 

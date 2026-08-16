@@ -13,3 +13,13 @@ libc = "0.2"
 rustix = { version = "1.1.4", features = ["event", "fs", "net", "process"] }
 awproto = { path = "../awproto" }
 fontdue = "0.9.4"
+# The path-and-gradient rasterizer behind Canvas. Everything it renders lands in
+# a small scratch pixmap that one blend loop composites onto the XRGB frame, so
+# the flat-fill fast paths, the cursor overlay and the dirty-rectangle
+# discipline never depend on it. png-format is off: nothing here reads or
+# writes PNG.
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+# Renders app icons, which are SVG so one file serves every size chrome needs.
+# Default features off: icons are paths, not documents, so no text layout, no
+# system fonts, and no embedded raster images.
+resvg = { version = "0.45", default-features = false }

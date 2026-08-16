@@ -58,6 +58,16 @@ pub const DANGER_DEEP: Color = rgb(0xb8, 0x42, 0x42);
 pub const OK: Color = rgb(0x5a, 0xc8, 0x8a);
 pub const SELECTED: Color = rgb(0x2b, 0x3f, 0x5e);
 
+/// A colour nudged brighter, for the top edge of a gradient.
+///
+/// Gradients here are lighting, not decoration: a surface lit faintly from
+/// above reads as raised without a heavier border doing the work. The nudge is
+/// small on purpose; a gradient anyone's eye snags on is too strong.
+pub fn lift(color: Color, by: u8) -> Color {
+    let channel = |shift: u32| ((color >> shift) & 0xff).saturating_add(by as u32).min(255);
+    (channel(16) << 16) | (channel(8) << 8) | channel(0)
+}
+
 /// The interface scale, set once at startup before anything is measured.
 ///
 /// Every metric below is a *logical* size multiplied by this. It exists because
@@ -906,7 +916,13 @@ fn paint_node(
                 (_, _, Some("danger")) => DANGER,
                 _ => RAISED,
             };
-            canvas.fill_round_rect(rect, radius_control(), fill);
+            // Lit faintly from above, except when disabled (flat says inert)
+            // or pressed (a control being pushed in should not look raised).
+            if disabled || pressed {
+                canvas.fill_round_rect(rect, radius_control(), fill);
+            } else {
+                canvas.fill_round_rect_vgrad(rect, radius_control(), lift(fill, 10), fill);
+            }
             if focused && !disabled {
                 canvas.stroke_round_rect(rect, radius_control(), 2, ACCENT);
             } else if emphasis.is_none() {

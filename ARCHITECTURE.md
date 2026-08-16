@@ -14,6 +14,8 @@ The `agentwarecore` repository is structured to separate the boot-critical super
 
 First-party applications live in a second workspace, `agentwareapps`, beside `agentwarecore` rather than inside it. Apps are clients of the display protocol, not parts of the system: they link the protocol crate and nothing else, and the separate workspace makes that boundary a directory rather than a convention.
 
+An installed application is a folder, `/apps/<name>/`, holding three things: `exec`, the program the Supervisor forks; `icon.svg`, which the haimanager rasterizes for the window title bar and the dock (SVG so one file serves every display scale); and `description.txt`, for whatever lists applications to humans and agents. The division of labour matches the rest of the system: the Supervisor touches only `exec` and stays out of content, and the haimanager reads the icon under the name the Supervisor stated at handoff, so an application cannot wear another's face.
+
 ## The Supervisor (PID 1)
 The Supervisor is the absolute root of the userland.
 * Runs as process ID 1 immediately after the Linux kernel finishes booting.

@@ -16,6 +16,7 @@ mod client;
 mod cursor;
 mod document;
 mod drm;
+mod icons;
 mod input;
 mod paint;
 mod screen;

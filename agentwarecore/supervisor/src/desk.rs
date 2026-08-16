@@ -46,7 +46,13 @@ const KILL_GRACE: Duration = Duration::from_secs(2);
 pub struct Programs {
     pub desk: (String, Vec<String>),
     pub agent: (String, Vec<String>),
-    /// Directory searched for app binaries, by name.
+    /// Directory holding one folder per installed application.
+    ///
+    /// An app is a package, not a binary: `{app_dir}/{name}/` holds `exec`,
+    /// the program itself, beside `icon.svg` and `description.txt`. The
+    /// supervisor only ever touches `exec`; the icon is chrome and belongs to
+    /// the haimanager, and the description belongs to whatever lists apps to
+    /// people and agents. PID 1 stays out of content, images included.
     pub app_dir: String,
 }
 
@@ -55,7 +61,7 @@ impl Programs {
         Self {
             desk: ("/bin/agentdesk".into(), vec![]),
             agent: ("/bin/agent".into(), vec![]),
-            app_dir: "/bin".into(),
+            app_dir: "/apps".into(),
         }
     }
 }
@@ -185,7 +191,7 @@ impl Desks {
 
         let (app_end, ui_end) = ui_socketpair()?;
 
-        let program = format!("{app_dir}/{app}");
+        let program = format!("{app_dir}/{app}/exec");
         let pid = spawn_in(&desk.cgroup, &program, &[], vec![(HAI_FD_ENV, app_end)])
             .map_err(|err| format!("could not start {program}: {err}"))?;
 

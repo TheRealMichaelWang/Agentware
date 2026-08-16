@@ -126,6 +126,26 @@ far only one, and doubles as the reference for how an application is written: a
 model and a `render`, hand-written stable ids, no diffing, no ephemeral state.
 The demo agent turn drives it: 12 + 34, one press at a time, and reads back 46.
 
+An installed app is a **package, not a binary**: `/apps/<name>/` holds `exec`
+(what the supervisor forks), `icon.svg` (what the compositor draws in the title
+bar and the dock; SVG so one file serves every scale), and `description.txt`
+(for whatever lists apps to people and agents, once something does). The
+supervisor only ever touches `exec`; the compositor loads the icon itself under
+the name PID 1 handed over, parses it once per app, rasterizes once per size,
+and caches the miss too, so an iconless app costs one probe, not one per frame.
+The selftest stand-ins ship in the same format so `make selftest` exercises the
+same spawn path. The dock is icon tiles with a running dot, not text pills; an
+app without an icon shows its initial.
+
+Rendering is still the hand-rolled rasterizer, with **tiny-skia behind
+`Canvas`** for what genuinely needs a path engine: resvg renders the icons
+through it, and `Canvas::blend_pixmap` is the one place premultiplied RGBA
+meets the XRGB frame. Raised surfaces (buttons, title bars, the dock) carry a
+faint top-lit vertical gradient, drawn as row-interpolated fills after the
+tiny-skia scratch version measurably doubled paint time on a maximized window
+full of buttons. Measured after: drag paint 3-6.5ms avg at 2560x1440, agent
+turn repaints 5-6.8ms avg at 1600x1000.
+
 No `agentdesk`, no `agent`, no `startmenu` exist yet. `awapp` stands in for the
 agentdesk and is the reference client for the desk connection: regions, the
 conversation pane, and the broker requests a workspace makes. The supervisor
@@ -344,3 +364,9 @@ part of the application catalogue and never reaches an agent.
 * **`/dev/input` is not fully populated at startup.** QEMU's PS/2 mouse appears
   about 300ms after the directory first has entries, so devices must be
   rescanned rather than enumerated once.
+* **A per-repaint scratch rasterization is a per-frame cost.** Gradient buttons
+  drawn through tiny-skia scratch pixmaps doubled paint time the moment a
+  maximized window was full of them; the frames log caught it. Anything drawn
+  every frame must be row fills, cached tiles, or a blit of something
+  rasterized once. tiny-skia is for icons and genuinely curved work, not for
+  shapes a row fill can describe.

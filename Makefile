@@ -72,7 +72,7 @@ pack: build
 	@echo "==> Packing initramfs..."
 	
 	# 1. Create the directories the image needs
-	mkdir -p $(FS_DIR)/dev $(FS_DIR)/bin
+	mkdir -p $(FS_DIR)/dev $(FS_DIR)/bin $(FS_DIR)/apps
 	
 	# 2. Create the console device node (Requires sudo)
 	@if [ ! -c $(FS_DIR)/dev/console ]; then \
@@ -89,24 +89,34 @@ pack: build
 	cp $(BIN_DIR)/awapp $(FS_DIR)/bin/awapp
 	# The per-turn worker, forked on the agentdesk's request.
 	cp $(BIN_DIR)/awagent $(FS_DIR)/bin/awagent
-	# First-party applications, forked by name by the spawn broker.
-	cp $(APPS_BIN_DIR)/awcalc $(FS_DIR)/bin/awcalc
-	# The old second app name. A previous image's copy would otherwise survive
-	# in the staging directory and keep shipping a binary the build no longer
-	# produces.
-	rm -f $(FS_DIR)/bin/awnotes
 
-	# 3b. Stand-in binaries used by `make selftest` to exercise the service
+	# 3b. First-party applications. An app is a folder, not a binary:
+	# /apps/<name>/ holds exec, icon.svg and description.txt, and the broker
+	# forks /apps/<name>/exec. Binaries stale-shipped under the old layout are
+	# removed so the image cannot boot a copy the build no longer produces.
+	rm -f $(FS_DIR)/bin/awnotes $(FS_DIR)/bin/awcalc
+	mkdir -p $(FS_DIR)/apps/awcalc
+	cp $(APPS_BIN_DIR)/awcalc $(FS_DIR)/apps/awcalc/exec
+	cp $(AW_APPS_DIR)/awcalc/icon.svg $(FS_DIR)/apps/awcalc/icon.svg
+	cp $(AW_APPS_DIR)/awcalc/description.txt $(FS_DIR)/apps/awcalc/description.txt
+
+	# 3c. Stand-in binaries used by `make selftest` to exercise the service
 	# table and the control socket. Harmless to ship; nothing starts them
 	# without the selftest flag on the kernel command line.
 	#   awtest      a service that exits, crashes, or runs on demand
 	#   awstubborn  an app that ignores SIGTERM, to force the cgroup.kill path
 	#   awctl       the control socket client
 	#   awui        a stand-in compositor that receives passed descriptors
+	# awtest doubles as the selftest's desk and agent stand-in from /bin, and
+	# both it and awstubborn are also staged as app packages so the selftest
+	# drives the same /apps/<name>/exec spawn path the real system uses.
 	cp $(BIN_DIR)/awtest $(FS_DIR)/bin/awtest
-	cp $(BIN_DIR)/awstubborn $(FS_DIR)/bin/awstubborn
 	cp $(BIN_DIR)/awctl $(FS_DIR)/bin/awctl
 	cp $(BIN_DIR)/awui $(FS_DIR)/bin/awui
+	rm -f $(FS_DIR)/bin/awstubborn
+	mkdir -p $(FS_DIR)/apps/awtest $(FS_DIR)/apps/awstubborn
+	cp $(BIN_DIR)/awtest $(FS_DIR)/apps/awtest/exec
+	cp $(BIN_DIR)/awstubborn $(FS_DIR)/apps/awstubborn/exec
 	
 	# 4. Pack the filesystem.
 	#

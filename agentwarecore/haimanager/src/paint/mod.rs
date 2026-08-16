@@ -99,6 +99,50 @@ pub const fn rgb(r: u8, g: u8, b: u8) -> Color {
     ((r as u32) << 16) | ((g as u32) << 8) | b as u32
 }
 
+/// The same colour as tiny-skia holds one, with an alpha.
+fn skia_color(color: Color, alpha: u8) -> tiny_skia::Color {
+    tiny_skia::Color::from_rgba8(
+        ((color >> 16) & 0xff) as u8,
+        ((color >> 8) & 0xff) as u8,
+        (color & 0xff) as u8,
+        alpha,
+    )
+}
+
+/// The colour `numerator/denominator` of the way from `a` to `b`.
+fn lerp_color(a: Color, b: Color, numerator: i32, denominator: i32) -> Color {
+    let mix = |shift: u32| {
+        let from = ((a >> shift) & 0xff) as i32;
+        let to = ((b >> shift) & 0xff) as i32;
+        ((from + (to - from) * numerator / denominator.max(1)) as u32) << shift
+    };
+    mix(16) | mix(8) | mix(0)
+}
+
+/// A rounded rectangle as a tiny-skia path.
+fn round_rect_path(rect: Rect, radius: f32) -> Option<tiny_skia::Path> {
+    let (x, y, w, h) = (rect.x as f32, rect.y as f32, rect.w as f32, rect.h as f32);
+    if radius <= 0.0 {
+        return tiny_skia::PathBuilder::from_rect(tiny_skia::Rect::from_xywh(x, y, w, h)?).into();
+    }
+    let r = radius.min(w / 2.0).min(h / 2.0);
+    // Circular corners from cubic curves, with the constant every 2D library
+    // uses for a quarter arc.
+    let k = r * 0.552_285;
+    let mut path = tiny_skia::PathBuilder::new();
+    path.move_to(x + r, y);
+    path.line_to(x + w - r, y);
+    path.cubic_to(x + w - r + k, y, x + w, y + r - k, x + w, y + r);
+    path.line_to(x + w, y + h - r);
+    path.cubic_to(x + w, y + h - r + k, x + w - r + k, y + h, x + w - r, y + h);
+    path.line_to(x + r, y + h);
+    path.cubic_to(x + r - k, y + h, x, y + h - r + k, x, y + h - r);
+    path.line_to(x, y + r);
+    path.cubic_to(x, y + r - k, x + r - k, y, x + r, y);
+    path.close();
+    path.finish()
+}
+
 /// A rectangle in pixels. `x` and `y` are the top-left corner.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Rect {
@@ -461,6 +505,113 @@ impl Canvas {
             let x = (ax + (bx - ax) * f).round() as i32;
             let y = (ay + (by - ay) * f).round() as i32;
             self.fill_rect(Rect::new(x - t / 2, y - t / 2, t, t), color);
+        }
+    }
+
+    /// Rasterize a shape through tiny-skia and composite it onto the frame.
+    ///
+    /// tiny-skia is the path-and-gradient engine behind Canvas, and this is the
+    /// one door it comes through. The shape is rendered into a scratch pixmap
+    /// no larger than the clipped bounding box, with a transform that maps
+    /// canvas coordinates into it, and [`Self::blend_pixmap`] converts its
+    /// premultiplied RGBA into the XRGB frame. Rendering off to the side keeps
+    /// the clip exact without tiny-skia's mask machinery, whose full-frame
+    /// allocation is the wrong price for a rectangle.
+    fn with_skia(&mut self, bbox: Rect, draw: impl FnOnce(&mut tiny_skia::PixmapMut, tiny_skia::Transform)) {
+        let Some(area) = self.clip.intersect(&bbox) else {
+            return;
+        };
+        let Some(mut scratch) = tiny_skia::Pixmap::new(area.w as u32, area.h as u32) else {
+            return;
+        };
+        let to_scratch = tiny_skia::Transform::from_translate(-area.x as f32, -area.y as f32);
+        draw(&mut scratch.as_mut(), to_scratch);
+        self.blend_pixmap(scratch.as_ref(), area.x, area.y);
+    }
+
+    /// Composite a premultiplied RGBA pixmap onto the frame at `(x, y)`.
+    ///
+    /// This is the only place the two pixel formats meet: tiny-skia and resvg
+    /// produce RGBA with premultiplied alpha, the frame is XRGB, and the
+    /// conversion is source-over against an opaque destination, one pixel at a
+    /// time, clipped like every other primitive.
+    pub fn blend_pixmap(&mut self, pixmap: tiny_skia::PixmapRef, x: i32, y: i32) {
+        let Some(area) =
+            self.clip.intersect(&Rect::new(x, y, pixmap.width() as i32, pixmap.height() as i32))
+        else {
+            return;
+        };
+        let data = pixmap.data();
+        let stride = pixmap.width() as usize * 4;
+
+        for row in 0..area.h {
+            let sy = (area.y + row - y) as usize;
+            let src = &data[sy * stride + (area.x - x) as usize * 4..];
+            let dst = ((area.y + row) * self.width + area.x) as usize;
+            for column in 0..area.w as usize {
+                let p = &src[column * 4..column * 4 + 4];
+                let alpha = p[3] as u32;
+                if alpha == 0 {
+                    continue;
+                }
+                if alpha == 255 {
+                    self.pixels[dst + column] = rgb(p[0], p[1], p[2]);
+                    continue;
+                }
+                let under = self.pixels[dst + column];
+                let inv = 255 - alpha;
+                let mix = |channel: u8, shift: u32| {
+                    let below = (under >> shift) & 0xff;
+                    // The source is premultiplied, so it is added as it stands.
+                    (channel as u32 + (below * inv + 127) / 255) << shift
+                };
+                self.pixels[dst + column] = mix(p[0], 16) | mix(p[1], 8) | mix(p[2], 0);
+            }
+        }
+    }
+
+    /// A rounded rectangle filled with a vertical gradient.
+    ///
+    /// The gradient sibling of [`Self::fill_round_rect`]: the same row fills
+    /// and corner coverage, with the colour interpolated per row. The first
+    /// version rendered this through tiny-skia instead, and the frames log
+    /// answered: a maximized window of gradient buttons doubled the paint
+    /// time, because every repaint re-rasterized every button into a scratch
+    /// pixmap. A vertical gradient on a rectilinear shape is row fills, and
+    /// row fills are what this canvas is already fast at. tiny-skia stays for
+    /// what genuinely needs a rasterizer: icons, and shapes a row cannot
+    /// describe.
+    pub fn fill_round_rect_vgrad(&mut self, rect: Rect, radius: i32, top: Color, bottom: Color) {
+        if rect.w <= 0 || rect.h <= 0 {
+            return;
+        }
+        let r = radius.min(rect.w / 2).min(rect.h / 2);
+
+        // The straight spans: full width through the middle, inset beside the
+        // corners. One fill per row, each with its own colour.
+        for row in 0..rect.h {
+            let color = lerp_color(top, bottom, row, rect.h - 1);
+            let (x, w) = if row < r || row >= rect.h - r {
+                (rect.x + r, rect.w - r * 2)
+            } else {
+                (rect.x, rect.w)
+            };
+            self.fill_rect(Rect::new(x, rect.y + row, w, 1), color);
+        }
+        if r <= 0 {
+            return;
+        }
+
+        for (corner, (cx, cy)) in corners(rect, r) {
+            for dy in 0..r {
+                let py = corner.1 + dy;
+                let color = lerp_color(top, bottom, py - rect.y, rect.h - 1);
+                for dx in 0..r {
+                    let px = corner.0 + dx;
+                    let coverage = disc_coverage(px, py, cx, cy, r as f32);
+                    self.blend(px, py, color, coverage);
+                }
+            }
         }
     }
 

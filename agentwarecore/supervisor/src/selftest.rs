@@ -34,7 +34,10 @@ pub fn programs() -> Programs {
     Programs {
         desk: (AWTEST.into(), vec!["desk".into()]),
         agent: (AWTEST.into(), vec!["exit".into(), "0".into(), "200".into()]),
-        app_dir: "/bin".into(),
+        // The stand-in apps live in the real app directory in the real package
+        // format, so the self-test exercises the same spawn path the system
+        // uses: {app_dir}/{name}/exec.
+        app_dir: "/apps".into(),
     }
 }
 

@@ -53,6 +53,7 @@ use awproto::agent;
 use crate::client::{Client, Kind, Progress};
 use crate::cursor;
 use crate::document::Document;
+use crate::icons::Icons;
 use crate::input::{Button, Event, Key};
 use crate::paint::font::{Family, Fonts, Style};
 use crate::paint::{Canvas, Rect};
@@ -70,6 +71,8 @@ const TASKBAR_HEIGHT: i32 = 0;
 fn pane_handle_w() -> i32 { ui::sc(12) }
 /// Height of the title bar the compositor draws around an application window.
 fn window_title_h() -> i32 { ui::sc(24) }
+/// The square icon at the left end of a title bar.
+fn title_icon() -> i32 { ui::sc(14) }
 /// How far each successive window is offset, so none opens exactly on another.
 fn cascade() -> i32 { ui::sc(26) }
 fn window_margin() -> i32 { ui::sc(14) }
@@ -77,8 +80,14 @@ fn window_margin() -> i32 { ui::sc(14) }
 /// each the full height of the bar, which makes them targets rather than dots.
 fn title_button_w() -> i32 { ui::sc(34) }
 /// The strip along the bottom of the apps region holding every open window.
-fn dock_height() -> i32 { ui::sc(26) }
-fn dock_pill() -> i32 { ui::sc(104) }
+///
+/// Taller than the old text-pill dock, because a tile now holds an icon with a
+/// running dot beneath it rather than a line of text beside one.
+fn dock_height() -> i32 { ui::sc(36) }
+/// One square tile per window, sized to sit inside the dock with equal margin.
+fn dock_tile() -> i32 { dock_height() - ui::sc(10) }
+/// The icon inside a tile, leaving room below for the running dot.
+fn dock_icon() -> i32 { ui::sc(18) }
 
 /// What a point in a title bar means.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -250,6 +259,9 @@ pub struct Screen {
     /// checked, and a still frame cannot otherwise say which connection is
     /// holding which version.
     pub debug: bool,
+    /// App icons, parsed and rasterized when an app attaches so drawing them
+    /// is a lookup. Cached across windows and workspaces by app name.
+    icons: Icons,
     /// Requests for the supervisor. Collected here rather than sent from here
     /// because the control connection is owned by the event loop, and a screen
     /// that could write to PID 1 from inside a click handler is a screen that
@@ -313,6 +325,7 @@ impl Screen {
             nav_scroll: HashMap::new(),
             bounds,
             debug: false,
+            icons: Icons::new(),
             requests: Vec::new(),
             notes: Vec::new(),
             drag: None,
@@ -550,7 +563,7 @@ impl Screen {
             .get(at)
             .map(|workspace| workspace.windows.len())
             .unwrap_or(0) as i32;
-        let width = (dock_pill() + 6) * count + 6;
+        let width = (dock_tile() + 6) * count + 6;
         Rect::new(
             apps.x + (apps.w - width) / 2,
             apps.y + apps.h - dock_height() - 8,
@@ -567,15 +580,16 @@ impl Screen {
         }
 
         let dock = self.dock_rect(at);
+        let inset = (dock.h - dock_tile()) / 2;
         let mut x = dock.x + 6;
-        // In the order they opened rather than in z-order, so a pill does not
+        // In the order they opened rather than in z-order, so a tile does not
         // move under the pointer when the window behind it is raised.
         let mut pills: Vec<(RawFd, Rect)> = workspace
             .windows
             .iter()
             .map(|window| {
-                let pill = Rect::new(x, dock.y + 4, dock_pill(), dock_height() - 8);
-                x += dock_pill() + 6;
+                let pill = Rect::new(x, dock.y + inset, dock_tile(), dock_tile());
+                x += dock_tile() + 6;
                 (window.fd, pill)
             })
             .collect();
@@ -583,7 +597,7 @@ impl Screen {
         let mut x = dock.x + 6;
         for (_, pill) in &mut pills {
             pill.x = x;
-            x += dock_pill() + 6;
+            x += dock_tile() + 6;
         }
         pills
     }
@@ -643,6 +657,13 @@ impl Screen {
             Kind::App => field(3).parse().unwrap_or(0),
             _ => field(2).parse().unwrap_or(0),
         };
+
+        // The name arrived in the supervisor's handoff tag, which is the only
+        // identity an app has; its icon is read from the package under that
+        // name, so an app cannot wear another's.
+        if kind == Kind::App {
+            self.icons.prepare(&name, &[title_icon(), dock_icon()]);
+        }
 
         let client = Client::adopt(kind, desk, name, pid, UnixStream::from(fd))
             .map_err(|err| format!("could not adopt the descriptor: {err}"))?;
@@ -2068,8 +2089,9 @@ impl Screen {
             }
             let focused = self.focus == Surface::App(window.fd);
             let Some(client) = self.client(window.fd) else { continue };
+            let icon = self.icons.get(&client.name, title_icon());
             canvas.clipped(regions.apps, |canvas| {
-                draw_window(canvas, fonts, client, window.rect, focused, window.maximized, pointer)
+                draw_window(canvas, fonts, client, icon, window, focused, pointer)
             });
         }
 
@@ -2089,7 +2111,7 @@ impl Screen {
         self.draw_pane_handle(canvas);
     }
 
-    /// The dock: one pill per open window, floating over the apps region.
+    /// The dock: one icon tile per open window, floating over the apps region.
     fn draw_dock(&self, canvas: &mut Canvas, fonts: &Fonts) {
         let pills = self.dock_pills(self.current);
         if pills.is_empty() {
@@ -2098,10 +2120,13 @@ impl Screen {
 
         let dock = self.dock_rect(self.current);
         canvas.shadow(dock, ui::radius_surface(), ui::sc(14), 110);
-        canvas.fill_round_rect(dock, ui::radius_surface(), ui::SURFACE);
+        canvas.fill_round_rect_vgrad(dock, ui::radius_surface(), ui::lift(ui::SURFACE, 8), ui::SURFACE);
         canvas.stroke_round_rect(dock, ui::radius_surface(), 1, ui::BORDER);
 
-        let style = Style { size: 12.0 * ui::scale(), ..Style::default() };
+        // The fallback for an app without an icon: its initial, drawn large.
+        // A letter is not a picture, but it is stable, unique-ish, and honest
+        // about which window the tile is.
+        let style = Style { size: 15.0 * ui::scale(), ..Style::default() };
         for (fd, pill) in pills {
             let Some(client) = self.client(fd) else { continue };
             let minimized = self
@@ -2112,23 +2137,42 @@ impl Screen {
             if focused {
                 canvas.fill_round_rect(pill, ui::radius_control(), ui::RAISED);
             }
-            let ink = if minimized { ui::MUTED } else { ui::TEXT };
-            canvas.clipped(pill.inset(2), |canvas| {
-                canvas.draw_text(
-                    fonts,
-                    client.title(),
-                    pill.x + 12,
-                    pill.y + (pill.h - fonts.line_height(&style)) / 2,
-                    &style,
-                    ink,
-                );
-            });
+
+            match self.icons.get(&client.name, dock_icon()) {
+                Some(icon) => {
+                    canvas.blend_pixmap(
+                        icon.as_ref(),
+                        pill.x + (pill.w - dock_icon()) / 2,
+                        pill.y + ui::sc(2),
+                    );
+                }
+                None => {
+                    let initial = client.title().chars().next().unwrap_or('?').to_string();
+                    let ink = if minimized { ui::MUTED } else { ui::TEXT };
+                    let x = pill.x + (pill.w - fonts.measure(&initial, &style)) / 2;
+                    canvas.draw_text(
+                        fonts,
+                        &initial,
+                        x,
+                        pill.y + ui::sc(2),
+                        &style,
+                        ink,
+                    );
+                }
+            }
+
             // A dot under a window that is on screen, the way a dock marks a
             // running application. Absent for one that is put away.
             if !minimized {
+                let dot = ui::sc(3).max(3);
                 canvas.fill_round_rect(
-                    Rect::new(pill.x + 5, pill.y + pill.h / 2 - 2, 4, 4),
-                    2,
+                    Rect::new(
+                        pill.x + (pill.w - dot) / 2,
+                        pill.y + pill.h - dot - ui::sc(2),
+                        dot,
+                        dot,
+                    ),
+                    dot / 2,
                     ui::ACCENT,
                 );
             }
@@ -2304,11 +2348,13 @@ fn draw_window(
     canvas: &mut Canvas,
     fonts: &Fonts,
     client: &Client,
-    rect: Rect,
+    icon: Option<&tiny_skia::Pixmap>,
+    window: &Window,
     focused: bool,
-    maximized: bool,
     pointer: (i32, i32),
 ) {
+    let rect = window.rect;
+    let maximized = window.maximized;
     let bar = Rect::new(rect.x, rect.y, rect.w, window_title_h());
 
     // Depth rather than a heavy outline. A focused window sits higher.
@@ -2316,12 +2362,15 @@ fn draw_window(
     canvas.fill_round_rect(rect, ui::radius_window(), ui::BACKGROUND);
 
     // The bar is the top of the same rounded shape, clipped to its own height so
-    // the two lower corners stay square against the content below.
+    // the two lower corners stay square against the content below. Lit faintly
+    // from above like every other raised surface.
     canvas.clipped(bar, |canvas| {
-        canvas.fill_round_rect(
+        let base = if focused { ui::RAISED } else { ui::SURFACE };
+        canvas.fill_round_rect_vgrad(
             Rect::new(bar.x, bar.y, bar.w, bar.h + ui::radius_window()),
             ui::radius_window(),
-            if focused { ui::RAISED } else { ui::SURFACE },
+            ui::lift(base, 8),
+            base,
         );
     });
 
@@ -2376,10 +2425,15 @@ fn draw_window(
     let style = Style { size: 13.0 * ui::scale(), ..Style::default() };
     let ink = if focused { ui::TEXT } else { ui::MUTED };
     let title = client.title();
-    // The title starts at the bar's text inset rather than being centred:
-    // centred text between asymmetric furniture never quite looks centred, and
-    // a left-anchored title is where the drag region unambiguously begins.
-    let x = bar.x + ui::sc(12);
+    // The icon leads and the title follows it. The title starts at the bar's
+    // text inset rather than being centred: centred text between asymmetric
+    // furniture never quite looks centred, and a left-anchored title is where
+    // the drag region unambiguously begins.
+    let mut x = bar.x + ui::sc(10);
+    if let Some(icon) = icon {
+        canvas.blend_pixmap(icon.as_ref(), x, bar.y + (bar.h - title_icon()) / 2);
+        x += title_icon() + ui::sc(6);
+    }
     let clip = Rect::new(bar.x, bar.y, bar.w - title_button_w() * 3 - ui::sc(6), bar.h);
     canvas.clipped(clip, |canvas| {
         canvas.draw_text(fonts, title, x, cy - fonts.line_height(&style) / 2, &style, ink);

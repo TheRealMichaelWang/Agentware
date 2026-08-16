@@ -1,0 +1,1 @@
+A pocket calculator. Adds, subtracts, multiplies and divides, one press at a time, the way a human would use it.
