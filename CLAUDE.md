@@ -37,7 +37,7 @@ agentwareapps/          cargo workspace: first-party applications
   awcalc/               a calculator, the first real application
   awfiles/              a file explorer, and where the shared dialogs are seen
 home/                   sample files, staged to /home (RAM, like everything)
-wallpapers/             SVG wallpapers, staged to /wallpapers
+default_wallpapers/     the wallpapers that ship, staged to /default_wallpapers
 initramfs/              staged image contents (build output, gitignored)
 tools/screenshot.py     boot, inject input, capture the screen as PNG
 kernel-build/           Linux submodule
@@ -168,11 +168,17 @@ The `background` region holds the wallpaper: an `image` element, new to the
 catalogue, whose `src` the compositor loads (SVG via resvg, PNG via tiny-skia),
 fits with `cover`, composites over the system background once per size, and
 blits as opaque rows every frame. `awsettings` is a first-party app in
-`agentwarecore` that lists `/wallpapers` with previews and writes the choice
+`agentwarecore`: a rail of categories down the right (Desktop, so far) and
+the page beside it, where a `select` dropdown offers the pictures in
+`/default_wallpapers` plus "Choose an image...", which opens the shared file
+dialog filtered to SVG and PNG anywhere on the machine. The choice is written
 to `/run/agentware/settings/wallpaper` (`awproto::settings`), the one setting
 that crosses between processes as a file: every desk picks it up within a
-second, no process is told. `text` wraps now, and `scroll anchor="end"` keeps
-a transcript pinned to its end until the human scrolls away.
+second, no process is told. `select`/`option` are implemented for it (the
+app owns `open`; the compositor sends `open`/`close`, floats the options over
+what follows, and closes on a press elsewhere). `text` wraps, and `scroll
+anchor="end"` keeps a transcript pinned to its end until the human scrolls
+away.
 
 First-party applications live in `agentwareapps/`, a separate workspace because
 apps are clients of the display protocol, not parts of the system: they link
@@ -197,10 +203,15 @@ inside its container at natural size (rows sum, columns take the widest, text
 counts up to a cap because it wraps, spacers count nothing), clamped between
 the resize minimum and the room left in the workspace; the height is the
 measure at that width. Rows measure each child at the slot it will really get,
-and a growing `scroll` measures as at least a few rows, so a browser opens
-with room to browse in rather than as a slit around its first two entries.
-First trees only: an app that re-renders larger does not move a window the
-human may hold.
+and a growing `scroll` measures as at least a few rows. An app whose
+top-level content is marked `grow` is saying the window should have room,
+not just fit (`ui::wants_room`): it opens at half the workspace in each
+direction, or its content's size if that is more, so a browser or a settings
+page opens with room and a calculator opens the size of a calculator; the
+proportion comes from the display, so no app carries a pixel size. First
+trees only: an app that re-renders larger does not move a window the human
+may hold. In a row, one-line controls (button, field, select, checkbox) keep
+their own height and sit in the middle; containers and text take the row.
 
 **Dialogs are in the app's tree** (`docs/UIElements.md`). An application with a
 question renders a `dialog` among its nodes and drops it when answered. The

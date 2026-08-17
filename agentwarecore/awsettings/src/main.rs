@@ -1,28 +1,46 @@
 //! Settings: the application that changes what every workspace looks like.
 //!
-//! One page for now, the wallpaper. Each installed wallpaper is shown as a
-//! preview with its name and a button that makes it the one every agentdesk
-//! draws, plus a row for none at all. Choosing writes one small file in the
-//! runtime directory; every agentdesk reads it on its clock tick and re-renders
-//! its background. No process is told, nothing is broadcast, and the setting is
-//! gone at reboot with everything else.
+//! A rail of categories down the right-hand side and the chosen category's
+//! page beside it. One category so far, Desktop, and one setting on it: the
+//! wallpaper, a dropdown of the pictures that ship with the system plus
+//! "Choose an image...", which opens the shared file dialog on any SVG or PNG
+//! on the machine. Choosing writes one small file in the runtime directory;
+//! every agentdesk reads it on its clock tick and re-renders its background.
+//! No process is told, nothing is broadcast, and the setting is gone at reboot
+//! with everything else.
 //!
 //! Written the way every application is written: a model, a `render`, whole
 //! tree every time, hand-written stable ids, no diffing and no ephemeral state.
-//! What is different is only what it links, and that is nothing but awproto:
-//! this is a first-party application with no more access than a calculator.
+//! The dropdown's `open` is the application's, like every other piece of
+//! state in its tree: the compositor asks to open and close it and the
+//! application answers by re-rendering. What is different is only what it
+//! links, and that is awproto and awkit: this is a first-party application
+//! with no more access than a calculator.
 
 use std::fmt::Write as _;
 use std::io::Write as IoWrite;
+use std::path::Path;
 
+use awkit::{Answer, FileDialog};
 use awproto::display::{self, Event, Surface, escape};
 use awproto::settings;
 
+/// The categories down the rail. One so far.
+const CATEGORIES: &[(&str, &str)] = &[("desktop", "Desktop")];
+
+/// The dropdown's option for opening the file dialog.
+const CHOOSE: &str = "choose";
+
 struct Settings {
-    /// Every wallpaper installed, as (name, path).
-    wallpapers: Vec<(String, String)>,
+    category: &'static str,
+    /// The wallpapers that ship with the system, as (name, path).
+    defaults: Vec<(String, String)>,
     /// The current choice, `None` for a plain background.
     current: Option<String>,
+    /// Whether the wallpaper dropdown is showing its options.
+    open: bool,
+    /// The file dialog, while one is up.
+    choosing: Option<FileDialog>,
     status: String,
 }
 
@@ -36,11 +54,13 @@ fn main() {
     };
 
     let mut app = Settings {
-        wallpapers: settings::wallpapers(),
+        category: CATEGORIES[0].0,
+        defaults: settings::wallpapers(),
         current: settings::wallpaper(),
+        open: false,
+        choosing: None,
         status: String::new(),
     };
-    app.status = format!("{} wallpaper(s) installed", app.wallpapers.len());
 
     if let Err(err) = surface.render(&app.render()) {
         log(&format!("could not send the first tree: {err}"));
@@ -70,22 +90,70 @@ fn main() {
 
 impl Settings {
     fn accept(&mut self, surface: &Surface, event: &Event) -> bool {
-        // A click on a stale tree is a click on a button that may no longer
+        // A click on a stale tree is a click on a control that may no longer
         // mean what it meant. Discarded, not guessed at.
-        if surface.is_stale(event) || event.action != display::ACTION_CLICK {
+        if surface.is_stale(event) && event.action == display::ACTION_CLICK {
             return false;
         }
 
-        let choice: Option<Option<String>> = match event.target.as_str() {
-            "use-none" => Some(None),
-            target => target
-                .strip_prefix("use-")
-                .and_then(|index| index.parse::<usize>().ok())
-                .and_then(|index| self.wallpapers.get(index))
-                .map(|(_, path)| Some(path.clone())),
-        };
-        let Some(choice) = choice else { return false };
+        // The dialog first: it owns its ids and ignores the rest.
+        if let Some(dialog) = &mut self.choosing {
+            match dialog.accept(event) {
+                Answer::Ignored => {}
+                Answer::Changed => return true,
+                Answer::Cancelled => {
+                    self.choosing = None;
+                    self.status = "kept the wallpaper as it was".into();
+                    return true;
+                }
+                Answer::Chosen(path) => {
+                    self.choosing = None;
+                    self.choose(Some(path.to_string_lossy().into_owned()));
+                    return true;
+                }
+            }
+        }
 
+        match (event.target.as_str(), event.action.as_str()) {
+            ("wallpaper", display::ACTION_OPEN) => self.open = true,
+            ("wallpaper", display::ACTION_CLOSE) => self.open = false,
+
+            (target, display::ACTION_SELECT) if target.starts_with("wallpaper-") => {
+                self.open = false;
+                match &target["wallpaper-".len()..] {
+                    CHOOSE => {
+                        // Any picture on the machine. Starts where the shipped
+                        // ones are, since that is where pictures are known to
+                        // be, and lists only what the compositor can draw.
+                        self.choosing = Some(
+                            FileDialog::open(settings::WALLPAPER_DIR).only(&["svg", "png"]),
+                        );
+                        self.status = "choose a picture".into();
+                    }
+                    "current" => {}
+                    index => {
+                        if let Some((_, path)) = index.parse::<usize>().ok().and_then(|i| self.defaults.get(i)) {
+                            let path = path.clone();
+                            self.choose(Some(path));
+                        }
+                    }
+                }
+            }
+
+            (target, display::ACTION_CLICK) if target.starts_with("category-") => {
+                let name = &target["category-".len()..];
+                if let Some((id, _)) = CATEGORIES.iter().find(|(id, _)| *id == name) {
+                    self.category = id;
+                }
+            }
+
+            _ => return false,
+        }
+        true
+    }
+
+    /// Record a wallpaper and say so.
+    fn choose(&mut self, choice: Option<String>) {
         match settings::set_wallpaper(choice.as_deref()) {
             Ok(()) => {
                 self.status = match &choice {
@@ -97,65 +165,106 @@ impl Settings {
             Err(err) => self.status = format!("could not save the setting: {err}"),
         }
         log(&self.status);
-        true
+    }
+
+    /// Whether the current wallpaper is one of the shipped ones.
+    fn current_is_default(&self) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(|path| self.defaults.iter().any(|(_, default)| default == path))
     }
 
     fn render(&self) -> String {
         let mut out = String::new();
-        let _ = write!(
-            out,
-            r#"<window title="Settings" font="sans">
-  <vstack gap="sm">
-    <text role="heading">Wallpaper</text>
-    <text role="caption" color="muted">{status}</text>
-    <divider/>
-    <scroll grow="true">
-      <vstack gap="md">
-"#,
-            status = escape(&self.status),
-        );
+        out.push_str("<window title=\"Settings\" font=\"sans\">\n  <hstack gap=\"lg\" grow=\"true\">\n");
 
-        for (index, (name, path)) in self.wallpapers.iter().enumerate() {
-            let current = self.current.as_deref() == Some(path.as_str());
-            let _ = write!(
+        // The page for the chosen category, with room to breathe.
+        out.push_str("    <scroll grow=\"true\">\n      <vstack gap=\"md\">\n");
+        match self.category {
+            "desktop" => self.render_desktop(&mut out),
+            _ => out.push_str("        <text color=\"muted\">Nothing here yet.</text>\n"),
+        }
+        out.push_str("      </vstack>\n    </scroll>\n");
+
+        // A rule, then the rail of categories down the right.
+        out.push_str("    <divider dir=\"vertical\"/>\n    <vstack gap=\"sm\">\n      <list label=\"Settings\">\n");
+        for (id, label) in CATEGORIES {
+            let _ = writeln!(
                 out,
-                r#"        <hstack gap="md">
-          <image src="{path}" alt="Preview of the wallpaper {name}" fit="cover"/>
-          <vstack gap="sm" grow="true">
-            <text weight="bold">{name}</text>
-            <text role="caption" color="muted">{path}</text>
-            <button id="use-{index}" label="{label}"{state}
-                    description="Makes {name} the wallpaper of every agentdesk"/>
-          </vstack>
-        </hstack>
-"#,
-                path = escape(path),
-                name = escape(name),
-                label = if current { "In use" } else { "Use" },
-                state = if current { r#" disabled="true""# } else { "" },
+                r#"        <item id="category-{id}" label="{label}"{selected} description="Shows the {label} settings"/>"#,
+                selected = if *id == self.category { r#" selected="true""# } else { "" },
             );
         }
+        out.push_str("      </list>\n    </vstack>\n  </hstack>\n");
 
-        let none = self.current.is_none();
-        let _ = write!(
-            out,
-            r#"        <hstack gap="md">
-          <vstack gap="sm" grow="true">
-            <text weight="bold">None</text>
-            <text role="caption" color="muted">A plain background, no picture.</text>
-            <button id="use-none" label="{label}"{state}
-                    description="Removes the wallpaper from every agentdesk, leaving a plain background"/>
-          </vstack>
-        </hstack>
-      </vstack>
-    </scroll>
-  </vstack>
-</window>
-"#,
-            label = if none { "In use" } else { "Use" },
-            state = if none { r#" disabled="true""# } else { "" },
-        );
+        if let Some(dialog) = &self.choosing {
+            out.push_str(&dialog.render());
+        }
+        out.push_str("</window>\n");
         out
+    }
+
+    fn render_desktop(&self, out: &mut String) {
+        out.push_str("        <text role=\"heading\">Desktop</text>\n");
+
+        // One setting, one labelled group: what it is and what it does on
+        // the left, the control on the right, and what is set below.
+        out.push_str("        <group label=\"Wallpaper\">\n          <vstack gap=\"md\">\n            <hstack gap=\"lg\">\n              <vstack gap=\"sm\" grow=\"true\">\n                <text>Picture</text>\n                <text role=\"caption\" color=\"muted\">Every agentdesk shows the same picture behind its windows.</text>\n              </vstack>\n");
+
+        // The dropdown. The value names the option chosen; a wallpaper from
+        // outside the shipped set appears as its own option so the box can
+        // show what is set.
+        let value = match &self.current {
+            Some(path) => match self.defaults.iter().position(|(_, default)| default == path) {
+                Some(index) => index.to_string(),
+                None => "current".to_owned(),
+            },
+            None => String::new(),
+        };
+        let _ = writeln!(
+            out,
+            r#"              <select id="wallpaper" value="{value}"{open} placeholder="No wallpaper" description="Chooses the wallpaper every agentdesk shows: one that ships with the system, or a picture chosen through the file dialog">"#,
+            open = if self.open { r#" open="true""# } else { "" },
+        );
+        for (index, (name, path)) in self.defaults.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                r#"                <option id="wallpaper-{index}" label="{name}" value="{index}"{selected} description="Sets the wallpaper to {name}"/>"#,
+                name = escape(name),
+                selected = if self.current.as_deref() == Some(path.as_str()) { r#" selected="true""# } else { "" },
+            );
+        }
+        if let (Some(path), false) = (&self.current, self.current_is_default()) {
+            let name = Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or(path);
+            let _ = writeln!(
+                out,
+                r#"                <option id="wallpaper-current" label="{name}" value="current" selected="true" description="The picture currently set, {path}"/>"#,
+                name = escape(name),
+                path = escape(path),
+            );
+        }
+        let _ = writeln!(
+            out,
+            r#"                <option id="wallpaper-{CHOOSE}" label="Choose an image..." value="{CHOOSE}" description="Opens a file dialog to pick any SVG or PNG on the machine as the wallpaper"/>
+              </select>
+            </hstack>"#
+        );
+
+        // What is set, seen.
+        if let Some(path) = &self.current {
+            let _ = writeln!(
+                out,
+                r#"            <hstack gap="md">
+              <image src="{path}" alt="The current wallpaper" fit="cover"/>
+              <text role="caption" color="muted">{path}</text>
+            </hstack>"#,
+                path = escape(path),
+            );
+        }
+        out.push_str("          </vstack>\n        </group>\n");
+        if !self.status.is_empty() {
+            let _ = writeln!(out, r#"        <text role="caption" color="muted">{}</text>"#, escape(&self.status));
+        }
     }
 }
 

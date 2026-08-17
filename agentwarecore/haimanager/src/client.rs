@@ -436,6 +436,11 @@ impl Client {
         self.doc.as_ref().map(|doc| ui::document_width(fonts, &doc.tree))
     }
 
+    /// Whether the tree's top-level content asks to fill its window.
+    pub fn wants_room(&self) -> bool {
+        self.doc.as_ref().is_some_and(|doc| ui::wants_room(&doc.tree))
+    }
+
     /// Move or resize this client's part of the screen.
     pub fn set_frame(&mut self, fonts: &Fonts, frame: Frame) {
         self.frame = frame;
@@ -636,7 +641,19 @@ impl Client {
         }
 
         let Some(doc) = &self.doc else { return false };
-        let Some(index) = self.layout.hit(&doc.tree, x, y) else {
+        let hit = self.layout.hit_with_overlays(&doc.tree, x, y);
+
+        // A click anywhere but on an open dropdown or its options closes it,
+        // and does nothing else: the press that dismisses a menu is not also
+        // a press on what was behind it.
+        if let Some(open) = doc.tree.open_selects().last().copied()
+            && !hit.is_some_and(|index| index == open || doc.tree.node(index).parent == Some(open))
+        {
+            let _ = self.act(fonts, open, "close", "");
+            return true;
+        }
+
+        let Some(index) = hit else {
             // Clicking the gap between two controls is a real thing to have
             // done: it takes focus off whatever had it.
             self.focus = None;
@@ -680,10 +697,14 @@ impl Client {
         // click on a checkbox is a toggle rather than a click: `check` and
         // `uncheck` exist so an intent can be unconditional, but a human
         // pressing the box means invert it.
-        let action = if tag == Tag::Checkbox {
-            display::ACTION_TOGGLE
-        } else {
-            display::ACTION_CLICK
+        // A dropdown's box opens or closes it, and one of its options is
+        // chosen: what a person pressing each of them means.
+        let action = match tag {
+            Tag::Checkbox => display::ACTION_TOGGLE,
+            Tag::Select if node.flag("open") => "close",
+            Tag::Select => "open",
+            Tag::Option => "select",
+            _ => display::ACTION_CLICK,
         };
         let _ = self.act(fonts, index, action, "");
         true
@@ -755,6 +776,11 @@ impl Client {
                 }
             }
 
+            // A dropdown's option is always reported when chosen, even the
+            // one already chosen: choosing is also what closes the list, and
+            // an application that hears nothing would leave it open.
+            "select" if tag == Tag::Option => self.emit(&id, display::ACTION_SELECT, ""),
+
             "select" | "deselect" => {
                 if selected != (action == "select") {
                     let verb = if action == "select" {
@@ -762,6 +788,15 @@ impl Client {
                     } else {
                         display::ACTION_DESELECT
                     };
+                    self.emit(&id, verb, "");
+                }
+            }
+
+            // The unconditional forms again: an intent says which way the
+            // list should be, and one that already is that way sends nothing.
+            "open" | "close" => {
+                if node.flag("open") != (action == "open") {
+                    let verb = if action == "open" { display::ACTION_OPEN } else { display::ACTION_CLOSE };
                     self.emit(&id, verb, "");
                 }
             }

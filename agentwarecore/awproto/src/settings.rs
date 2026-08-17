@@ -19,12 +19,13 @@ pub const SETTINGS_DIR: &str = "/run/agentware/settings";
 /// for a plain background. Absent means the default.
 pub const WALLPAPER_FILE: &str = "/run/agentware/settings/wallpaper";
 
-/// Where wallpapers are installed: SVG or PNG files, one per wallpaper, named
-/// for people.
-pub const WALLPAPER_DIR: &str = "/wallpapers";
+/// Where the wallpapers that ship with the system live: SVG or PNG files, one
+/// per wallpaper, named for people. A wallpaper need not come from here; the
+/// settings application also takes any picture chosen through the file dialog.
+pub const WALLPAPER_DIR: &str = "/default_wallpapers";
 
 /// The wallpaper shown before anyone has chosen one.
-pub const DEFAULT_WALLPAPER: &str = "/wallpapers/dusk.svg";
+pub const DEFAULT_WALLPAPER: &str = "/default_wallpapers/dusk.svg";
 
 /// The setting's value for no wallpaper at all.
 pub const WALLPAPER_NONE: &str = "none";
@@ -53,7 +54,8 @@ pub fn set_wallpaper(path: Option<&str>) -> std::io::Result<()> {
     std::fs::write(WALLPAPER_FILE, path.unwrap_or(WALLPAPER_NONE))
 }
 
-/// The wallpapers installed, as (display name, path), in name order.
+/// The wallpapers that ship with the system, as (display name, path), in name
+/// order.
 pub fn wallpapers() -> Vec<(String, String)> {
     let Ok(entries) = std::fs::read_dir(WALLPAPER_DIR) else { return Vec::new() };
     let mut found: Vec<(String, String)> = entries

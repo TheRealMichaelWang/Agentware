@@ -5,5 +5,5 @@ initramfs.cpio.gz
 initramfs/init
 initramfs/bin/
 initramfs/apps/
-initramfs/wallpapers/
+initramfs/default_wallpapers/
 initramfs/home/

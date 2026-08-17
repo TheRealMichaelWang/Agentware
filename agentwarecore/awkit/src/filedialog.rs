@@ -96,6 +96,9 @@ pub struct FileDialog {
     name: String,
     /// Why the last attempt did not go through, shown until the next change.
     error: Option<String>,
+    /// File extensions to list, lower-case and without the dot; empty lists
+    /// every file. Folders are always listed, since a file may be in one.
+    only: Vec<String>,
 }
 
 impl FileDialog {
@@ -109,9 +112,20 @@ impl FileDialog {
             selected: None,
             name: String::new(),
             error: None,
+            only: Vec::new(),
         };
         dialog.enter(dir.into());
         dialog
+    }
+
+    /// List only files with these extensions (without the dot), for a dialog
+    /// that wants a picture, a document, or whatever the application reads.
+    /// Folders stay listed, because the file may be inside one.
+    pub fn only(mut self, extensions: &[&str]) -> FileDialog {
+        self.only = extensions.iter().map(|ext| ext.to_lowercase()).collect();
+        let dir = self.dir.clone();
+        self.enter(dir);
+        self
     }
 
     /// Ask for a place and a name to save under, starting in `dir` with
@@ -172,6 +186,16 @@ impl FileDialog {
                 // things that cannot be chosen, and a list of those is noise.
                 if self.purpose == Purpose::Folder && !is_dir {
                     return None;
+                }
+                if !is_dir && !self.only.is_empty() {
+                    let ext = Path::new(&name)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(str::to_lowercase)
+                        .unwrap_or_default();
+                    if !self.only.contains(&ext) {
+                        return None;
+                    }
                 }
                 Some(Entry { name, is_dir })
             })

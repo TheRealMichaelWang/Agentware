@@ -58,6 +58,10 @@ pub const ACTION_SUBMIT: &str = "submit";
 pub const ACTION_TOGGLE: &str = "toggle";
 pub const ACTION_SELECT: &str = "select";
 pub const ACTION_DESELECT: &str = "deselect";
+/// A dropdown asked to show or hide its options. The application owns the
+/// `open` state, as it owns every other, and answers by re-rendering.
+pub const ACTION_OPEN: &str = "open";
+pub const ACTION_CLOSE: &str = "close";
 
 /// Longest tree the haimanager will accept from one client.
 ///

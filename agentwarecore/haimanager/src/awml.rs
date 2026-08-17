@@ -41,6 +41,9 @@ pub enum Tag {
     Checkbox,
     List,
     Item,
+    /// A dropdown: one chosen value, the options shown only while `open`.
+    Select,
+    Option,
     Dialog,
 }
 
@@ -62,6 +65,8 @@ impl Tag {
             "checkbox" => Tag::Checkbox,
             "list" => Tag::List,
             "item" => Tag::Item,
+            "select" => Tag::Select,
+            "option" => Tag::Option,
             "dialog" => Tag::Dialog,
             _ => return None,
         })
@@ -84,6 +89,8 @@ impl Tag {
             Tag::Checkbox => "checkbox",
             Tag::List => "list",
             Tag::Item => "item",
+            Tag::Select => "select",
+            Tag::Option => "option",
             Tag::Dialog => "dialog",
         }
     }
@@ -97,7 +104,7 @@ impl Tag {
     pub fn is_control(self) -> bool {
         matches!(
             self,
-            Tag::Button | Tag::Field | Tag::Editor | Tag::Checkbox | Tag::Item
+            Tag::Button | Tag::Field | Tag::Editor | Tag::Checkbox | Tag::Item | Tag::Select | Tag::Option
         )
     }
 
@@ -117,6 +124,11 @@ impl Tag {
             Tag::Editor => &["focus", "type-text", "clear"],
             Tag::Checkbox => &["focus", "check", "uncheck", "toggle"],
             Tag::Item => &["focus", "click", "select", "deselect"],
+            // A dropdown offers both verbs whatever its state, the way a
+            // checkbox offers check and uncheck: the intent says what should
+            // be true, and one that is already true is a no-op, not an error.
+            Tag::Select => &["focus", "open", "close"],
+            Tag::Option => &["select"],
             _ => &[],
         }
     }
@@ -200,6 +212,26 @@ impl Tree {
             .find(|&index| self.nodes[index].tag == Tag::Dialog)
     }
 
+    /// Every dropdown showing its options, in document order.
+    ///
+    /// Their options float over whatever follows them, so layout, painting and
+    /// hit testing each want the list.
+    pub fn open_selects(&self) -> Vec<usize> {
+        (0..self.nodes.len())
+            .filter(|&index| self.nodes[index].tag == Tag::Select && self.nodes[index].flag("open"))
+            .collect()
+    }
+
+    /// Whether a node is an option of a dropdown that is not showing them.
+    /// Such a node has no place on screen and answers to nothing.
+    pub fn folded(&self, index: usize) -> bool {
+        let node = &self.nodes[index];
+        if node.tag != Tag::Option {
+            return false;
+        }
+        node.parent.is_none_or(|parent| !self.nodes[parent].flag("open"))
+    }
+
     /// Whether a node is behind an open dialog: outside it while it is up.
     pub fn blocked(&self, index: usize) -> bool {
         match self.modal() {
@@ -225,7 +257,7 @@ impl Tree {
     /// path checks, so a human's click, an agent's intent and the agent's
     /// view cannot disagree about it.
     pub fn inert(&self, index: usize) -> bool {
-        self.nodes[index].disabled() || self.blocked(index)
+        self.nodes[index].disabled() || self.blocked(index) || self.folded(index)
     }
 
     /// The nearest value of an inheriting attribute, searching up the tree.
@@ -573,7 +605,7 @@ fn emit(tree: &Tree, index: usize, depth: usize, out: &mut String) {
     if let Some(alt) = node.attr("alt") {
         attrs.push_str(&format!(" alt=\"{alt}\""));
     }
-    for state in ["value", "checked", "selected", "invalid", "busy"] {
+    for state in ["value", "checked", "selected", "open", "invalid", "busy"] {
         if let Some(value) = node.attr(state) {
             attrs.push_str(&format!(" {state}=\"{value}\""));
         }

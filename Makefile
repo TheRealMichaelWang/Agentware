@@ -112,11 +112,13 @@ pack: build
 	cp $(BIN_DIR)/awsettings $(FS_DIR)/apps/awsettings/exec
 	cp $(AW_CORE_DIR)/awsettings/icon.svg $(AW_CORE_DIR)/awsettings/description.txt $(AW_CORE_DIR)/awsettings/name.txt $(FS_DIR)/apps/awsettings/
 
-	# 3b'. Wallpapers. Read by the compositor when a workspace names one, and
-	# listed by the settings app; SVG so one file serves every display size.
-	rm -rf $(FS_DIR)/wallpapers
-	mkdir -p $(FS_DIR)/wallpapers
-	cp wallpapers/*.svg $(FS_DIR)/wallpapers/
+	# 3b'. The wallpapers that ship with the system. Read by the compositor
+	# when a workspace names one and listed by the settings app; SVG so one
+	# file serves every display size. Any picture elsewhere works too, chosen
+	# through the settings app's file dialog.
+	rm -rf $(FS_DIR)/wallpapers $(FS_DIR)/default_wallpapers
+	mkdir -p $(FS_DIR)/default_wallpapers
+	cp default_wallpapers/*.svg $(FS_DIR)/default_wallpapers/
 
 	# 3b''. /home, where the file browser opens, with a few files to find.
 	# In RAM like everything else: what is made there lasts until power off.

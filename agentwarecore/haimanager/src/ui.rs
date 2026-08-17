@@ -404,8 +404,29 @@ impl Layout {
             .find(|&index| {
                 tree.node(index).tag.is_control()
                     && !tree.blocked(index)
+                    && !tree.folded(index)
                     && self.visible_at(index, x, y)
             })
+    }
+
+    /// The control under a point, with a dropdown's floating options taking
+    /// precedence over whatever they hang across. Layout does not know what
+    /// floats; the tree does, so callers pass it and this checks the floating
+    /// nodes before the rest.
+    pub fn hit_with_overlays(&self, tree: &Tree, x: i32, y: i32) -> Option<usize> {
+        for select in tree.open_selects().into_iter().rev() {
+            if let Some(option) = tree
+                .node(select)
+                .children
+                .iter()
+                .rev()
+                .copied()
+                .find(|&child| !tree.node(child).disabled() && self.visible_at(child, x, y))
+            {
+                return Some(option);
+            }
+        }
+        self.hit(tree, x, y)
     }
 
     /// Where a node is on screen, for driving the fake cursor to it.
@@ -543,13 +564,19 @@ fn measure(fonts: &Fonts, tree: &Tree, index: usize, width: i32) -> i32 {
         }
         Tag::Icon => line_height(fonts, tree, index),
         Tag::Image => image_w().min(width.max(1)) * 9 / 16,
+        // A rule across a column is a hairline tall; one down a row takes the
+        // row's height and asks for none of its own.
+        Tag::Divider if node.attr("dir") == Some("vertical") => 0,
         Tag::Divider => DIVIDER,
         // A tile is a button stood on end: icon above label, for a grid of
         // things to open. Compositor chrome for now, like `width`.
         Tag::Button if node.flag("tile") => {
             tile_pad() * 2 + tile_icon() + sc(6) + line_height(fonts, tree, index)
         }
-        Tag::Button | Tag::Field | Tag::Item => control_height(fonts, tree, index),
+        Tag::Button | Tag::Field | Tag::Item | Tag::Select => control_height(fonts, tree, index),
+        // Options take no room in the flow: they float below their dropdown
+        // while it is open and are nowhere while it is not.
+        Tag::Option => 0,
         Tag::Checkbox => control_height(fonts, tree, index).max(checkbox_size()),
         Tag::Editor => line_height(fonts, tree, index) * EDITOR_LINES + control_pad() * 2,
 
@@ -734,6 +761,34 @@ impl Placer<'_> {
             return;
         }
 
+        // A dropdown's options are not in the flow. Open, they hang below it
+        // in a column the dropdown's width, over whatever is there, and above
+        // it instead if the window has no room below. Closed, they are
+        // nowhere: an empty rectangle, so nothing paints them and nothing
+        // hits them.
+        if tag == Tag::Select {
+            let open = node.flag("open");
+            let row = control_height(self.fonts, tree, index);
+            let count = children.len() as i32;
+            let below = area.y + area.h;
+            let fits_below = below + row * count <= clip.y + clip.h;
+            let top = if fits_below || area.y - row * count < clip.y {
+                below
+            } else {
+                area.y - row * count
+            };
+            for (at, child) in children.into_iter().enumerate() {
+                let rect = if open {
+                    Rect::new(area.x, top + row * at as i32, area.w, row)
+                } else {
+                    Rect::new(0, 0, 0, 0)
+                };
+                self.rects[child] = rect;
+                self.clips[child] = if open { clip } else { Rect::new(0, 0, 0, 0) };
+            }
+            return;
+        }
+
         if tag == Tag::HStack {
             self.place_row(&children, inner, gap, inside);
             return;
@@ -768,12 +823,23 @@ impl Placer<'_> {
 
         let mut x = inner.x;
         for &child in children {
-            let width = if self.doc.tree.node(child).flag("grow") {
+            let node = self.doc.tree.node(child);
+            let width = if node.flag("grow") {
                 each
             } else {
                 natural_width(self.fonts, &self.doc.tree, child)
             };
-            self.place(child, Rect::new(x, inner.y, width, inner.h), clip);
+            // A one-line control in a taller row keeps its own height and
+            // sits in the middle of the row, rather than being stretched to
+            // the height of whatever paragraph or stack it shares the row
+            // with. Containers and text take the row: they have insides that
+            // want the room, or centre themselves when painted.
+            let mut slot = Rect::new(x, inner.y, width, inner.h);
+            if matches!(node.tag, Tag::Button | Tag::Field | Tag::Select | Tag::Checkbox) {
+                let own = measure(self.fonts, &self.doc.tree, child, width).min(inner.h);
+                slot = Rect::new(x, inner.y + (inner.h - own) / 2, width, own);
+            }
+            self.place(child, slot, clip);
             x += width + gap;
         }
     }
@@ -891,6 +957,23 @@ pub fn document_width(fonts: &Fonts, tree: &Tree) -> i32 {
     wanted_width(fonts, tree, Tree::ROOT)
 }
 
+/// Room at a dropdown's right end for the chevron that says it opens.
+fn chevron_w() -> i32 { sc(22) }
+/// Whether a document's top-level content asks to fill whatever it is given.
+///
+/// An application marks a container `grow` to say "this takes the room": a
+/// browser's listing, a settings page, a transcript. When that mark is on
+/// something directly under the window, the application is saying the window
+/// as a whole should have room, and the compositor opens it with some rather
+/// than at the size of its first tree. A calculator marks nothing at that
+/// level and opens the size of a calculator.
+pub fn wants_room(tree: &Tree) -> bool {
+    tree.node(Tree::ROOT)
+        .children
+        .iter()
+        .any(|&child| tree.node(child).flag("grow") && tree.node(child).tag != Tag::Dialog)
+}
+
 /// The most a run of text asks a window for. Longer text wraps.
 fn text_cap() -> i32 { sc(320) }
 /// The least a growing scroll container measures as: a few rows of content.
@@ -915,10 +998,12 @@ fn wanted_width(fonts: &Fonts, tree: &Tree, index: usize) -> i32 {
                 fonts.measure(label, &style).min(text_cap())
             }
         }
+        Tag::Divider if node.attr("dir") == Some("vertical") => DIVIDER,
         Tag::Divider => 0,
-        Tag::Image | Tag::Button | Tag::Field | Tag::Editor | Tag::Checkbox | Tag::Item => {
+        Tag::Image | Tag::Button | Tag::Field | Tag::Editor | Tag::Checkbox | Tag::Item | Tag::Select => {
             natural_width(fonts, tree, index)
         }
+        Tag::Option => 0,
         Tag::HStack => {
             let gaps = gap_of(node) * (node.children.len().saturating_sub(1)) as i32;
             children(false).sum::<i32>() + gaps
@@ -950,6 +1035,7 @@ fn natural_width(fonts: &Fonts, tree: &Tree, index: usize) -> i32 {
     match node.tag {
         Tag::Text | Tag::Icon => fonts.measure(label_of(node), &style),
         Tag::Image => image_w(),
+        Tag::Divider if node.attr("dir") == Some("vertical") => DIVIDER,
         Tag::Button => {
             let icon = if node.attr("icon").is_some() && !node.flag("tile") {
                 button_icon() + sc(6)
@@ -959,7 +1045,19 @@ fn natural_width(fonts: &Fonts, tree: &Tree, index: usize) -> i32 {
             fonts.measure(label_of(node), &style) + button_pad() * 2 + icon
         }
         Tag::Checkbox => checkbox_size() + 8 + fonts.measure(label_of(node), &style),
-        Tag::Item => fonts.measure(label_of(node), &style) + control_pad() * 2,
+        Tag::Item | Tag::Option => fonts.measure(label_of(node), &style) + control_pad() * 2,
+        // Wide enough for its widest option, so choosing one never changes
+        // the width of the row it sits in.
+        Tag::Select => {
+            let widest = node
+                .children
+                .iter()
+                .map(|&child| fonts.measure(label_of(tree.node(child)), &style))
+                .max()
+                .unwrap_or(0)
+                .max(fonts.measure(node.attr("placeholder").unwrap_or(""), &style));
+            widest + control_pad() * 2 + chevron_w()
+        }
         // A text entry that is not told to grow is the width of a search box:
         // room for a sentence, which is what one in a row is for.
         Tag::Field | Tag::Editor => sc(260),
@@ -1102,6 +1200,37 @@ fn paint_scrollbar(canvas: &mut Canvas, layout: &Layout, index: usize, lit: Opti
     // No track drawn, only the thumb. A permanent groove down the side of
     // every scrollable thing is most of what makes a list look heavy.
     canvas.fill_round_rect(thumb, track.w / 2, MUTED);
+}
+
+/// An open dropdown's options: a raised panel hanging off the box, over
+/// whatever it covers, painted after everything else in the window.
+fn paint_popup(
+    canvas: &mut Canvas,
+    fonts: &Fonts,
+    images: &Images,
+    tree: &Tree,
+    layout: &Layout,
+    select: usize,
+    focus: &Focus,
+) {
+    let options = &tree.node(select).children;
+    let Some(&first) = options.first() else { return };
+    let Some(&last) = options.last() else { return };
+    let top = layout.rects[first];
+    let bottom = layout.rects[last];
+    let panel = Rect::new(top.x, top.y, top.w, bottom.y + bottom.h - top.y);
+    if panel.w <= 0 || panel.h <= 0 {
+        return;
+    }
+    let clip = layout.clips[select];
+    canvas.clipped(clip, |canvas| {
+        canvas.shadow(panel, radius_control(), sc(10), 120);
+        canvas.fill_round_rect(panel, radius_control(), RAISED);
+        canvas.stroke_round_rect(panel, radius_control(), 1, BORDER);
+    });
+    for &option in options {
+        paint_node(canvas, fonts, images, tree, layout, option, focus);
+    }
 }
 
 fn paint_node(
@@ -1354,6 +1483,49 @@ fn paint_node(
             );
         }
 
+        // The dropdown as it sits closed or open: a box like a field with the
+        // chosen option's words and a chevron. Its options paint separately,
+        // last, so they float over what follows.
+        Tag::Select => {
+            let open = node.flag("open");
+            canvas.fill_round_rect(rect, radius_control(), BACKGROUND);
+            let edge = if focused || open { ACCENT } else { BORDER };
+            canvas.stroke_round_rect(rect, radius_control(), if focused || open { 2 } else { 1 }, edge);
+            let chosen = node.attr("value").unwrap_or("");
+            let shown = node
+                .children
+                .iter()
+                .map(|&child| tree.node(child))
+                .find(|option| option.attr("value").unwrap_or(label_of(option)) == chosen)
+                .map(label_of)
+                .filter(|label| !label.is_empty());
+            let (words, color) = match shown {
+                Some(label) => (label.to_owned(), ink),
+                None => (node.attr("placeholder").unwrap_or("").to_owned(), MUTED),
+            };
+            canvas.clipped(Rect::new(rect.x, rect.y, rect.w - chevron_w(), rect.h), |canvas| {
+                canvas.draw_text(fonts, &words, rect.x + control_pad(), centred(rect.h), &style, color);
+            });
+            // The chevron: down while closed, up while open.
+            let cx = (rect.x + rect.w - chevron_w() / 2) as f32;
+            let cy = (rect.y + rect.h / 2) as f32;
+            let r = sc(3) as f32;
+            let t = sc(1).max(1);
+            let dy = if open { -r * 0.7 } else { r * 0.7 };
+            canvas.stroke_line(cx - r, cy - dy * 0.5, cx, cy + dy * 0.5, t, MUTED);
+            canvas.stroke_line(cx, cy + dy * 0.5, cx + r, cy - dy * 0.5, t, MUTED);
+        }
+
+        Tag::Option => {
+            if node.flag("selected") {
+                canvas.fill_rect(rect, SELECTED);
+            }
+            if focused {
+                canvas.stroke_rect(rect, 1, ACCENT);
+            }
+            canvas.draw_text(fonts, label_of(node), rect.x + control_pad(), centred(rect.h), &style, ink);
+        }
+
         Tag::Item => {
             if node.flag("selected") {
                 canvas.fill_rect(rect, SELECTED);
@@ -1377,7 +1549,7 @@ fn paint_node(
 
     // Children in order, except that a window's dialogs go last, over the
     // content they float above, with the content dimmed under them so what is
-    // inert looks inert.
+    // inert looks inert; and open dropdowns' options go after even those.
     let node = tree.node(index);
     if node.tag == Tag::Window {
         for &child in &node.children {
@@ -1393,6 +1565,11 @@ fn paint_node(
         for child in dialogs {
             paint_node(canvas, fonts, images, tree, layout, child, focus);
         }
+        for select in tree.open_selects() {
+            paint_popup(canvas, fonts, images, tree, layout, select, focus);
+        }
+    } else if node.tag == Tag::Select {
+        // Options are painted by the popup pass, not here.
     } else {
         for &child in &node.children {
             paint_node(canvas, fonts, images, tree, layout, child, focus);

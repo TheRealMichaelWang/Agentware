@@ -112,7 +112,7 @@ Visible to agents, since an agent must be able to read a screen. They carry no i
 | `text` | `role=heading\|subheading\|body\|caption\|label` | Role is semantic, not a font size. Wraps to the width it is given. |
 | `icon` | `name`, `alt` | `alt` is what the agent reads. |
 | `image` | `src`, `alt`, `fit=cover` | `alt` required. An agent that cannot read a picture must still know what it shows. `src` names a file (SVG or PNG) the haimanager loads and fits; pixels never cross the protocol. Placed among controls it takes a preview-sized 16:9 slot; placed as a region's whole content, it takes the region. |
-| `divider` | `dir` | Purely visual, but cheap to keep. |
+| `divider` | `dir` | Purely visual, but cheap to keep. A hairline across a column, or down a row with `dir="vertical"`. |
 | `progress` | `value` or `indeterminate`, `label` | State an agent needs: is something still running? |
 
 ## Controls
@@ -146,8 +146,10 @@ A `password` field reports `value` as a masked placeholder in the agent's view, 
 | `checkbox` | `label` | `checked`, `disabled` | `focus` `check` `uncheck` `toggle` |
 | `radiogroup` | `label` | `disabled` | — |
 | `radio` | `label` | `checked`, `disabled` | `focus` `select` |
-| `select` | `label` | `value`, `disabled`, `open` | `focus` `open` `close` |
+| `select` | `label`, `placeholder` | `value`, `disabled`, `open` | `focus` `open` `close` |
 | `option` | `label`, `value` | `selected`, `disabled` | `select` |
+
+A `select` is a dropdown. Its `open` is the application's, like every other piece of state in its tree: the compositor asks with `open` and `close` events (a human pressing the box, or an agent's intent; both are unconditional, so one that is already that way sends nothing) and the application answers by re-rendering with `open="true"` and its `option` children, which then float below the box over whatever follows, painted after everything else in the window and hit-tested first. Pressing an option always reports `select` on it, even the one already chosen, because choosing is also what closes the list. A press anywhere else while it is open closes it and does nothing more. Closed, the options are nowhere: no rectangle, no actions, and `folded` from the compositor's point of view, so an agent's view lists them but offers no action until the list is open. Options carry ids, since an agent chooses one by naming it.
 | `slider` | `label`, `min`, `max`, `step` | `value`, `disabled` | `focus` `set-value` |
 
 `check` and `uncheck` exist alongside `toggle` deliberately. An agent that wants a box checked should say `check`, not `toggle`, so the outcome does not depend on a state it may have read a moment ago.
@@ -288,14 +290,14 @@ Ids should be meaningful (`send`, `recipient-field`) rather than positional (`bt
 
 ## Scope for Version One
 
-The full catalogue above is the target. Fourteen elements are enough to build the whole agentdesk shell and the first real applications:
+The full catalogue above is the target. Sixteen elements are enough to build the whole agentdesk shell and the first real applications:
 
 ```
 vstack  hstack  scroll  text  divider  icon  image
-button  field  editor  checkbox
+button  field  editor  checkbox  select  option
 list  item  dialog
 ```
 
 Everything else is additive. Nothing in the reduced set forecloses the rest, and no element should be built before an application actually needs it.
 
-`select`, `slider`, `table` and `tabs` are the ones most likely to be wanted next, in that order. Each needs renderer machinery the first twelve do not: overlay positioning and focus trapping for `select` and `menu`, drag tracking for `slider`, column sizing for `table`.
+`slider`, `table` and `tabs` are the ones most likely to be wanted next, in that order. Each needs renderer machinery the ones built so far do not: drag tracking for `slider`, column sizing for `table`. `select` is built; its overlay is the same machinery a dialog's is.

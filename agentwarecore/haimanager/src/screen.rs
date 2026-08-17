@@ -541,6 +541,13 @@ impl Screen {
     /// of a calculator. The clamps against the workspace are what a long list
     /// or a wide table runs into, and scrolling takes over from there.
     ///
+    /// An application whose top-level content is marked `grow` is saying the
+    /// window should have room, not just fit: a listing, a settings page, a
+    /// document. Such a window opens at half the workspace in each direction,
+    /// or its content's size if that is more. The proportion comes from the
+    /// display, not from the application, so the same tree opens larger on a
+    /// larger screen and no application carries a pixel size anywhere.
+    ///
     /// First trees only. An application that re-renders larger does not get to
     /// move a window the human may have already taken hold of.
     fn fit_window(&mut self, fd: RawFd, fonts: &Fonts) {
@@ -559,8 +566,12 @@ impl Screen {
             return;
         };
         let room_w = (area.x + area.w - window.rect.x - window_margin()).max(min_w);
-        let width = wanted.clamp(min_w, room_w);
-        let Some(content) = client.natural_height(fonts, width) else { return };
+        let roomy = client.wants_room();
+        let width = if roomy { wanted.max(area.w / 2) } else { wanted }.clamp(min_w, room_w);
+        let Some(mut content) = client.natural_height(fonts, width) else { return };
+        if roomy {
+            content = content.max(area.h / 2 - window_title_h());
+        }
 
         let Some(window) = self.workspaces[at].windows.iter_mut().find(|w| w.fd == fd) else {
             return;
