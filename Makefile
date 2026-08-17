@@ -8,7 +8,7 @@ TARGET := x86_64-unknown-linux-musl
 BIN_DIR := $(AW_CORE_DIR)/target/$(TARGET)/release
 APPS_BIN_DIR := $(AW_APPS_DIR)/target/$(TARGET)/release
 
-.PHONY: all build buildcore buildapps pack run selftest clean cleanstate
+.PHONY: all build buildcore buildapps pack run selftest clean cleanstate kernel kernelconfig
 
 # Guest display size. virtio-vga defaults to 1280x800 and the compositor takes
 # the driver's preferred mode, so these two numbers are the whole of it.
@@ -53,6 +53,34 @@ STATE_DRIVE := -drive file=$(STATE_IMG),if=virtio,format=raw
 # Default Target
 # ---------------------------------------------------------
 all: run
+
+# ---------------------------------------------------------
+# The kernel
+# ---------------------------------------------------------
+
+# kernel-build/ is the Linux tree as a submodule, pinned to a commit. Its
+# configuration is not the submodule's to keep: kernel/agentware.config is the
+# minimal defconfig for this machine (virtio-gpu, virtio-blk, evdev, ext4,
+# cgroup2, no modules), checked in here, and `make kernel` expands it into the
+# tree and builds bzImage. A fresh clone therefore needs the submodule and
+# this target, not a copy of anyone's build directory. `make kernelconfig`
+# goes the other way after `make -C kernel-build menuconfig`, so a change to
+# the configuration lands in the repository rather than in a build tree.
+KERNEL_CONFIG := kernel/agentware.config
+
+kernel: kernel-build/Makefile
+	cp $(KERNEL_CONFIG) kernel-build/.config
+	$(MAKE) -C kernel-build olddefconfig
+	$(MAKE) -C kernel-build -j$(shell nproc) bzImage
+
+kernelconfig:
+	$(MAKE) -C kernel-build savedefconfig
+	mv kernel-build/defconfig $(KERNEL_CONFIG)
+
+# The submodule, if it has not been fetched. Shallow, because the Linux
+# history is several gigabytes nobody here needs.
+kernel-build/Makefile:
+	git submodule update --init --depth 1 kernel-build
 
 # ---------------------------------------------------------
 # Build Targets
