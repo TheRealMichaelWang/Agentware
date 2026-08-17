@@ -1,0 +1,14 @@
+[package]
+name = "awkit"
+version = "0.1.0"
+edition = "2024"
+
+# The application toolkit: what an application links besides the protocol
+# crate. Today it holds one thing, the file dialogs, which every application
+# that opens or saves a document needs and none should write twice. It is a
+# library of models and renders in the same shape applications are written in,
+# not a service: a dialog is part of the application's own tree, drawn by the
+# compositor like everything else, and visible to an agent as part of that
+# application's view.
+[dependencies]
+awproto = { path = "../awproto" }

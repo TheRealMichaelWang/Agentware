@@ -24,6 +24,7 @@ obvious alternative was tried and failed.
 agentwarecore/          cargo workspace
   awproto/              the wires: control socket, display, agent, desk-agent turn;
                         and the one file contract, settings
+  awkit/                the app toolkit: models that render AWML; the dialogs
   supervisor/           PID 1: init, service table, spawn broker
     src/bin/            awtest awstubborn awctl awui: self-test stand-ins
   haimanager/           the compositor: DRM, input, AWML, layout, paint, clients
@@ -34,6 +35,8 @@ agentwarecore/          cargo workspace
   awagent/              stand-in per-turn worker: scripted, speaks both channels
 agentwareapps/          cargo workspace: first-party applications
   awcalc/               a calculator, the first real application
+  awfiles/              a file explorer, and where the shared dialogs are seen
+home/                   sample files, staged to /home (RAM, like everything)
 wallpapers/             SVG wallpapers, staged to /wallpapers
 initramfs/              staged image contents (build output, gitignored)
 tools/screenshot.py     boot, inject input, capture the screen as PNG
@@ -173,10 +176,48 @@ a transcript pinned to its end until the human scrolls away.
 
 First-party applications live in `agentwareapps/`, a separate workspace because
 apps are clients of the display protocol, not parts of the system: they link
-`awproto` and nothing else. `awcalc`, a pocket calculator, is the first and so
-far only one, and doubles as the reference for how an application is written: a
-model and a `render`, hand-written stable ids, no diffing, no ephemeral state.
-The demo agent turn drives it: 12 + 34, one press at a time, and reads back 46.
+`awproto`, plus `awkit` when they need a dialog, and nothing else. `awcalc`, a
+pocket calculator, is the first and the reference for how an application is
+written: a model and a `render`, hand-written stable ids, no diffing, no
+ephemeral state. `awfiles` is a file explorer: one folder at a time, every
+row a checkbox and a name, the checkbox marking the file or folder and the
+toolbar acting on what is marked (New folder, Rename, Copy to..., Move to...,
+Delete, Mark all). Marking is a checkbox rather than a modifier key because
+there are no modifier keys in the event vocabulary and should not be: an
+agent marks a file by naming its checkbox, exactly as a human does. Every
+question it asks is an `awkit` dialog. The demo agent has two scripts, picked
+by the prompt: one adds 12 + 34 on the calculator and reads back 46, and one
+whose prompt says "file" marks welcome.txt, opens Copy to..., is told
+`blocked` for a control behind the dialog, walks into notes and confirms.
+
+**A window opens at the size its content asks for.** AWML has no width to
+declare, so both are derived on the first tree (`ui::document_width`,
+`ui::natural_height`): the width is what the tree wants so every control sits
+inside its container at natural size (rows sum, columns take the widest, text
+counts up to a cap because it wraps, spacers count nothing), clamped between
+the resize minimum and the room left in the workspace; the height is the
+measure at that width. Rows measure each child at the slot it will really get,
+and a growing `scroll` measures as at least a few rows, so a browser opens
+with room to browse in rather than as a slit around its first two entries.
+First trees only: an app that re-renders larger does not move a window the
+human may hold.
+
+**Dialogs are in the app's tree** (`docs/UIElements.md`). An application with a
+question renders a `dialog` among its nodes and drops it when answered. The
+compositor floats it centred over the window and makes it modal for human and
+agent alike: outside controls are unreachable by click, focus jumps into the
+dialog, the agent's view marks them `blocked` with empty actions, and intents
+on them are rejected `blocked` (distinct from `disabled`). To the agent a
+dialog is controls nested in `<dialog>`, nothing more. `awkit` holds three:
+`FileDialog` (`open(dir)`, `save(dir, name)`, `folder(dir)`; `render()` gives
+the element, `accept(event)` answers `Ignored | Changed | Chosen(path) |
+Cancelled`), `Confirm` (a yes-or-no, `.danger()` for destructive), and
+`TextPrompt` (one line of text, `refuse(why)` to keep it open with a reason).
+Each owns its ids and answers `Ignored` for events that are not its own, so
+an app hands every event to its open dialog first. The file dialog reads the
+filesystem in-process because nothing is namespaced; the portal that hands
+back a descriptor instead is the later step and can keep this markup. A
+dialog's first text control opens with the caret at the end of its value.
 
 An installed app is a **package, not a binary**: `/apps/<name>/` holds `exec`
 (what the supervisor forks), `icon.svg` (what the compositor draws in the title
@@ -367,6 +408,10 @@ is the list so it does not get relitigated.
 * **The agent opens applications through its agentdesk**, never itself. It has
   no broker connection; `open-app` up the turn channel is a request, and the
   agent learns the outcome by asking the compositor what is open.
+* **A dialog belongs to the application's tree**, never to a separate process
+  or to chrome, so the agent sees it in the app's view as controls nested in
+  `<dialog>`. The compositor makes it modal for human and agent alike; there
+  is no attribute to opt out.
 
 `width` and `height` attributes on a control are compositor-internal sizing
 hints in physical pixels (the tab rename field keeps its tab's width; the

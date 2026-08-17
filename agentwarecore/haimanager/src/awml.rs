@@ -185,6 +185,49 @@ impl Tree {
         &self.nodes[index]
     }
 
+    /// The dialog in front, if the document has one open.
+    ///
+    /// A `dialog` is modal: while one is in the tree, everything outside it is
+    /// visible but inert, for the human and the agent alike. The last one in
+    /// document order is the one in front, so an app that opens a second on
+    /// top of the first gets what it would expect. There is no attribute for
+    /// this and no way to opt out, because a dialog that could be clicked
+    /// around is a dialog an agent could ignore, and the point of one is that
+    /// the choice it asks for is made before anything else happens.
+    pub fn modal(&self) -> Option<usize> {
+        (0..self.nodes.len())
+            .rev()
+            .find(|&index| self.nodes[index].tag == Tag::Dialog)
+    }
+
+    /// Whether a node is behind an open dialog: outside it while it is up.
+    pub fn blocked(&self, index: usize) -> bool {
+        match self.modal() {
+            Some(front) => !self.within(index, front),
+            None => false,
+        }
+    }
+
+    /// Whether `index` is `ancestor` or a descendant of it.
+    pub fn within(&self, index: usize, ancestor: usize) -> bool {
+        let mut at = Some(index);
+        while let Some(node) = at {
+            if node == ancestor {
+                return true;
+            }
+            at = self.nodes[node].parent;
+        }
+        false
+    }
+
+    /// Whether a node can take an action right now: not disabled by the
+    /// application, and not behind a dialog. The single predicate every
+    /// path checks, so a human's click, an agent's intent and the agent's
+    /// view cannot disagree about it.
+    pub fn inert(&self, index: usize) -> bool {
+        self.nodes[index].disabled() || self.blocked(index)
+    }
+
     /// The nearest value of an inheriting attribute, searching up the tree.
     ///
     /// Styling inherits so a window can set a font once rather than every
@@ -538,11 +581,17 @@ fn emit(tree: &Tree, index: usize, depth: usize, out: &mut String) {
     if node.disabled() {
         attrs.push_str(" disabled");
     }
+    // Behind an open dialog. Not the application's doing, so a separate word
+    // from `disabled`: the control is fine, something is in front of it, and
+    // dealing with the dialog is what brings it back.
+    if node.tag.is_control() && tree.blocked(index) {
+        attrs.push_str(" blocked");
+    }
     if let Some(description) = node.attr("description") {
         attrs.push_str(&format!(" description=\"{description}\""));
     }
     if node.tag.is_control() {
-        let actions = node.tag.actions(node.disabled()).join(" ");
+        let actions = node.tag.actions(tree.inert(index)).join(" ");
         attrs.push_str(&format!(" actions=\"{actions}\""));
     }
 

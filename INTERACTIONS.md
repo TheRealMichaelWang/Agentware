@@ -85,7 +85,9 @@ Step 4 is more literal than it sounds. Text is entered one character at a time, 
 
 If the agent could emit the event directly, every one of those steps would be skippable. An agent could "click" a disabled button, or one scrolled off screen, or one behind a dialog, and the app would receive something no human could have produced. The visible embodiment VISION.md promises would quietly stop being true.
 
-Because the steps can fail, **intents are rejectable**: `no such node`, `node is disabled`, `node is not visible`, `the human has taken over`. An agent that cannot be told no acts blind and retries forever.
+Because the steps can fail, **intents are rejectable**: `no such node`, `node is disabled`, `node is not visible`, `blocked` (behind a dialog the application has open), `the human has taken over`. An agent that cannot be told no acts blind and retries forever.
+
+**Dialogs are part of the application's tree**, and so of its view. An application that needs a choice made, a file to open or a name to save under, renders a `dialog` among its own nodes and takes it out when the answer is in; the compositor floats it over the window and makes everything outside it inert for the human and the agent alike, and the agent sees it as controls nested in `<dialog>`, nothing more. The dialogs every application shares come from `awkit`, a toolkit crate applications link beside the protocol crate: file and folder dialogs, a yes-or-no, and a line-of-text prompt, each a model that renders one `dialog` and answers the events that name its ids, so choosing a file, confirming a deletion or naming a folder is the same clicks in every application. It reads the filesystem in the application's own process, because nothing is namespaced yet; on the day it is, the same markup can front a picker the compositor brokers, handing back a descriptor rather than a path.
 
 ## The agentdesk and the haimanager
 

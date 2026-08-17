@@ -1,0 +1,1 @@
+A file explorer. Walks folders, marks files and folders, and makes, renames, copies, moves and deletes them, asking through the dialogs every application shares.

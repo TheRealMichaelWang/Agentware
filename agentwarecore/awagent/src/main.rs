@@ -5,11 +5,13 @@
 //! takes nothing with it, and it is never restarted, because restarting one
 //! would silently re-run side effects it had already performed.
 //!
-//! There is no model here. The script below is fixed, and it is chosen to walk
-//! every branch of the compositor's intent resolution: the ones that succeed,
-//! and each way one can be refused. A rejection is an answer, and an agent that
-//! cannot be told no acts blind and retries forever, so the refusals matter at
-//! least as much as the successes.
+//! There is no model here. Two scripts, and the prompt picks: one that mentions
+//! a file walks the file browser and its open dialog, anything else adds two
+//! numbers on the calculator. Both are chosen to walk every branch of the
+//! compositor's intent resolution: the ones that succeed, and each way one can
+//! be refused. A rejection is an answer, and an agent that cannot be told no
+//! acts blind and retries forever, so the refusals matter at least as much as
+//! the successes.
 //!
 //! Notice what this file cannot do. It never produces an event, only intents. It
 //! never names a workspace, because it has no way to name one and is never asked
@@ -83,15 +85,18 @@ fn main() {
     let mut agent = Agent { link, desk };
 
     // The context. A real agent would think about it; this one reports what
-    // it was given so the channel can be seen working end to end.
+    // it was given so the channel can be seen working end to end, and reads
+    // one word of it to pick which of its two scripts to run.
+    let mut prompt = String::new();
     if let Some(desk) = &mut agent.desk {
         match desk.context() {
-            Ok((history, prompt)) => {
+            Ok((history, text)) => {
                 let earlier = history.len();
                 agent.say(
                     turn::KIND_THOUGHT,
-                    &format!("read {earlier} earlier message(s); the prompt is {prompt:?}"),
+                    &format!("read {earlier} earlier message(s); the prompt is {text:?}"),
                 );
+                prompt = text;
             }
             Err(err) => {
                 log(&format!("could not read the context: {err}"));
@@ -100,9 +105,16 @@ fn main() {
         }
     }
 
-    // What is open. The answer is scoped to this agent's own workspace by the
-    // compositor, from what the supervisor told it at handoff. Nothing here
-    // asserts which workspace that is.
+    if prompt.to_lowercase().contains("file") {
+        files_turn(&mut agent);
+        return;
+    }
+    calculator_turn(&mut agent);
+}
+
+/// Make sure an application is open, asking the workspace for it if not, and
+/// waiting until the compositor says it is there. `false` if it never came.
+fn ensure_open(agent: &mut Agent, app: &str, label: &str) -> bool {
     let apps = match agent.link.apps() {
         Ok(markup) => markup,
         Err(err) => {
@@ -111,34 +123,168 @@ fn main() {
         }
     };
     report("apps", &apps);
+    if apps.contains(app) {
+        return true;
+    }
 
-    // The turn needs the calculator. If it is not open, ask the workspace to
-    // open it, then wait until the compositor says it is there.
-    if !apps.contains("awcalc") {
-        agent.say(turn::KIND_ACTION, "opening the calculator");
-        if let Some(desk) = &mut agent.desk
-            && let Err(err) = desk.open_app("awcalc")
-        {
-            log(&format!("could not ask for the calculator: {err}"));
-        }
-        let waited = Instant::now();
-        loop {
-            std::thread::sleep(THINKING);
-            match agent.link.apps() {
-                Ok(markup) if markup.contains("awcalc") => break,
-                Ok(_) if waited.elapsed() < OPENING => continue,
-                Ok(_) => {
-                    agent.say(turn::KIND_ERROR, "the calculator did not open");
-                    finish(&mut agent, "I could not open the calculator, so I could not add the numbers.");
-                    return;
-                }
-                Err(err) => {
-                    log(&format!("could not read the workspace: {err}"));
-                    std::process::exit(1);
-                }
+    agent.say(turn::KIND_ACTION, &format!("opening the {label}"));
+    if let Some(desk) = &mut agent.desk
+        && let Err(err) = desk.open_app(app)
+    {
+        log(&format!("could not ask for the {label}: {err}"));
+    }
+    let waited = Instant::now();
+    loop {
+        std::thread::sleep(THINKING);
+        match agent.link.apps() {
+            Ok(markup) if markup.contains(app) => break,
+            Ok(_) if waited.elapsed() < OPENING => continue,
+            Ok(_) => {
+                agent.say(turn::KIND_ERROR, &format!("the {label} did not open"));
+                return false;
+            }
+            Err(err) => {
+                log(&format!("could not read the workspace: {err}"));
+                std::process::exit(1);
             }
         }
-        agent.say(turn::KIND_RESULT, "the calculator is open");
+    }
+    agent.say(turn::KIND_RESULT, &format!("the {label} is open"));
+    true
+}
+
+/// One intent, told to the human, with the outcome as a string.
+fn act(agent: &mut Agent, app: &str, action: &str, target: &str, value: &str) -> String {
+    std::thread::sleep(THINKING);
+    let outcome = match agent.link.act(app, action, target, value) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            log(&format!("connection failed: {err}"));
+            std::process::exit(1);
+        }
+    };
+    let got = match &outcome {
+        Outcome::Done => "done".to_owned(),
+        Outcome::Rejected(reason) => reason.clone(),
+    };
+    let what = if value.is_empty() {
+        format!("{action} {target} in {app}")
+    } else {
+        format!("{action} {value:?} into {target} in {app}")
+    };
+    agent.say(turn::KIND_ACTION, &format!("{what}: {got}"));
+    got
+}
+
+/// The file script: open the explorer, mark a file, copy it into a folder
+/// chosen through the dialog.
+///
+/// This is the dialog contract seen from the agent's side. The dialog is
+/// controls nested in `<dialog>` in the explorer's own view, so choosing a
+/// folder is reading the view and clicking what it lists; and while the
+/// dialog is up, the explorer's own controls answer `blocked`, which is the
+/// compositor keeping the agent to the same rule the human is under.
+fn files_turn(agent: &mut Agent) {
+    if !ensure_open(agent, "awfiles", "file explorer") {
+        finish(agent, "I could not open the file explorer.");
+        return;
+    }
+
+    let view = |agent: &mut Agent, why: &str| -> String {
+        match agent.link.view("awfiles") {
+            Ok(markup) => {
+                report(why, &markup);
+                markup
+            }
+            Err(err) => {
+                log(&format!("could not read awfiles: {err}"));
+                String::new()
+            }
+        }
+    };
+
+    // Mark welcome.txt. A checkbox, so `check`: unconditional, and the
+    // compositor turns it into a toggle only if the box is not already checked.
+    let markup = view(agent, "view awfiles");
+    let Some(mark) = find_control(&markup, |d| d.starts_with("Marks the file welcome.txt")) else {
+        finish(agent, "I could not find welcome.txt to mark.");
+        return;
+    };
+    agent.say(turn::KIND_THOUGHT, "marking welcome.txt, then copying it into notes");
+    act(agent, "awfiles", "check", &mark, "");
+    act(agent, "awfiles", "click", "copy-to", "");
+
+    let markup = view(agent, "view awfiles with the dialog open");
+    let dialog_seen = markup.contains("<dialog");
+    agent.say(
+        turn::KIND_RESULT,
+        if dialog_seen { "the view shows a <dialog> asking for a folder" } else { "no dialog in the view" },
+    );
+
+    // The explorer's own Up is behind the dialog now. Told `blocked`, not
+    // `disabled`: the control is fine, something is in front of it.
+    let blocked = act(agent, "awfiles", "click", "up", "");
+    if blocked != "blocked" {
+        agent.say(turn::KIND_ERROR, &format!("expected blocked for a control behind the dialog, got {blocked}"));
+    }
+
+    // Into notes, then choose it.
+    if let Some(folder) = find_control(&markup, |d| d == "Enters the folder notes") {
+        act(agent, "awfiles", "click", &folder, "");
+    }
+    act(agent, "awfiles", "click", "file-dialog-confirm", "");
+
+    let after = view(agent, "view awfiles after the dialog");
+    let dialog_gone = !after.contains("<dialog");
+    let copied = after.contains("copied 1 item(s) to /home/notes");
+    agent.say(
+        turn::KIND_RESULT,
+        if dialog_gone { "the dialog is gone and the explorer answers again" } else { "the dialog is still up" },
+    );
+
+    let reply = match (dialog_gone, copied) {
+        (true, true) => "Copied welcome.txt into notes through the folder dialog.".to_owned(),
+        (true, false) => "The dialog closed, but the explorer does not say the copy happened.".to_owned(),
+        (false, _) => "The dialog did not close.".to_owned(),
+    };
+    finish(agent, &reply);
+}
+
+/// The id of the first control in a view whose description satisfies `wanted`
+/// and that can currently be acted on. The action list is the authority: a
+/// control that is disabled, or behind a dialog, has an empty one, and an
+/// agent that reads it never sends an intent that will be refused.
+fn find_control(view: &str, wanted: impl Fn(&str) -> bool) -> Option<String> {
+    view.lines().find_map(|line| {
+        let description = attribute(line, "description")?;
+        let actions = attribute(line, "actions")?;
+        (wanted(&description) && !actions.is_empty())
+            .then(|| attribute(line, "id"))
+            .flatten()
+    })
+}
+
+/// One attribute's value out of a line of markup. Enough of a parser for a
+/// view the compositor wrote; a real agent would have a real one.
+fn attribute(line: &str, name: &str) -> Option<String> {
+    let start = line.find(&format!(" {name}=\""))? + name.len() + 3;
+    let end = line[start..].find('"')? + start;
+    Some(unescape(&line[start..end]))
+}
+
+fn unescape(text: &str) -> String {
+    text.replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// The calculator script: 12 + 34, one press at a time.
+fn calculator_turn(agent: &mut Agent) {
+    if !ensure_open(agent, "awcalc", "calculator") {
+        finish(agent, "I could not open the calculator, so I could not add the numbers.");
+        return;
     }
 
     match agent.link.view("awcalc") {
@@ -183,31 +329,10 @@ fn main() {
 
     let mut surprises = 0;
     for &(app, action, target, value, expected) in script {
-        std::thread::sleep(THINKING);
-
-        let outcome = match agent.link.act(app, action, target, value) {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                log(&format!("connection failed: {err}"));
-                std::process::exit(1);
-            }
-        };
-
-        let got = match &outcome {
-            Outcome::Done => "done".to_owned(),
-            Outcome::Rejected(reason) => reason.clone(),
-        };
-
-        let what = if value.is_empty() {
-            format!("{action} {target} in {app}")
-        } else {
-            format!("{action} {value:?} into {target} in {app}")
-        };
-        if got == expected {
-            agent.say(turn::KIND_ACTION, &format!("{what}: {got}"));
-        } else {
+        let got = act(agent, app, action, target, value);
+        if got != expected {
             surprises += 1;
-            agent.say(turn::KIND_ERROR, &format!("{what}: {got}, expected {expected}"));
+            agent.say(turn::KIND_ERROR, &format!("{action} {target}: expected {expected}, got {got}"));
         }
     }
 
@@ -236,7 +361,7 @@ fn main() {
     } else {
         "turn complete with surprises"
     });
-    finish(&mut agent, &reply);
+    finish(agent, &reply);
 }
 
 /// The reply ends the turn. The agentdesk sees the hangup when this process

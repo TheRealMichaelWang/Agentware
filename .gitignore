@@ -4,3 +4,6 @@ target/
 initramfs.cpio.gz
 initramfs/init
 initramfs/bin/
+initramfs/apps/
+initramfs/wallpapers/
+initramfs/home/

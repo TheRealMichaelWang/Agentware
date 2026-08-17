@@ -1,11 +1,11 @@
 # First-party applications. A separate workspace from agentwarecore because
 # apps are clients of the display protocol, not parts of the system: they link
-# awproto and nothing else, and none of them may know the compositor's
-# internals. Keeping them out of the core workspace makes that boundary a
+# awproto, and awkit when they need a dialog, and none of them may know the
+# compositor's internals. Keeping them out of the core workspace makes that boundary a
 # directory rather than a convention.
 [workspace]
 resolver = "3"
-members = ["awcalc"]
+members = ["awcalc", "awfiles"]
 
 [profile.release]
 opt-level = "z"

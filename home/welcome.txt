@@ -1,0 +1,11 @@
+Welcome to Agentware.
+
+This is /home, the folder the file browser opens in. Everything here lives in
+memory: the whole system boots from an image into RAM and nothing is written to
+a disk, so what you make here lasts until the machine is switched off. That is
+by choice, for now.
+
+The file explorer (Files, in the start menu) walks folders and marks files and
+folders to rename, copy, move or delete. Every question it asks, where to,
+whether to, what name, is a dialog every application shares, so an agent that
+has learned them in one application has learned them in all of them.

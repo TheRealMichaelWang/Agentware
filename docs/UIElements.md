@@ -173,10 +173,12 @@ A `password` field reports `value` as a masked placeholder in the agent's view, 
 | --- | --- | --- | --- |
 | `menu` | `label` | `open` | `open` `close` |
 | `menuitem` | `label`, `icon` | `disabled` | `focus` `click` |
-| `dialog` | `title`, `dismissible` | `open` | `dismiss` |
+| `dialog` | `label` | — | — |
 | `popover` | `label` | `open` | `close` |
 
-A `dialog` is modal: while one is open, controls beneath it are not hit-testable, and intents naming them are rejected as not visible. This is a genuine safety property, not a rendering detail — it stops an agent acting on a screen the human has been interrupted away from.
+A `dialog` is a container an application puts in its tree when it has a question, and takes out when the question is answered: there is no `open` state and no `dismiss` action, because the application decides both by what it renders, and its own Cancel button is what dismissal is. The compositor floats it centred over the window and makes it **modal**: while one is in the tree, every control outside it is visible but inert, for the human and the agent alike. The human's clicks do not reach them, the keyboard follows focus into the dialog, and in the agent's view they carry `blocked` with an empty action list; an intent naming one is rejected as `blocked`, told apart from `disabled` so the agent knows to look for the dialog rather than wait for the application. To the agent a dialog is nothing special: controls nested in `<dialog label="...">`, read and acted on like any others. This is a genuine safety property, not a rendering detail. It stops an agent acting on a screen the human has been interrupted away from, and it means an agent that has learned one dialog has learned them all.
+
+`awkit` holds the shared ones: `FileDialog` for a file to open, a name to save under, or a folder; `Confirm` for a yes-or-no; `TextPrompt` for a line of text. Each is a model every application embeds the same way, so choosing a file, confirming a deletion or naming a folder is the same clicks in every application that asks.
 
 ## The Action Vocabulary
 
@@ -197,7 +199,6 @@ The complete closed set. Nothing else exists.
 | `set-value` | number | Set a numeric value. |
 | `open` | — | Expand a menu, dropdown or popover. |
 | `close` | — | Collapse it. |
-| `dismiss` | — | Close a dialog. |
 | `scroll-into-view` | — | Make a node visible. Any node, not just controls. |
 
 ### `scroll-into-view` is special

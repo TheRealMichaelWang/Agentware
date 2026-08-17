@@ -528,24 +528,23 @@ impl Screen {
         Rect::new(area.x + window_margin() + step, area.y + window_margin() + step, min_w, min_h)
     }
 
-    /// Size a window to what its content asks for, at the narrowest width a
-    /// resize would allow.
+    /// Size a window to what its content asks for.
     ///
-    /// Runs once per client, when its first tree arrives. The width is the
-    /// resize minimum rather than anything measured, because AWML describes
-    /// affordances rather than arrangement and has no natural width to ask for;
-    /// the height is the measure pass at that width plus the title bar, so
-    /// every element is visible without dead room below. The clamp against the
-    /// workspace is what a long list runs into, and its scroll container takes
-    /// over from there.
+    /// Runs once per client, when its first tree arrives. The width is what
+    /// the tree wants so that every control sits inside its container at its
+    /// natural size, never narrower than a resize would allow and never wider
+    /// than the workspace leaves room for; the height is the measure pass at
+    /// that width plus the title bar, so every element is visible without
+    /// dead room below. AWML describes affordances rather than arrangement,
+    /// so both are derived from the content, and a window with a wide row of
+    /// buttons opens wide enough for the row while a calculator opens the size
+    /// of a calculator. The clamps against the workspace are what a long list
+    /// or a wide table runs into, and scrolling takes over from there.
     ///
-    /// First trees only. An application that re-renders taller does not get to
+    /// First trees only. An application that re-renders larger does not get to
     /// move a window the human may have already taken hold of.
     fn fit_window(&mut self, fd: RawFd, fonts: &Fonts) {
         let (min_w, min_h) = min_window();
-        let Some(content) = self.client(fd).and_then(|c| c.natural_height(fonts, min_w)) else {
-            return;
-        };
         let Some(at) = self
             .workspaces
             .iter()
@@ -553,18 +552,25 @@ impl Screen {
         else {
             return;
         };
-
         let area = self.window_area(at);
+        let Some(client) = self.client(fd) else { return };
+        let Some(wanted) = client.natural_width(fonts) else { return };
+        let Some(window) = self.workspaces[at].windows.iter().find(|w| w.fd == fd) else {
+            return;
+        };
+        let room_w = (area.x + area.w - window.rect.x - window_margin()).max(min_w);
+        let width = wanted.clamp(min_w, room_w);
+        let Some(content) = client.natural_height(fonts, width) else { return };
+
         let Some(window) = self.workspaces[at].windows.iter_mut().find(|w| w.fd == fd) else {
             return;
         };
         if window.maximized {
             return;
         }
-
-        let room = (area.y + area.h - window.rect.y).max(min_h);
-        window.rect.w = min_w;
-        window.rect.h = (content + window_title_h()).clamp(min_h, room);
+        let room_h = (area.y + area.h - window.rect.y - window_margin()).max(min_h);
+        window.rect.w = width;
+        window.rect.h = (content + window_title_h()).clamp(min_h, room_h);
         window.restored = window.rect;
         self.reframe(fonts);
     }
@@ -1610,6 +1616,13 @@ impl Screen {
 
         if client.is_disabled(index) {
             self.refuse(from, &app, &target, agent::REASON_DISABLED);
+            return false;
+        }
+        // Behind a dialog. The view said so too: its actions were empty and
+        // it was marked, so an agent that reads before it acts never gets
+        // here, and one that does not is told what to deal with first.
+        if client.is_blocked(index) {
+            self.refuse(from, &app, &target, agent::REASON_BLOCKED);
             return false;
         }
         if client.needs_approval(index) {

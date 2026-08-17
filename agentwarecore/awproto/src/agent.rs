@@ -70,6 +70,11 @@ pub const REASON_DISABLED: &str = "disabled";
 /// behind another window is not a reason an agent can ever receive: acting on
 /// an app arranges its window to the front first.
 pub const REASON_NOT_VISIBLE: &str = "not-visible";
+/// Behind an open dialog. The control is fine and the application did not
+/// disable it; something modal is in front, and answering that is what brings
+/// it back. Told apart from `disabled` so the agent knows to look for the
+/// dialog rather than wait for the application.
+pub const REASON_BLOCKED: &str = "blocked";
 /// The element does not offer that action in its current state. The action list
 /// in the view is the authority, and it is derived rather than declared.
 pub const REASON_UNSUPPORTED: &str = "unsupported-action";

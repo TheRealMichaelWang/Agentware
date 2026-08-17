@@ -355,6 +355,40 @@ impl Client {
             self.focus = None;
         }
 
+        // A dialog that has just appeared takes the keyboard: focus moves to
+        // its first control, unless focus is already inside it. What a dialog
+        // asks for is the next thing to type, and a caret left blinking in a
+        // field behind it would be a caret nothing reaches.
+        if let Some(front) = next.tree.modal() {
+            let inside = self
+                .focus
+                .as_ref()
+                .and_then(|key| next.index_of(key))
+                .is_some_and(|index| next.tree.within(index, front));
+            if !inside {
+                let first = (front..next.tree.nodes.len()).find(|&index| {
+                    next.tree.within(index, front)
+                        && next.tree.node(index).tag.is_control()
+                        && !next.tree.node(index).disabled()
+                });
+                self.focus = first.map(|index| next.key(index).to_owned());
+                // A text control that opens with a value in it opens with the
+                // caret at the end: what a dialog offers to be edited is
+                // appended to or replaced, not typed into the front of.
+                if let Some(index) = first
+                    && matches!(next.tree.node(index).tag, Tag::Field | Tag::Editor)
+                {
+                    let value = next.tree.node(index).attr("value").unwrap_or("").to_owned();
+                    let key = next.key(index).to_owned();
+                    self.editing.entry(key).or_insert(Editing {
+                        caret: value.chars().count(),
+                        value,
+                        outstanding: Vec::new(),
+                    });
+                }
+            }
+        }
+
         self.scroll.retain(|key, _| next.has_key(key));
         self.editing.retain(|key, _| next.has_key(key));
 
@@ -395,6 +429,11 @@ impl Client {
     /// before its first tree has arrived.
     pub fn natural_height(&self, fonts: &Fonts, width: i32) -> Option<i32> {
         self.doc.as_ref().map(|doc| ui::natural_height(fonts, &doc.tree, width))
+    }
+
+    /// How wide the tree wants to be so nothing in it is squeezed.
+    pub fn natural_width(&self, fonts: &Fonts) -> Option<i32> {
+        self.doc.as_ref().map(|doc| ui::document_width(fonts, &doc.tree))
     }
 
     /// Move or resize this client's part of the screen.
@@ -675,6 +714,9 @@ impl Client {
         if disabled {
             return Err(agent::REASON_DISABLED);
         }
+        if doc.tree.blocked(index) {
+            return Err(agent::REASON_BLOCKED);
+        }
         if !tag.actions(disabled).contains(&action) {
             return Err(agent::REASON_UNSUPPORTED);
         }
@@ -797,6 +839,11 @@ impl Client {
             .is_some_and(|doc| doc.tree.node(index).disabled())
     }
 
+    /// Whether a node is behind an open dialog.
+    pub fn is_blocked(&self, index: usize) -> bool {
+        self.doc.as_ref().is_some_and(|doc| doc.tree.blocked(index))
+    }
+
     /// Whether the application declared that a human must approve this control
     /// before an agent may act on it.
     ///
@@ -897,6 +944,10 @@ impl Client {
         let Some(doc) = &self.doc else { return false };
         let Some(focus_key) = self.focus.clone() else { return false };
         let Some(index) = doc.index_of(&focus_key) else { return false };
+        // A control behind a dialog keeps its focus ring but not the keyboard.
+        if doc.tree.blocked(index) {
+            return false;
+        }
 
         let node = doc.tree.node(index);
         let tag = node.tag;
@@ -977,7 +1028,7 @@ impl Client {
         let order: Vec<usize> = (0..doc.tree.nodes.len())
             .filter(|&index| {
                 let node = doc.tree.node(index);
-                node.tag.is_control() && !node.disabled() && self.layout.is_visible(index)
+                node.tag.is_control() && !doc.tree.inert(index) && self.layout.is_visible(index)
             })
             .collect();
         if order.is_empty() {

@@ -581,6 +581,23 @@ impl Canvas {
         }
     }
 
+    /// Darken a rectangle by blending black over it at `alpha`, clipped.
+    ///
+    /// The scrim under a modal dialog. A per-pixel blend, so it is paid only
+    /// while a dialog is open, over the one window that has one.
+    pub fn dim(&mut self, rect: Rect, alpha: u8) {
+        let Some(area) = self.clip.intersect(&rect) else { return };
+        let keep = 255 - alpha as u32;
+        for y in area.y..area.y + area.h {
+            let start = (y * self.width + area.x) as usize;
+            for pixel in &mut self.pixels[start..start + area.w as usize] {
+                let p = *pixel;
+                let ch = |shift: u32| (((p >> shift) & 0xff) * keep / 255) << shift;
+                *pixel = ch(16) | ch(8) | ch(0);
+            }
+        }
+    }
+
     /// Copy an opaque bitmap with its top-left corner at `x`, `y`, clipped.
     ///
     /// Row copies and nothing else: this is the wallpaper's path, and a

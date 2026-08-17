@@ -1,0 +1,8 @@
+[package]
+name = "awfiles"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+awproto = { path = "../../agentwarecore/awproto" }
+awkit = { path = "../../agentwarecore/awkit" }

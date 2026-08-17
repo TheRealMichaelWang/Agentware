@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["awproto", "supervisor", "haimanager", "agentdesk", "awagent", "awsettings"]
+members = ["awproto", "awkit", "supervisor", "haimanager", "agentdesk", "awagent", "awsettings"]
 
 [profile.release]
 opt-level = "z"

@@ -10,6 +10,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "awfiles"
+version = "0.1.0"
+dependencies = [
+ "awkit",
+ "awproto",
+]
+
+[[package]]
+name = "awkit"
+version = "0.1.0"
+dependencies = [
+ "awproto",
+]
+
+[[package]]
 name = "awproto"
 version = "0.1.0"
 dependencies = [

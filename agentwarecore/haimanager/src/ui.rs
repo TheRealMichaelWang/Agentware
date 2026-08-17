@@ -123,6 +123,10 @@ fn tile_icon() -> i32 { sc(28) }
 fn tile_pad() -> i32 { sc(10) }
 /// The icon beside a button's label, when it has one.
 fn button_icon() -> i32 { sc(16) }
+/// How wide a dialog is, floating over its window. Fixed rather than fitted,
+/// because a dialog is a form and forms read best at one width; a window
+/// narrower than this gets a dialog as wide as itself.
+fn dialog_w() -> i32 { sc(460) }
 /// An image that is not filling a region is this wide, at 16:9. AWML has no
 /// natural size to ask a picture for, so a picture placed among controls takes
 /// a slot the size of a preview; one that fills a region takes the region.
@@ -386,6 +390,10 @@ impl Layout {
 
     /// The innermost node at a point that an agent or a human could act on.
     ///
+    /// Nothing behind an open dialog answers, however visible it is: that is
+    /// what makes the dialog modal for the human, and the agent's view says
+    /// the same thing about the same nodes.
+    ///
     /// Walked in reverse so later siblings, which paint on top, win. Layout
     /// elements are skipped: clicking the gap between two buttons should hit
     /// nothing, not the stack that arranged them. A node scrolled outside its
@@ -393,7 +401,11 @@ impl Layout {
     pub fn hit(&self, tree: &Tree, x: i32, y: i32) -> Option<usize> {
         (0..tree.nodes.len())
             .rev()
-            .find(|&index| tree.node(index).tag.is_control() && self.visible_at(index, x, y))
+            .find(|&index| {
+                tree.node(index).tag.is_control()
+                    && !tree.blocked(index)
+                    && self.visible_at(index, x, y)
+            })
     }
 
     /// Where a node is on screen, for driving the fake cursor to it.
@@ -541,12 +553,45 @@ fn measure(fonts: &Fonts, tree: &Tree, index: usize, width: i32) -> i32 {
         Tag::Checkbox => control_height(fonts, tree, index).max(checkbox_size()),
         Tag::Editor => line_height(fonts, tree, index) * EDITOR_LINES + control_pad() * 2,
 
-        Tag::HStack => node
-            .children
-            .iter()
-            .map(|&child| measure(fonts, tree, child, width))
-            .max()
-            .unwrap_or(0),
+        // A row is as tall as its tallest child, each measured at the width
+        // the row will actually give it: fixed children their natural width,
+        // growers an equal share of what is left. Measuring every child at
+        // the row's full width undercounted a paragraph in a narrow slot and
+        // let it spill out of the row.
+        Tag::HStack => {
+            let gap = gap_of(node);
+            let growers = node.children.iter().filter(|&&c| tree.node(c).flag("grow")).count() as i32;
+            let fixed: i32 = node
+                .children
+                .iter()
+                .filter(|&&c| !tree.node(c).flag("grow"))
+                .map(|&c| natural_width(fonts, tree, c))
+                .sum();
+            let gaps = gap * (node.children.len().saturating_sub(1)) as i32;
+            let each = if growers > 0 { ((width - fixed - gaps).max(0)) / growers } else { 0 };
+            node.children
+                .iter()
+                .map(|&child| {
+                    let slot = if tree.node(child).flag("grow") {
+                        each
+                    } else {
+                        natural_width(fonts, tree, child)
+                    };
+                    measure(fonts, tree, child, slot)
+                })
+                .max()
+                .unwrap_or(0)
+        }
+
+        // A scroll container that grows is a viewport onto its content, and a
+        // viewport sized to less than a few rows is a viewport onto nothing.
+        // It measures as its content, so a window fits it, but never as less
+        // than a few rows, so a browser or a list opens with room to browse
+        // in rather than as a slit the size of its first two entries.
+        Tag::Scroll if node.flag("grow") => {
+            let content = measure_children(fonts, tree, node, width);
+            content.max(viewport_min())
+        }
 
         // Everything else stacks vertically: the children's heights plus the
         // gaps between them, plus padding for anything that insets.
@@ -556,17 +601,8 @@ fn measure(fonts: &Fonts, tree: &Tree, index: usize, width: i32) -> i32 {
         // once something gives it less than that, which is what `grow` does.
         _ => {
             let padding = if padded(node) { padding() * 2 } else { 0 };
-            let inner = width - padding;
             let gap = gap_of(node);
-
-            let mut height = 0;
-            for (position, &child) in node.children.iter().enumerate() {
-                if position > 0 {
-                    height += gap;
-                }
-                height += measure(fonts, tree, child, inner);
-            }
-
+            let height = measure_children(fonts, tree, node, width - padding);
             let title = if titled(node.tag) && node.attr("label").is_some() {
                 label_height(fonts, tree, index) + gap
             } else {
@@ -575,6 +611,26 @@ fn measure(fonts: &Fonts, tree: &Tree, index: usize, width: i32) -> i32 {
             height + padding + title
         }
     }
+}
+
+/// The height of a node's children stacked, with the gaps between them.
+fn measure_children(fonts: &Fonts, tree: &Tree, node: &Node, inner: i32) -> i32 {
+    let gap = gap_of(node);
+    let mut height = 0;
+    let mut position = 0;
+    for &child in &node.children {
+        // A dialog floats over its window rather than stacking in it, so it
+        // adds nothing to the window's height.
+        if node.tag == Tag::Window && tree.node(child).tag == Tag::Dialog {
+            continue;
+        }
+        if position > 0 {
+            height += gap;
+        }
+        position += 1;
+        height += measure(fonts, tree, child, inner);
+    }
+    height
 }
 
 struct Placer<'a> {
@@ -649,12 +705,34 @@ impl Placer<'_> {
         }
 
         let gap = gap_of(node);
-        let children = node.children.clone();
+        let mut children = node.children.clone();
         let inside = if clipping(tag) {
             clip.intersect(&area).unwrap_or(Rect::new(area.x, area.y, 0, 0))
         } else {
             clip
         };
+
+        // A window's dialogs float over its content, centred, rather than
+        // stacking below it. They are pulled out of the flow here and placed
+        // after the rest, at a dialog's width and their own height, so an
+        // application opens one by adding it to its tree and closes one by
+        // leaving it out, and never says where it goes.
+        if tag == Tag::Window {
+            let dialogs: Vec<usize> = children
+                .iter()
+                .copied()
+                .filter(|&child| tree.node(child).tag == Tag::Dialog)
+                .collect();
+            children.retain(|child| tree.node(*child).tag != Tag::Dialog);
+            self.place_column(&children, inner, gap, inside);
+            for dialog in dialogs {
+                let w = dialog_w().min(inner.w);
+                let h = measure(self.fonts, &self.doc.tree, dialog, w).min(inner.h);
+                let rect = Rect::new(inner.x + (inner.w - w) / 2, inner.y + (inner.h - h) / 2, w, h);
+                self.place(dialog, rect, inside);
+            }
+            return;
+        }
 
         if tag == Tag::HStack {
             self.place_row(&children, inner, gap, inside);
@@ -798,6 +876,64 @@ pub fn natural_height(fonts: &Fonts, tree: &Tree, width: i32) -> i32 {
     measure(fonts, tree, Tree::ROOT, width)
 }
 
+/// How wide a whole document wants to be so that nothing in it is squeezed.
+///
+/// The width sibling of [`natural_height`], for the same one caller: sizing a
+/// window to its content when the first tree arrives. AWML describes
+/// affordances rather than arrangement and has no width to declare, so this
+/// is derived: a row wants the sum of what its children want, a column wants
+/// the widest of them, a control wants its label and its padding, and text
+/// wants its own length up to a cap, because text wraps and a paragraph must
+/// not size a window to its longest line. A spacer wants nothing. What comes
+/// out is the narrowest width at which every control sits inside its
+/// container at its natural size, which is what a window should open at.
+pub fn document_width(fonts: &Fonts, tree: &Tree) -> i32 {
+    wanted_width(fonts, tree, Tree::ROOT)
+}
+
+/// The most a run of text asks a window for. Longer text wraps.
+fn text_cap() -> i32 { sc(320) }
+/// The least a growing scroll container measures as: a few rows of content.
+fn viewport_min() -> i32 { sc(180) }
+
+fn wanted_width(fonts: &Fonts, tree: &Tree, index: usize) -> i32 {
+    let node = tree.node(index);
+    let style = style_at(tree, index);
+    let children = |skip_dialogs: bool| {
+        node.children
+            .iter()
+            .copied()
+            .filter(move |&child| !(skip_dialogs && tree.node(child).tag == Tag::Dialog))
+            .map(|child| wanted_width(fonts, tree, child))
+    };
+    match node.tag {
+        Tag::Text | Tag::Icon => {
+            let label = label_of(node);
+            if label.trim().is_empty() {
+                0
+            } else {
+                fonts.measure(label, &style).min(text_cap())
+            }
+        }
+        Tag::Divider => 0,
+        Tag::Image | Tag::Button | Tag::Field | Tag::Editor | Tag::Checkbox | Tag::Item => {
+            natural_width(fonts, tree, index)
+        }
+        Tag::HStack => {
+            let gaps = gap_of(node) * (node.children.len().saturating_sub(1)) as i32;
+            children(false).sum::<i32>() + gaps
+        }
+        // A dialog floats and sizes itself, so it asks the window for
+        // nothing; the window's own content is what the window is for.
+        Tag::Window => {
+            let widest = children(true).max().unwrap_or(0);
+            widest + if padded(node) { padding() * 2 } else { 0 }
+        }
+        Tag::Dialog => children(false).max().unwrap_or(0) + padding() * 2,
+        _ => children(false).max().unwrap_or(0),
+    }
+}
+
 /// How wide a node is when it is not being stretched.
 fn natural_width(fonts: &Fonts, tree: &Tree, index: usize) -> i32 {
     let node = tree.node(index);
@@ -823,6 +959,7 @@ fn natural_width(fonts: &Fonts, tree: &Tree, index: usize) -> i32 {
             fonts.measure(label_of(node), &style) + button_pad() * 2 + icon
         }
         Tag::Checkbox => checkbox_size() + 8 + fonts.measure(label_of(node), &style),
+        Tag::Item => fonts.measure(label_of(node), &style) + control_pad() * 2,
         // A text entry that is not told to grow is the width of a search box:
         // room for a sentence, which is what one in a row is for.
         Tag::Field | Tag::Editor => sc(260),
@@ -1002,10 +1139,17 @@ fn paint_node(
     canvas.clipped(clip, |canvas| match node.tag {
         Tag::Window => canvas.fill_rect(rect, BACKGROUND),
 
+        // Text sits in the vertical middle of whatever box it was given. In a
+        // column the box is exactly its lines and this changes nothing; in a
+        // row beside buttons the box is the row's height, and a label at the
+        // top of it reads as misplaced next to controls whose text is centred.
         Tag::Text => {
             let step = fonts.line_height(&style);
-            for (row, line) in wrap(fonts, label_of(node), &style, rect.w).into_iter().enumerate() {
-                canvas.draw_text(fonts, line, rect.x, rect.y + row as i32 * step, &style, ink);
+            let lines = wrap(fonts, label_of(node), &style, rect.w);
+            let block = lines.len() as i32 * step;
+            let top = rect.y + ((rect.h - block) / 2).max(0);
+            for (row, line) in lines.into_iter().enumerate() {
+                canvas.draw_text(fonts, line, rect.x, top + row as i32 * step, &style, ink);
             }
         }
 
@@ -1034,7 +1178,7 @@ fn paint_node(
                 fonts,
                 node.attr("alt").unwrap_or("?"),
                 rect.x,
-                rect.y,
+                centred(rect.h),
                 &style,
                 MUTED,
             );
@@ -1231,8 +1375,28 @@ fn paint_node(
         Tag::VStack | Tag::HStack | Tag::Scroll => {}
     });
 
-    for &child in &tree.node(index).children {
-        paint_node(canvas, fonts, images, tree, layout, child, focus);
+    // Children in order, except that a window's dialogs go last, over the
+    // content they float above, with the content dimmed under them so what is
+    // inert looks inert.
+    let node = tree.node(index);
+    if node.tag == Tag::Window {
+        for &child in &node.children {
+            if tree.node(child).tag != Tag::Dialog {
+                paint_node(canvas, fonts, images, tree, layout, child, focus);
+            }
+        }
+        let dialogs: Vec<usize> =
+            node.children.iter().copied().filter(|&c| tree.node(c).tag == Tag::Dialog).collect();
+        if !dialogs.is_empty() {
+            canvas.clipped(clip, |canvas| canvas.dim(rect, 96));
+        }
+        for child in dialogs {
+            paint_node(canvas, fonts, images, tree, layout, child, focus);
+        }
+    } else {
+        for &child in &node.children {
+            paint_node(canvas, fonts, images, tree, layout, child, focus);
+        }
     }
 
     if node.tag == Tag::Scroll {
