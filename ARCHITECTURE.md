@@ -8,18 +8,22 @@ This document covers what the processes are and how long they live. INTERACTIONS
 The `agentwarecore` repository is structured to separate the boot-critical supervisor from the graphical and application subsystems:
 * `supervisor/` - The PID 1 bare-metal init system and spawn broker.
 * `haimanager/` - The Human-Agent Interface Manager: the window manager, markup parser, and renderer.
-* `startmenu/` - The home screen: a prompt bar, a button for creating an empty agentdesk, and the list of open ones. It launches workspaces, never apps, and holds no workspace of its own.
-* `agentdesk/` - The workspace process. One per open agentdesk, owning that workspace's apps, conversation history, and UI state.
-* `agent/` - The per-turn worker. Spawned to execute one prompt and gone when that prompt is finished.
+* `agentdesk/` - The workspace process. One per open agentdesk, owning that workspace's conversation history, its taskbar, and the opening of applications on its agent's behalf.
+* `awsettings/` - The settings application. In this workspace rather than `agentwareapps` because what it edits is system state every workspace reads, but an ordinary application in every other way: it links the protocol crate and nothing else.
+* `agent/` - The per-turn worker. Spawned to execute one prompt and gone when that prompt is finished. Not built yet; `awagent/` is a scripted stand-in.
+
+There is no start menu process. The start menu is a panel the haimanager draws: the Agentware mark at the left end of the taskbar opens it, centred over the workspace, with a prompt that becomes a new agentdesk and a grid of every installed application. It is chrome for the reasons the dock is (it needs the icons only the haimanager holds, it must vanish on a click anywhere else, and it must work when the workspace under it does not), and its requests go to the Supervisor the way the stop button's does. The plus at the end of the navigation bar's tabs creates an agentdesk with nothing to do; the haimanager asks for a blank one itself when it comes up and again whenever the last one closes, so the machine boots to a workspace and never shows a display with nothing on it.
 
 First-party applications live in a second workspace, `agentwareapps`, beside `agentwarecore` rather than inside it. Apps are clients of the display protocol, not parts of the system: they link the protocol crate and nothing else, and the separate workspace makes that boundary a directory rather than a convention.
 
-An installed application is a folder, `/apps/<name>/`, holding three things: `exec`, the program the Supervisor forks; `icon.svg`, which the haimanager rasterizes for the window title bar and the dock (SVG so one file serves every display scale); and `description.txt`, for whatever lists applications to humans and agents. The division of labour matches the rest of the system: the Supervisor touches only `exec` and stays out of content, and the haimanager reads the icon under the name the Supervisor stated at handoff, so an application cannot wear another's face.
+An installed application is a folder, `/apps/<name>/`, holding four things: `exec`, the program the Supervisor forks; `icon.svg`, which the haimanager rasterizes for the window title bar and the dock (SVG so one file serves every display scale); `description.txt`, which the start menu carries in each tile's description and which will tell agents what an application is for; and `name.txt`, the name people see under the icon, falling back to the folder's. A folder with an `exec` but no description is not offered: that is what keeps the self-test's stand-ins, which ship in the same format, out of the start menu. The division of labour matches the rest of the system: the Supervisor touches only `exec` and stays out of content, and the haimanager reads the icon under the name the Supervisor stated at handoff, so an application cannot wear another's face.
+
+Wallpapers live in `/wallpapers/`, one SVG or PNG each. The settings application lists them and records the choice in a file in the runtime directory, the one setting that crosses between processes on the filesystem rather than over a socket; every agentdesk reads it on its clock tick and names the file in an `image` element in its background region, and the haimanager loads and fits the picture. Nothing persists: the runtime directory is RAM.
 
 ## The Supervisor (PID 1)
 The Supervisor is the absolute root of the userland.
 * Runs as process ID 1 immediately after the Linux kernel finishes booting.
-* Responsible for hardware initialization, mounting virtual filesystems (`/dev`, `/proc`, `/sys`), and bootstrapping the `haimanager` and `startmenu` processes.
+* Responsible for hardware initialization, mounting virtual filesystems (`/dev`, `/proc`, `/sys`), and bootstrapping the `haimanager`.
 * Monitors the health of all sub-processes and acts as the grim reaper for zombie processes to prevent resource leaks.
 * Acts as the **spawn broker**: every agentdesk and every agent in the system is forked by the Supervisor, on request, and is therefore a direct child of PID 1.
 
@@ -76,7 +80,7 @@ Open agentdesks accumulate the way browser tabs do. An agentdesk that has not be
 Suspension is a memory optimization, not a persistence mechanism. The serialized tree and the conversation history stay in RAM for as long as the machine is on, and die with it like everything else. The win is still large: a markup tree costs a fraction of the app processes and agent context it replaces, which is what lets a machine hold many more open agentdesks than it could hold live ones.
 
 ## The Spawn Broker
-`startmenu` and the agentdesks do not fork processes themselves. They ask the Supervisor over a control socket at `/run/agentware/sup.sock`:
+The haimanager and the agentdesks do not fork processes themselves. They ask the Supervisor over a control socket at `/run/agentware/sup.sock`:
 
 ```
 CreateDesk { prompt: Option<text> } -> desk_id
@@ -87,7 +91,7 @@ Interrupt  { desk_id }              -> SIGTERM the desk's current agent
 CloseDesk  { desk_id }              -> tear down the desk and everything in it
 ```
 
-`CreateDesk` carries a prompt or nothing, matching the start menu's two buttons. That opening prompt is the only piece of user text the Supervisor ever handles, and it exists solely because a brand new workspace has no other way to learn what it was created for. It is handed to the agentdesk, not to an agent.
+`CreateDesk` carries a prompt or nothing, matching the two ways a workspace is made: the start menu's prompt, and the navigation bar's plus. That opening prompt is the only piece of user text the Supervisor ever handles, and it exists solely because a brand new workspace has no other way to learn what it was created for. It is handed to the agentdesk, not to an agent.
 
 Creating a workspace does not start a turn. The agentdesk reads its opening prompt and asks for an agent itself. `StartAgent` therefore carries no text at all: the Supervisor is told *that* a turn should run, never what it is about.
 
@@ -95,14 +99,14 @@ Instead it forks the agent with two pre-connected descriptors and returns the ag
 
 There is one agent process per workspace at a time. This is a structural limit rather than a queueing policy: two agents doing computer use in one workspace would fight over the same cursor and the same DOM. A human message that arrives while a turn is running is queued by the agentdesk and delivered when the turn ends. It is never refused. To act on it sooner the human interrupts, which ends the turn and lets the queued message open the next one. All of this happens inside the agentdesk and is invisible to the Supervisor.
 
-Apps never enter a workspace at creation time; they arrive later through `OpenApp`, requested by the agentdesk's own launcher on behalf of either the human or the agent.
+Apps never enter a workspace at creation time; they arrive later through `OpenApp`: from the haimanager when the human presses a tile in the start menu, or from the agentdesk when its agent asks for one over the turn channel.
 
 `CloseApp` exists because a window's close button is the human ending one application, not the workspace. It is a separate escalation from `CloseDesk` and shares only the signal. The request comes from the haimanager rather than from the agentdesk, since window chrome is drawn by the compositor and the agentdesk is never told that windows exist. The pid is checked against that workspace's own apps rather than trusted, so no workspace can ask PID 1 to signal another's process.
 
 Brokering through PID 1 rather than forking locally buys four things:
 
-* **Process tree ownership.** If `startmenu` forked agentdesks, a crash of `startmenu` would orphan every open workspace to PID 1 with no record attached, leaving them unnameable and unmanageable. As children of the Supervisor they are first-class entries in its service table from the start.
-* **Privilege separation.** Sandboxing an agent requires namespaces and cgroups, which require privilege. With the broker at PID 1, `startmenu` needs none.
+* **Process tree ownership.** If the compositor forked the workspaces its start menu and plus ask for, a crash of the compositor would orphan every open workspace to PID 1 with no record attached, leaving them unnameable and unmanageable. As children of the Supervisor they are first-class entries in its service table from the start.
+* **Privilege separation.** Sandboxing an agent requires namespaces and cgroups, which require privilege. With the broker at PID 1, nothing that asks for a process needs any.
 * **File descriptor passing.** Every agentdesk, app and agent is forked already holding a `socketpair` to the haimanager, and agents hold a second one to their agentdesk. Nothing opens a socket by path. This removes the startup race, keeps a sandboxed process from reaching anything it was not explicitly handed, and turns identity into a capability rather than a claim: the haimanager knows which workspace a connection belongs to because the Supervisor told it at handoff, which is what scopes an agent to its own desk and keeps the agentdesk's own chrome invisible to it.
 * **One owner of lifetime.** The Supervisor already reaps and already tracks process state. A second spawner would mean two components tracking lifetime, and they would drift apart.
 
@@ -110,8 +114,7 @@ What deliberately does **not** cross this socket is agent telemetry. The stream 
 
 ## Process Isolation & Lifecycle
 Every major component in Agentware is strictly isolated in its own process space to guarantee system stability.
-* **Home Screen Process:** `startmenu` runs as a persistent, standalone process directly under the Supervisor. It is a launcher, so it holds no user work and losing it costs nothing but the menu.
 * **Agentdesk Processes:** Each open workspace is its own process, forked by the Supervisor on request and placed in its own cgroup along with its apps. If one crashes, gets stuck, or is closed, no other workspace is affected.
 * **App Processes:** One per app *per workspace*. The same app open in several agentdesks is several independent processes, each owned by exactly one workspace and torn down with it.
 * **Agent Processes:** Short-lived and frequent, one per turn. Because they perform computer use on a live workspace, they are the correct place to apply sandboxing (`CLONE_NEWPID`, `CLONE_NEWNS`, cgroup limits) as the isolation model matures. Nothing they need arrives by path, so a mount namespace costs them no capability they actually use.
-* **Restart Policy by Kind:** `haimanager` and `startmenu` restart forever with exponential backoff, since the machine is unusable without them. Agentdesks and agents do not silently restart, because doing so would destroy conversation state or repeat work the human did not ask for twice.
+* **Restart Policy by Kind:** `haimanager` restarts forever with exponential backoff, since the machine is unusable without it. Agentdesks and agents do not silently restart, because doing so would destroy conversation state or repeat work the human did not ask for twice.

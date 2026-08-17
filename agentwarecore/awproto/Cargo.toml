@@ -7,3 +7,9 @@ edition = "2024"
 # supervisor that serves it, the haimanager that registers on it, and the client
 # binaries that drive it. Defining it once is what stops the socket path, the
 # handoff environment variables and the role names drifting apart.
+
+[dependencies]
+# For one call: receiving the descriptor the supervisor attaches to a
+# `start-agent` reply. Only the `net` feature, so an application linking this
+# crate still gets nothing it could open a device or a socket path with.
+rustix = { version = "1.1.4", default-features = false, features = ["std", "net"] }

@@ -37,6 +37,7 @@ use std::sync::OnceLock;
 
 use crate::awml::{Node, Tag, Tree};
 use crate::document::Document;
+use crate::images::Images;
 use crate::paint::font::{Family, Fonts, Style, Weight};
 use crate::paint::{Canvas, Color, Rect, rgb};
 
@@ -110,6 +111,22 @@ pub fn radius_small() -> i32 { sc(3) }
 // controls do not read as friendly at this scale, they read as unfinished.
 fn body_size() -> f32 { 13.0 * scale() }
 fn padding() -> i32 { sc(10) }
+/// Space above and below the taskbar's row of controls. Public because the
+/// screen sizes the band from it: the band is a control plus this twice.
+pub fn taskbar_inset() -> i32 { sc(8) }
+/// How tall one control is: the number the taskbar band is built around.
+pub fn control_h(fonts: &Fonts) -> i32 {
+    fonts.line_height(&Style { size: body_size(), ..Style::default() }) + control_pad() * 2
+}
+/// The icon on a tile button, and the room around it.
+fn tile_icon() -> i32 { sc(28) }
+fn tile_pad() -> i32 { sc(10) }
+/// The icon beside a button's label, when it has one.
+fn button_icon() -> i32 { sc(16) }
+/// An image that is not filling a region is this wide, at 16:9. AWML has no
+/// natural size to ask a picture for, so a picture placed among controls takes
+/// a slot the size of a preview; one that fills a region takes the region.
+fn image_w() -> i32 { sc(160) }
 /// Space above and below the text inside a control.
 fn control_pad() -> i32 { sc(6) }
 /// Space either side of the text inside a button.
@@ -122,6 +139,8 @@ const EDITOR_LINES: i32 = 4;
 fn scrollbar_w() -> i32 { sc(5) }
 /// How far one notch of the wheel moves a scroll container.
 pub fn wheel_step() -> i32 { sc(48) }
+/// The stored offset of a scroll container that is following its end.
+const AT_END: i32 = i32::MAX;
 
 fn gap_of(node: &Node) -> i32 {
     match node.attr("gap") {
@@ -495,9 +514,29 @@ fn titled(tag: Tag) -> bool {
 fn measure(fonts: &Fonts, tree: &Tree, index: usize, width: i32) -> i32 {
     let node = tree.node(index);
 
+    // The vertical twin of the `width` hint: compositor-internal, physical
+    // pixels, for chrome that knows the box it wants. The start menu's prompt
+    // is the one user; a large box for a large ask.
+    if let Some(height) = node.attr("height").and_then(|value| value.parse::<i32>().ok()) {
+        return height.max(sc(20));
+    }
+
     match node.tag {
-        Tag::Text | Tag::Icon => line_height(fonts, tree, index),
+        // Text wraps to the width it is given, so a paragraph in a narrow pane
+        // is as tall as its lines rather than one line clipped at the edge.
+        Tag::Text => {
+            let style = style_at(tree, index);
+            let lines = wrap(fonts, label_of(node), &style, width).len().max(1) as i32;
+            lines * fonts.line_height(&style)
+        }
+        Tag::Icon => line_height(fonts, tree, index),
+        Tag::Image => image_w().min(width.max(1)) * 9 / 16,
         Tag::Divider => DIVIDER,
+        // A tile is a button stood on end: icon above label, for a grid of
+        // things to open. Compositor chrome for now, like `width`.
+        Tag::Button if node.flag("tile") => {
+            tile_pad() * 2 + tile_icon() + sc(6) + line_height(fonts, tree, index)
+        }
         Tag::Button | Tag::Field | Tag::Item => control_height(fonts, tree, index),
         Tag::Checkbox => control_height(fonts, tree, index).max(checkbox_size()),
         Tag::Editor => line_height(fonts, tree, index) * EDITOR_LINES + control_pad() * 2,
@@ -560,13 +599,30 @@ impl Placer<'_> {
 
         let children = self.doc.tree.node(Tree::ROOT).children.clone();
         for child in children {
-            let claim = regions.claim(self.doc.tree.node(child).attr("region"));
+            let name = self.doc.tree.node(child).attr("region");
+            let claim = regions.claim(name);
             match claim {
                 // Inset, so a region's content does not sit flush against the
                 // edge of the region. The compositor owns the division, so it
                 // owns the breathing room too; there is no attribute an
-                // agentdesk could set to take it back.
-                Some(rect) => self.place(child, rect.inset(padding()), rect),
+                // agentdesk could set to take it back. Two exceptions, both
+                // the compositor's: the background gets none, because what
+                // goes there is a wallpaper and a wallpaper reaches the edges;
+                // the taskbar gets less above and below, because it is one row
+                // of controls in a band sized to hold exactly that.
+                Some(rect) => {
+                    let inner = match name {
+                        Some("background") => rect,
+                        Some("taskbar") => Rect::new(
+                            rect.x + padding(),
+                            rect.y + taskbar_inset(),
+                            rect.w - padding() * 2,
+                            rect.h - taskbar_inset() * 2,
+                        ),
+                        _ => rect.inset(padding()),
+                    };
+                    self.place(child, inner, rect)
+                }
                 None => {
                     self.rects[child] = Rect::new(0, 0, 0, 0);
                     self.clips[child] = Rect::new(0, 0, 0, 0);
@@ -701,9 +757,21 @@ impl Placer<'_> {
         let content = heights.iter().sum::<i32>() + gaps;
         let furthest = (content - inner.h).max(0);
 
+        // `anchor="end"` is a transcript's request: keep the end in view as
+        // content grows, until the human scrolls away from it. The offset map
+        // holds AT_END for such a container while it is at its end, so that
+        // the next layout, with more content, resolves it to the new end
+        // rather than to a number that used to be the end. A concrete offset
+        // is what the human's wheel writes, and it means "here, not the end".
         let key = self.doc.key(index).to_owned();
-        let offset = self.scroll.get(&key).copied().unwrap_or(0).clamp(0, furthest);
-        self.scroll.insert(key, offset);
+        let follows_end = tree.node(index).attr("anchor") == Some("end");
+        let offset = match self.scroll.get(&key).copied() {
+            Some(AT_END) => furthest,
+            Some(stored) => stored.clamp(0, furthest),
+            None if follows_end => furthest,
+            None => 0,
+        };
+        self.scroll.insert(key, if follows_end && offset >= furthest { AT_END } else { offset });
         self.scrollers.push(Scroller {
             node: index,
             content,
@@ -745,10 +813,70 @@ fn natural_width(fonts: &Fonts, tree: &Tree, index: usize) -> i32 {
 
     match node.tag {
         Tag::Text | Tag::Icon => fonts.measure(label_of(node), &style),
-        Tag::Button => fonts.measure(label_of(node), &style) + button_pad() * 2,
+        Tag::Image => image_w(),
+        Tag::Button => {
+            let icon = if node.attr("icon").is_some() && !node.flag("tile") {
+                button_icon() + sc(6)
+            } else {
+                0
+            };
+            fonts.measure(label_of(node), &style) + button_pad() * 2 + icon
+        }
         Tag::Checkbox => checkbox_size() + 8 + fonts.measure(label_of(node), &style),
+        // A text entry that is not told to grow is the width of a search box:
+        // room for a sentence, which is what one in a row is for.
+        Tag::Field | Tag::Editor => sc(260),
         _ => sc(160),
     }
+}
+
+/// Break text into lines no wider than `width`, at spaces where possible.
+///
+/// Greedy, which is what every desktop does and what a reader expects: a line
+/// takes as many words as fit. A single word wider than the line is broken
+/// between characters rather than overflowing, because a URL or a long number
+/// clipped at the edge is text the human cannot read at all. Newlines in the
+/// text break lines too, so a message typed with returns keeps them.
+pub fn wrap<'a>(fonts: &Fonts, text: &'a str, style: &Style, width: i32) -> Vec<&'a str> {
+    let mut lines = Vec::new();
+    for paragraph in text.split('\n') {
+        if paragraph.is_empty() {
+            lines.push(paragraph);
+            continue;
+        }
+        let mut start = 0;
+        let mut last_space: Option<usize> = None;
+        let mut at = 0;
+        while at < paragraph.len() {
+            let next = paragraph[at..]
+                .char_indices()
+                .nth(1)
+                .map(|(offset, _)| at + offset)
+                .unwrap_or(paragraph.len());
+            if fonts.measure(&paragraph[start..next], style) > width && next > start {
+                // Over the edge. Break at the last space if there was one, else
+                // right here, but always make progress by at least one char.
+                let (line_end, resume) = match last_space {
+                    Some(space) if space > start => (space, space + 1),
+                    _ if at > start => (at, at),
+                    _ => (next, next),
+                };
+                lines.push(&paragraph[start..line_end]);
+                start = resume;
+                last_space = None;
+                at = start;
+                continue;
+            }
+            if paragraph[at..].starts_with(' ') {
+                last_space = Some(at);
+            }
+            at = next;
+        }
+        if start < paragraph.len() || lines.is_empty() {
+            lines.push(&paragraph[start..]);
+        }
+    }
+    lines
 }
 
 /// The first `caret` characters of a string, as a slice.
@@ -759,8 +887,15 @@ fn prefix(text: &str, caret: usize) -> &str {
     }
 }
 
-pub fn paint(canvas: &mut Canvas, fonts: &Fonts, tree: &Tree, layout: &Layout, focus: &Focus) {
-    paint_subtree(canvas, fonts, tree, layout, Tree::ROOT, focus);
+pub fn paint(
+    canvas: &mut Canvas,
+    fonts: &Fonts,
+    images: &Images,
+    tree: &Tree,
+    layout: &Layout,
+    focus: &Focus,
+) {
+    paint_subtree(canvas, fonts, images, tree, layout, Tree::ROOT, focus);
 }
 
 /// Paint one branch of a document.
@@ -772,12 +907,13 @@ pub fn paint(canvas: &mut Canvas, fonts: &Fonts, tree: &Tree, layout: &Layout, f
 pub fn paint_subtree(
     canvas: &mut Canvas,
     fonts: &Fonts,
+    images: &Images,
     tree: &Tree,
     layout: &Layout,
     index: usize,
     focus: &Focus,
 ) {
-    paint_node(canvas, fonts, tree, layout, index, focus);
+    paint_node(canvas, fonts, images, tree, layout, index, focus);
 }
 
 /// A thin indicator beside content that overflows.
@@ -834,6 +970,7 @@ fn paint_scrollbar(canvas: &mut Canvas, layout: &Layout, index: usize, lit: Opti
 fn paint_node(
     canvas: &mut Canvas,
     fonts: &Fonts,
+    images: &Images,
     tree: &Tree,
     layout: &Layout,
     index: usize,
@@ -866,10 +1003,31 @@ fn paint_node(
         Tag::Window => canvas.fill_rect(rect, BACKGROUND),
 
         Tag::Text => {
-            canvas.draw_text(fonts, label_of(node), rect.x, rect.y, &style, ink);
+            let step = fonts.line_height(&style);
+            for (row, line) in wrap(fonts, label_of(node), &style, rect.w).into_iter().enumerate() {
+                canvas.draw_text(fonts, line, rect.x, rect.y + row as i32 * step, &style, ink);
+            }
         }
 
         Tag::Divider => canvas.fill_rect(rect, BORDER),
+
+        // A picture, fitted to cover its rectangle. A source that cannot be
+        // loaded leaves the words meant for an agent: the alt text, muted, so a
+        // broken path is visible on screen rather than a silent hole.
+        Tag::Image => match node.attr("src").and_then(|src| images.get(src, rect.w, rect.h)) {
+            Some(bitmap) => canvas.blit(&bitmap, rect.x, rect.y),
+            None => {
+                canvas.fill_rect(rect, SURFACE);
+                canvas.draw_text(
+                    fonts,
+                    node.attr("alt").unwrap_or("?"),
+                    rect.x + control_pad(),
+                    rect.y + control_pad(),
+                    &style,
+                    MUTED,
+                );
+            }
+        },
 
         Tag::Icon => {
             canvas.draw_text(
@@ -930,8 +1088,30 @@ fn paint_node(
             }
 
             let label = label_of(node);
-            let x = rect.x + (rect.w - fonts.measure(label, &style)) / 2;
-            canvas.draw_text(fonts, label, x, centred(rect.h), &style, ink);
+            let icon = node
+                .attr("icon")
+                .and_then(|name| images.icons.get(name, if node.flag("tile") { tile_icon() } else { button_icon() }));
+            if node.flag("tile") {
+                // Icon centred above the label. A missing icon leaves the
+                // label where it is, so the grid does not jump.
+                let top = rect.y + tile_pad();
+                if let Some(icon) = icon {
+                    canvas.blend_pixmap(icon.as_ref(), rect.x + (rect.w - tile_icon()) / 2, top);
+                }
+                let x = rect.x + (rect.w - fonts.measure(label, &style)) / 2;
+                canvas.clipped(rect.inset(2), |canvas| {
+                    canvas.draw_text(fonts, label, x, top + tile_icon() + sc(6), &style, ink);
+                });
+            } else {
+                let icon_w = icon.as_ref().map(|_| button_icon() + sc(6)).unwrap_or(0);
+                let width = fonts.measure(label, &style) + icon_w;
+                let mut x = rect.x + (rect.w - width) / 2;
+                if let Some(icon) = icon {
+                    canvas.blend_pixmap(icon.as_ref(), x, rect.y + (rect.h - button_icon()) / 2);
+                    x += icon_w;
+                }
+                canvas.draw_text(fonts, label, x, centred(rect.h), &style, ink);
+            }
         }
 
         Tag::Field | Tag::Editor => {
@@ -1052,7 +1232,7 @@ fn paint_node(
     });
 
     for &child in &tree.node(index).children {
-        paint_node(canvas, fonts, tree, layout, child, focus);
+        paint_node(canvas, fonts, images, tree, layout, child, focus);
     }
 
     if node.tag == Tag::Scroll {

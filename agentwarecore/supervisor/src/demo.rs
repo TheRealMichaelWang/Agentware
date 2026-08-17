@@ -1,29 +1,23 @@
 //! Boot-time demonstration, enabled with `agentware.demo` on the kernel command
 //! line.
 //!
-//! `startmenu` does not exist, so nothing asks the broker to create a
-//! workspace, so the haimanager comes up owning a display with no clients on it.
-//! The whole graphical half of the system would then be unobservable, and
-//! graphics cannot be checked from a serial log.
+//! There is no agent with a model behind it yet, so on a plain boot a message
+//! sent from a workspace has nobody to answer it. This substitutes the one
+//! piece that is missing and nothing else: the agent becomes `awagent`, a
+//! scripted stand-in that opens the calculator and adds two numbers on it
+//! whatever it is asked. Everything else is the real thing: the real
+//! agentdesk, the real applications, PID 1 forking each into a cgroup and
+//! handing the compositor its descriptor. The machine boots to one blank
+//! agentdesk either way; the turn runs when someone sends a message.
 //!
-//! This substitutes the two pieces that are missing and nothing else. The
-//! agentdesk becomes `awapp desk`, the stand-in workspace shell, and a small
-//! control-socket client stands in for the start menu by asking for workspaces.
-//! Everything between those two ends is the real thing: PID 1 forks both
-//! processes into a cgroup, hands each a socketpair to the compositor, and
-//! pushes the other end over the control socket tagged with the workspace it
-//! belongs to. The application each workspace opens is real too: `awcalc`, from
-//! `agentwareapps`, launched through the broker like anything else.
-//!
-//! It goes away when `startmenu` and a real agentdesk exist.
+//! It goes away when a real agent exists.
 
 use awproto::ROLE_HAIMANAGER;
 
 use crate::desk::Programs;
 use crate::service::{RestartPolicy, Service};
 
-const AWCTL: &str = "/bin/awctl";
-const AWAPP: &str = "/bin/awapp";
+const AGENTDESK: &str = "/bin/agentdesk";
 const AWAGENT: &str = "/bin/awagent";
 const HAIMANAGER: &str = "/bin/haimanager";
 
@@ -34,27 +28,21 @@ pub fn requested() -> bool {
         .unwrap_or(false)
 }
 
-/// The workspace process and the agent are both stand-ins.
+/// The real workspace process and a stand-in agent.
 ///
 /// The agent is forked on request from the agentdesk, exactly as a real one
 /// would be, with a descriptor to the compositor and a private channel back to
 /// the workspace that asked for it.
 pub fn programs() -> Programs {
     Programs {
-        desk: (AWAPP.into(), vec!["desk".into()]),
+        desk: (AGENTDESK.into(), vec![]),
         agent: (AWAGENT.into(), vec![]),
         app_dir: "/apps".into(),
     }
 }
 
-/// The real compositor, plus a stand-in for the start menu.
-///
-/// The stand-in waits for the compositor to have registered rather than merely
-/// to have been forked, or it would create a workspace with nowhere to hand the
-/// descriptor to and the window would never appear.
+/// The real compositor, and nothing else: the first workspace is the
+/// compositor's own request, and the demonstration turn is a message away.
 pub fn services() -> Vec<Service> {
-    vec![
-        Service::new(ROLE_HAIMANAGER, HAIMANAGER, &[], RestartPolicy::Always),
-        Service::new("demo", AWCTL, &["demo"], RestartPolicy::Never).requires(ROLE_HAIMANAGER),
-    ]
+    vec![Service::new(ROLE_HAIMANAGER, HAIMANAGER, &[], RestartPolicy::Always)]
 }

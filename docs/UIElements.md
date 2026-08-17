@@ -82,7 +82,7 @@ No id, no description, no actions. Invisible to agents.
 | `vstack` | `gap`, `align`, `grow` | Stacks children top to bottom. |
 | `hstack` | `gap`, `align`, `grow` | Stacks children left to right. |
 | `grid` | `cols`, `gap` | Uniform columns. |
-| `scroll` | `dir=x\|y\|both` | Clips and scrolls its overflow. Needs no id: see `scroll-into-view`. |
+| `scroll` | `dir=x\|y\|both`, `anchor=end` | Clips and scrolls its overflow. Needs no id: see `scroll-into-view`. `anchor="end"` keeps the end in view as content grows, until the human scrolls away from it: a transcript's behaviour. |
 | `split` | `dir`, `ratio` | Two resizable panes. Used for the workspace side pane. |
 
 There is no absolute positioning, no `z-index`, and no stylesheet. The layout model is deliberately small enough to implement deterministically and to reason about without simulation.
@@ -109,9 +109,9 @@ Visible to agents, since an agent must be able to read a screen. They carry no i
 
 | Element | Attributes | Notes |
 | --- | --- | --- |
-| `text` | `role=heading\|subheading\|body\|caption\|label` | Role is semantic, not a font size. |
+| `text` | `role=heading\|subheading\|body\|caption\|label` | Role is semantic, not a font size. Wraps to the width it is given. |
 | `icon` | `name`, `alt` | `alt` is what the agent reads. |
-| `image` | `src`, `alt` | `alt` required. An agent that cannot read a picture must still know what it shows. |
+| `image` | `src`, `alt`, `fit=cover` | `alt` required. An agent that cannot read a picture must still know what it shows. `src` names a file (SVG or PNG) the haimanager loads and fits; pixels never cross the protocol. Placed among controls it takes a preview-sized 16:9 slot; placed as a region's whole content, it takes the region. |
 | `divider` | `dir` | Purely visual, but cheap to keep. |
 | `progress` | `value` or `indeterminate`, `label` | State an agent needs: is something still running? |
 
@@ -270,7 +270,7 @@ The haimanager resolves the target to a rectangle, verifies it is visible, hit-t
 <rejected target="send" reason="disabled"/>
 <rejected target="row-88" reason="not-visible"/>
 <rejected target="purchase" reason="needs-approval"/>
-<rejected target="taskbar-launcher" reason="not-addressable"/>
+<rejected target="send-message" reason="not-addressable"/>
 ```
 
 `not-addressable` covers anything the agent may not touch: another workspace's apps, and the agentdesk's own chrome. Both are enforced by which connection the request arrived on, never by a claim the agent makes about itself.
@@ -287,10 +287,10 @@ Ids should be meaningful (`send`, `recipient-field`) rather than positional (`bt
 
 ## Scope for Version One
 
-The full catalogue above is the target. Thirteen elements are enough to build the start menu, the whole agentdesk shell, and two real applications:
+The full catalogue above is the target. Fourteen elements are enough to build the whole agentdesk shell and the first real applications:
 
 ```
-vstack  hstack  scroll  text  divider  icon
+vstack  hstack  scroll  text  divider  icon  image
 button  field  editor  checkbox
 list  item  dialog
 ```

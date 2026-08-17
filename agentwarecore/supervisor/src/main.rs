@@ -51,19 +51,15 @@ const TOKEN_SIGNALS: u64 = 1;
 
 /// The services that make up the Agentware userland.
 ///
-/// `startmenu` draws through `haimanager`, so it waits for the compositor to
-/// register on the control socket rather than merely to be forked. Table order
-/// alone would not be enough: a forked process is not a listening one.
-///
-/// Neither binary exists yet. The service table logs and skips what is not
-/// installed rather than crash looping against it, which is what lets the
-/// supervisor boot and be useful before the graphical stack is written.
+/// One entry. The compositor asks the broker for the first workspace itself
+/// when it comes up, and every workspace after that is created from the
+/// navigation bar's plus or a workspace's own taskbar, so there is no start
+/// menu process to list. What is still missing is an agent with a model behind
+/// it: `Programs::system` names `/bin/agent`, and the service table's habit of
+/// logging and skipping what is not installed extends to the broker refusing
+/// `start-agent` with a clear error rather than crash looping.
 fn system_services() -> Vec<Service> {
-    vec![
-        Service::new(ROLE_HAIMANAGER, "/bin/haimanager", &[], RestartPolicy::Always),
-        Service::new("startmenu", "/bin/startmenu", &[], RestartPolicy::Always)
-            .requires(ROLE_HAIMANAGER),
-    ]
+    vec![Service::new(ROLE_HAIMANAGER, "/bin/haimanager", &[], RestartPolicy::Always)]
 }
 
 fn main() {

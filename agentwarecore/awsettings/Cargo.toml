@@ -1,0 +1,13 @@
+[package]
+name = "awsettings"
+version = "0.1.0"
+edition = "2024"
+
+# The settings application. It is part of agentwarecore rather than
+# agentwareapps because what it edits is system state every workspace reads,
+# but it is still an ordinary application: it links awproto and nothing else,
+# draws through the display protocol, and has no connection to the broker or
+# the compositor beyond the one every app is handed. What makes a setting
+# system-wide is the file it writes, not any privilege this process has.
+[dependencies]
+awproto = { path = "../awproto" }

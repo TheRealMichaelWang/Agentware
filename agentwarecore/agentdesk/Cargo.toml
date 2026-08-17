@@ -1,0 +1,14 @@
+[package]
+name = "agentdesk"
+version = "0.1.0"
+edition = "2024"
+
+# The workspace process: one per agentdesk, alive until the human closes the
+# tab. It owns the conversation and nothing else durable, draws through the
+# display protocol like any client, and is the only process besides the
+# compositor that talks to the broker. It links awproto for the wires and
+# rustix for one call, poll, because it waits on three things at once: the
+# compositor, its agent, and the clock.
+[dependencies]
+awproto = { path = "../awproto" }
+rustix = { version = "1.1.4", default-features = false, features = ["std", "event"] }

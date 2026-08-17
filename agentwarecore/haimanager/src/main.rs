@@ -17,9 +17,11 @@ mod cursor;
 mod document;
 mod drm;
 mod icons;
+mod images;
 mod input;
 mod paint;
 mod screen;
+mod startmenu;
 mod ui;
 
 use std::collections::VecDeque;
@@ -91,7 +93,7 @@ fn main() {
     };
 
     let mut canvas = Canvas::new(width, height);
-    let mut screen = Screen::new(Rect::new(0, 0, width as i32, height as i32));
+    let mut screen = Screen::new(Rect::new(0, 0, width as i32, height as i32), &fonts);
 
     // Paint once before waiting, so a machine with nothing attached still shows
     // something rather than a blank screen.
@@ -134,6 +136,15 @@ fn run(
         )
     {
         log(&format!("could not watch the supervisor connection: {err}"));
+    }
+
+    // A display with no workspace on it is not a desk. The compositor asks for
+    // the first one itself, exactly as it does when the plus in the
+    // navigation bar is pressed, so the machine boots to a workspace rather
+    // than to a bar with nothing under it. Every workspace after this one is
+    // the human's doing.
+    if let Some(inbox) = &mut handoffs {
+        inbox.request(&["create-desk"]);
     }
 
     let mut events = [epoll::Event {
@@ -597,10 +608,10 @@ impl Handoffs {
 
     /// Ask the supervisor for something.
     ///
-    /// Used for exactly one thing today: the stop button, which routes here
-    /// rather than through the agentdesk so that it works when the agentdesk
-    /// does not. The reply arrives back down the same connection and is logged
-    /// with everything else.
+    /// The stop button, a tab's close, and the plus that makes a workspace
+    /// all route here rather than through an agentdesk, so that each works
+    /// when the agentdesk does not. The reply arrives back down the same
+    /// connection and is logged with everything else.
     fn request(&mut self, fields: &[&str]) {
         if let Err(err) = self.stream.write_all(&encode(fields)) {
             log(&format!("could not reach the supervisor: {err}"));

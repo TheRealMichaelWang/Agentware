@@ -2,7 +2,7 @@
 //!
 //! An app is a folder, and `/apps/<name>/icon.svg` is the one piece of it the
 //! compositor reads. SVG because chrome renders at whatever scale the display
-//! chose, and the dock, the title bar and a future start menu all want
+//! chose, and the dock, the title bar and whatever lists apps next all want
 //! different sizes; one vector file serves them all without anyone shipping a
 //! bitmap for every case.
 //!
@@ -59,6 +59,14 @@ impl Icons {
     /// A previously prepared rasterization, if the app has an icon.
     pub fn get(&self, app: &str, size: i32) -> Option<&tiny_skia::Pixmap> {
         self.rendered.get(&(app.to_owned(), size))?.as_ref()
+    }
+
+    /// Install an icon from SVG data under a name, for the compositor's own
+    /// marks: things that are not applications and have no package to be read
+    /// from. Later `prepare` calls rasterize it like any other.
+    pub fn install(&mut self, name: &str, svg: &[u8]) {
+        let tree = usvg::Tree::from_data(svg, &usvg::Options::default()).ok();
+        self.trees.insert(name.to_owned(), tree);
     }
 
     fn rasterize(&mut self, app: &str, size: i32) -> Option<tiny_skia::Pixmap> {

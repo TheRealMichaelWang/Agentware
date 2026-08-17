@@ -25,6 +25,19 @@
 //! cannot drift from the style of what it sits above, and it means the code that
 //! resolves a click to a node is one implementation rather than two.
 //!
+//! ## The start menu is chrome
+//!
+//! The Agentware mark at the left end of the taskbar opens a panel centred over
+//! the workspace: a prompt that becomes a new agentdesk, and a grid of every
+//! installed application. It is drawn here rather than by the agentdesk for the
+//! reasons the dock and the navigation bar are: it needs the icons only the
+//! compositor holds, it must vanish on a click anywhere else, which only the
+//! compositor sees, and it must work when the workspace under it does not.
+//! What it asks for goes to PID 1 the way the stop button and a tab's close do:
+//! `create-desk` with the prompt, `open-app` into the workspace on screen. An
+//! agent still opens applications only through its agentdesk; this is the
+//! human's door, and it is the same door for every workspace.
+//!
 //! ## The stop button does not pass through the agentdesk
 //!
 //! Clicking it sends `interrupt` to the supervisor. The agentdesk is the process
@@ -53,7 +66,8 @@ use awproto::agent;
 use crate::client::{Client, Kind, Progress};
 use crate::cursor;
 use crate::document::Document;
-use crate::icons::Icons;
+use crate::images::Images;
+use crate::startmenu::{AGENTWARE_ICON, AGENTWARE_SVG, StartMenu, StartOutcome};
 use crate::input::{Button, Event, Key};
 use crate::paint::font::{Family, Fonts, Style};
 use crate::paint::{Canvas, Rect};
@@ -61,12 +75,13 @@ use crate::ui::{self, Focus, Frame, Layout, Regions};
 
 /// Height of the navigation bar, which sits above every workspace.
 fn nav_height() -> i32 { ui::sc(32) }
-/// The agentdesk's taskbar region is parked at zero height for now. The strip
-/// duplicated what the dock does and spent a full-width band saying so. The
-/// region stays in the protocol and the layout path, so an agentdesk may still
-/// declare content for it and nothing breaks; it simply gets no room until
-/// there is a design worth giving room to.
-const TASKBAR_HEIGHT: i32 = 0;
+/// Height of the agentdesk's taskbar: the full-width band along the bottom of
+/// a workspace, sized to hold one row of controls with the taskbar inset above
+/// and below. It was parked at zero height for a while, when all it held was a
+/// duplicate of the dock. Now it holds the clock, the launcher and the way to
+/// start a new workspace, and the dock sits in the middle of it, so one band
+/// does what two used to.
+fn taskbar_height(fonts: &Fonts) -> i32 { ui::control_h(fonts) + ui::taskbar_inset() * 2 }
 /// Width of the handle left behind when the pane is collapsed.
 fn pane_handle_w() -> i32 { ui::sc(12) }
 /// Height of the title bar the compositor draws around an application window.
@@ -79,15 +94,16 @@ fn window_margin() -> i32 { ui::sc(14) }
 /// Width of one title bar button. The three sit flush at the bar's right end,
 /// each the full height of the bar, which makes them targets rather than dots.
 fn title_button_w() -> i32 { ui::sc(34) }
-/// The strip along the bottom of the apps region holding every open window.
-///
-/// Taller than the old text-pill dock, because a tile now holds an icon with a
-/// running dot beneath it rather than a line of text beside one.
-fn dock_height() -> i32 { ui::sc(36) }
-/// One square tile per window, sized to sit inside the dock with equal margin.
-fn dock_tile() -> i32 { dock_height() - ui::sc(10) }
+/// One square tile per open window, centred in the taskbar band. An icon with
+/// a running dot beneath it, so it fits the band's height with a little air.
+fn dock_tile() -> i32 { ui::sc(32) }
 /// The icon inside a tile, leaving room below for the running dot.
-fn dock_icon() -> i32 { ui::sc(18) }
+fn dock_icon() -> i32 { ui::sc(20) }
+/// The gap between tiles.
+fn dock_gap() -> i32 { ui::sc(4) }
+/// The start button at the left end of the taskbar band, and its mark.
+fn start_button_w() -> i32 { ui::sc(40) }
+fn start_icon() -> i32 { ui::sc(22) }
 
 /// What a point in a title bar means.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -197,6 +213,8 @@ enum Surface {
     Nav,
     Desk,
     App(RawFd),
+    /// The start menu, while it is open.
+    Start,
 }
 
 /// One application window.
@@ -259,9 +277,13 @@ pub struct Screen {
     /// checked, and a still frame cannot otherwise say which connection is
     /// holding which version.
     pub debug: bool,
-    /// App icons, parsed and rasterized when an app attaches so drawing them
-    /// is a lookup. Cached across windows and workspaces by app name.
-    icons: Icons,
+    /// Pictures: app icons, parsed and rasterized when an app attaches so
+    /// drawing them is a lookup, and the images documents point at, fitted
+    /// and cached on first paint.
+    images: Images,
+    /// The taskbar band's height, fixed at startup from the font metrics the
+    /// band is sized around.
+    taskbar_h: i32,
     /// Requests for the supervisor. Collected here rather than sent from here
     /// because the control connection is owned by the event loop, and a screen
     /// that could write to PID 1 from inside a click handler is a screen that
@@ -279,6 +301,8 @@ pub struct Screen {
     /// and the width of the tab it replaced, so entering the editor does not
     /// change the tab's size under the click that opened it.
     renaming: Option<(usize, String, i32)>,
+    /// The start menu, while it is open.
+    start: Option<StartMenu>,
 
     /// The intent being performed, if any.
     flight: Option<Flight>,
@@ -314,7 +338,10 @@ pub struct Screen {
 }
 
 impl Screen {
-    pub fn new(bounds: Rect) -> Screen {
+    pub fn new(bounds: Rect, fonts: &Fonts) -> Screen {
+        let mut images = Images::new(ui::BACKGROUND);
+        images.icons.install(AGENTWARE_ICON, AGENTWARE_SVG);
+        images.icons.prepare(AGENTWARE_ICON, &[start_icon()]);
         Screen {
             clients: Vec::new(),
             workspaces: Vec::new(),
@@ -325,13 +352,15 @@ impl Screen {
             nav_scroll: HashMap::new(),
             bounds,
             debug: false,
-            icons: Icons::new(),
+            images,
+            taskbar_h: taskbar_height(fonts),
             requests: Vec::new(),
             notes: Vec::new(),
             drag: None,
             scroll_drag: None,
             tab_drag: None,
             renaming: None,
+            start: None,
             flight: None,
             queued: VecDeque::new(),
             agent_cursor: None,
@@ -381,7 +410,7 @@ impl Screen {
         let open = 1.0 - fold;
         let eased = open * open * (3.0 - 2.0 * open);
         let pane = (full as f32 * eased).round() as i32;
-        Regions::carve(area, TASKBAR_HEIGHT, pane)
+        Regions::carve(area, self.taskbar_h, pane)
     }
 
     /// Advance every pane that is not where it is meant to be.
@@ -419,7 +448,7 @@ impl Screen {
         match self.focus {
             Surface::App(fd) => Some(fd),
             Surface::Desk => self.workspaces.get(self.current).and_then(|w| w.desk),
-            Surface::Nav => None,
+            Surface::Nav | Surface::Start => None,
         }
     }
 
@@ -437,7 +466,7 @@ impl Screen {
             .keyboard_client()
             .and_then(|fd| self.client(fd))
             .is_some_and(Client::focused_text);
-        if !in_client && self.renaming.is_none() {
+        if !in_client && self.renaming.is_none() && self.start.is_none() {
             return None;
         }
         let period = BLINK.as_millis();
@@ -474,14 +503,10 @@ impl Screen {
         true
     }
 
-    /// Where windows may go: the apps region, less the dock if it is showing.
+    /// Where windows may go: the apps region. The dock lives in the taskbar
+    /// band below it, so nothing here changes size when a window opens.
     fn window_area(&self, at: usize) -> Rect {
-        let apps = self.regions_for(at);
-        let apps = apps.apps;
-        if self.dock_pills(at).is_empty() {
-            return apps;
-        }
-        Rect::new(apps.x, apps.y, apps.w, apps.h - dock_height() - 8)
+        self.regions_for(at).apps
     }
 
     /// Where a window opens, before the human has an opinion about it.
@@ -544,35 +569,33 @@ impl Screen {
         self.reframe(fonts);
     }
 
-    /// The strip of minimized windows along the bottom of the apps region.
-    ///
-    /// Drawn by the compositor rather than put in the agentdesk's taskbar,
-    /// because whether a window is minimized is compositor state and the
-    /// agentdesk is never told that windows exist at all.
-    /// The dock: one pill per open window, floating at the bottom of the apps
-    /// region.
+    /// The dock: one tile per open window, centred in the taskbar band.
     ///
     /// Every window rather than only the minimized ones, because switching
     /// between windows is what a dock is for and half a switcher is worse than
     /// none. It is compositor chrome for the same reason the title bars are:
-    /// which window is where is not something the agentdesk is told.
+    /// which window is where is not something the agentdesk is told. It sits
+    /// in the agentdesk's own band because that is where a person looks for
+    /// it, and the agentdesk keeps the middle of its taskbar clear for it the
+    /// way it leaves the title bars to the compositor: by design, not by
+    /// protocol.
     fn dock_rect(&self, at: usize) -> Rect {
-        let apps = self.regions_for(at).apps;
+        let band = self.regions_for(at).taskbar;
         let count = self
             .workspaces
             .get(at)
             .map(|workspace| workspace.windows.len())
             .unwrap_or(0) as i32;
-        let width = (dock_tile() + 6) * count + 6;
+        let width = (dock_tile() + dock_gap()) * count - dock_gap();
         Rect::new(
-            apps.x + (apps.w - width) / 2,
-            apps.y + apps.h - dock_height() - 8,
-            width,
-            dock_height(),
+            band.x + (band.w - width) / 2,
+            band.y + (band.h - dock_tile()) / 2,
+            width.max(0),
+            dock_tile(),
         )
     }
 
-    /// Where each window's pill sits.
+    /// Where each window's tile sits.
     fn dock_pills(&self, at: usize) -> Vec<(RawFd, Rect)> {
         let Some(workspace) = self.workspaces.get(at) else { return Vec::new() };
         if workspace.windows.is_empty() {
@@ -580,24 +603,15 @@ impl Screen {
         }
 
         let dock = self.dock_rect(at);
-        let inset = (dock.h - dock_tile()) / 2;
-        let mut x = dock.x + 6;
         // In the order they opened rather than in z-order, so a tile does not
         // move under the pointer when the window behind it is raised.
-        let mut pills: Vec<(RawFd, Rect)> = workspace
-            .windows
-            .iter()
-            .map(|window| {
-                let pill = Rect::new(x, dock.y + inset, dock_tile(), dock_tile());
-                x += dock_tile() + 6;
-                (window.fd, pill)
-            })
-            .collect();
+        let mut pills: Vec<(RawFd, Rect)> =
+            workspace.windows.iter().map(|window| (window.fd, dock)).collect();
         pills.sort_by_key(|(fd, _)| *fd);
-        let mut x = dock.x + 6;
+        let mut x = dock.x;
         for (_, pill) in &mut pills {
-            pill.x = x;
-            x += dock_tile() + 6;
+            *pill = Rect::new(x, dock.y, dock_tile(), dock_tile());
+            x += dock_tile() + dock_gap();
         }
         pills
     }
@@ -662,7 +676,7 @@ impl Screen {
         // identity an app has; its icon is read from the package under that
         // name, so an app cannot wear another's.
         if kind == Kind::App {
-            self.icons.prepare(&name, &[title_icon(), dock_icon()]);
+            self.images.icons.prepare(&name, &[title_icon(), dock_icon()]);
         }
 
         let client = Client::adopt(kind, desk, name, pid, UnixStream::from(fd))
@@ -720,9 +734,20 @@ impl Screen {
         // A workspace with nothing left in it is gone. Nothing here restarts, so
         // there is no reason to keep an entry the human can navigate to and find
         // empty.
+        let had_any = !self.workspaces.is_empty();
         self.workspaces
             .retain(|workspace| workspace.desk.is_some() || !workspace.windows.is_empty());
         self.current = self.current.min(self.workspaces.len().saturating_sub(1));
+
+        // The last workspace going leaves a display with nothing on it, which
+        // is not a desk. Ask for a blank one, exactly as at boot, so closing
+        // every tab lands the human on an empty agentdesk rather than on a bar
+        // with nothing under it. Only on the removal that emptied the list,
+        // so a straggling connection closing later cannot ask twice.
+        if had_any && self.workspaces.is_empty() {
+            self.requests.push(vec!["create-desk".into()]);
+            self.notes.push("last agentdesk closed; asking for a blank one".into());
+        }
 
         if self.focus == Surface::App(fd) {
             self.focus = Surface::Desk;
@@ -892,10 +917,8 @@ impl Screen {
             Event::Scrolled { delta, x, y } => match self.surface_at(x, y) {
                 Some(Surface::App(fd)) => self.route_to(fd, fonts, event),
                 Some(Surface::Desk) => self.route_desk(fonts, event),
-                _ => {
-                    let _ = delta;
-                    false
-                }
+                Some(Surface::Start) => self.start_wheel(fonts, delta, x, y),
+                _ => false,
             },
 
             Event::KeyPressed(key) => {
@@ -904,13 +927,14 @@ impl Screen {
                     Surface::App(fd) => self.route_to(fd, fonts, event),
                     Surface::Desk => self.route_desk(fonts, event),
                     Surface::Nav => self.nav_key(fonts, key),
+                    Surface::Start => self.start_key(fonts, key),
                 }
             }
 
             Event::KeyReleased(_) => match self.focus {
                 Surface::App(fd) => self.route_to(fd, fonts, event),
                 Surface::Desk => self.route_desk(fonts, event),
-                Surface::Nav => false,
+                Surface::Nav | Surface::Start => false,
             },
 
             _ => false,
@@ -950,6 +974,9 @@ impl Screen {
             && let Some(index) = doc.index_of("#nav-rename")
             && self.nav_layout.rect_of(index).contains(x, y)
         {
+            return cursor::Shape::Beam;
+        }
+        if self.start.as_ref().is_some_and(|menu| menu.over_prompt(x, y)) {
             return cursor::Shape::Beam;
         }
 
@@ -1023,6 +1050,9 @@ impl Screen {
         if self.nav_rect().contains(x, y) {
             return Some(Surface::Nav);
         }
+        if self.start.is_some() && self.start_rect().contains(x, y) {
+            return Some(Surface::Start);
+        }
 
         if self.regions().apps.contains(x, y)
             && let Some(fd) = self.topmost_at(self.current, x, y)
@@ -1036,6 +1066,17 @@ impl Screen {
     }
 
     fn click(&mut self, fonts: &Fonts, x: i32, y: i32) -> bool {
+        // An open start menu takes the click or is closed by it. Closed and
+        // consumed: the click that dismisses a menu is not also a click on
+        // whatever was behind it, or a window would open on a stray press.
+        if self.start.is_some() {
+            if self.start_rect().contains(x, y) {
+                return self.click_start(fonts, x, y);
+            }
+            self.close_start();
+            return true;
+        }
+
         let Some(surface) = self.surface_at(x, y) else { return false };
         // Where a click went is invisible in a screenshot, so it is traceable
         // in the log when the overlay is on.
@@ -1046,6 +1087,7 @@ impl Screen {
                     Surface::Nav => "navigation bar".to_owned(),
                     Surface::Desk => "workspace chrome".to_owned(),
                     Surface::App(fd) => format!("app on fd {fd}"),
+                    Surface::Start => "start menu".to_owned(),
                 }
             ));
         }
@@ -1099,12 +1141,19 @@ impl Screen {
                 dirty
             }
 
+            // Only reachable while the menu is open, which was handled above.
+            Surface::Start => true,
+
             Surface::Desk => {
-                // Both of these are compositor chrome sitting over the
+                // All of these are compositor chrome sitting over the
                 // workspace, so they are checked before the click is handed to
                 // it.
                 if self.pane_handle(self.current).contains(x, y) {
                     return self.toggle_pane(fonts);
+                }
+                if self.start_button_rect(self.current).contains(x, y) {
+                    self.open_start(fonts);
+                    return true;
                 }
 
                 if let Some((fd, _)) = self
@@ -1163,7 +1212,6 @@ impl Screen {
                     .find(|window| !window.minimized)
                     .map(|window| Surface::App(window.fd))
                     .unwrap_or(Surface::Desk);
-                // The dock appearing takes room from the windows above it.
                 self.reframe(fonts);
                 true
             }
@@ -1317,6 +1365,7 @@ impl Screen {
         self.current = to;
         self.focus = Surface::Desk;
         self.nav = None;
+        self.start = None;
         true
     }
 
@@ -1773,9 +1822,7 @@ impl Screen {
     /// everything else rather than being a second rendering path.
     fn nav_markup(&self) -> String {
         let mut out = String::from(
-            "<window font=\"sans\" pad=\"none\" size=\"sm\">\n  <hstack gap=\"sm\">\n\
-             \x20   <button id=\"nav-home\" label=\"Home\" \
-             description=\"Opens the start menu, where a new workspace is created\"/>\n",
+            "<window font=\"sans\" pad=\"none\" size=\"sm\">\n  <hstack gap=\"sm\">\n",
         );
 
         for (at, workspace) in self.workspaces.iter().enumerate() {
@@ -1803,6 +1850,15 @@ impl Screen {
             ));
         }
 
+        // The plus at the end of the row: a new agentdesk with no prompt. It
+        // is chrome rather than a workspace's control for the same reason the
+        // tabs are: it is how the human gets somewhere else, and it must work
+        // when no workspace does. A workspace's taskbar holds the other way,
+        // a new agentdesk with a prompt.
+        out.push_str(
+            "    <button id=\"nav-new\" label=\"+\" \
+             description=\"Creates a new agentdesk with nothing to do yet\"/>\n",
+        );
         out.push_str("    <text grow=\"true\"/>\n");
 
         // Drawn only while there is something to stop, so the button never
@@ -1887,8 +1943,13 @@ impl Screen {
             return true;
         }
 
-        if id == "nav-home" {
-            self.notes.push("the start menu does not exist yet".into());
+        if id == "nav-new" {
+            // Straight to PID 1, like the stop button and the tab's close: a
+            // workspace comes from the broker and the compositor is already
+            // its client. Creating one starts no turn; the desk that appears
+            // is empty until someone types into it.
+            self.requests.push(vec!["create-desk".into()]);
+            self.notes.push("new agentdesk requested".into());
             return true;
         }
 
@@ -2027,6 +2088,116 @@ impl Screen {
         let _ = fonts;
     }
 
+    // ---- the start menu ----------------------------------------------------
+
+    /// The Agentware mark at the left end of the taskbar band.
+    fn start_button_rect(&self, at: usize) -> Rect {
+        let band = self.regions_for(at).taskbar;
+        Rect::new(
+            band.x + ui::sc(6),
+            band.y + (band.h - dock_tile()) / 2,
+            start_button_w(),
+            dock_tile(),
+        )
+    }
+
+    /// Where the panel goes: the workspace area above the taskbar. The menu
+    /// centres itself in it and sizes itself to its content.
+    fn start_area(&self) -> Rect {
+        let area = self.workspace_area();
+        Rect::new(area.x, area.y, area.w, area.h - self.taskbar_h)
+    }
+
+    /// The open panel's rectangle, or an empty one when it is closed.
+    fn start_rect(&self) -> Rect {
+        self.start.as_ref().map(StartMenu::panel).unwrap_or(Rect::new(0, 0, 0, 0))
+    }
+
+    fn open_start(&mut self, fonts: &Fonts) {
+        self.commit_rename(fonts);
+        let mut menu = StartMenu::open();
+        let area = self.start_area();
+        menu.build(fonts, &mut self.images, area);
+        self.start = Some(menu);
+        self.focus = Surface::Start;
+        self.blink_epoch = Instant::now();
+    }
+
+    fn close_start(&mut self) {
+        if self.start.take().is_some() && self.focus == Surface::Start {
+            self.focus = Surface::Desk;
+        }
+    }
+
+    /// Carry out what the menu decided. Requests go to PID 1 the way the stop
+    /// button's does; the menu itself never touches the control connection.
+    fn start_outcome(&mut self, fonts: &Fonts, outcome: StartOutcome) -> bool {
+        match outcome {
+            StartOutcome::Nothing => false,
+            StartOutcome::Changed => {
+                let area = self.start_area();
+                if let Some(menu) = &mut self.start {
+                    menu.build(fonts, &mut self.images, area);
+                }
+                true
+            }
+            StartOutcome::Close => {
+                self.close_start();
+                true
+            }
+            StartOutcome::CreateDesk(prompt) => {
+                match prompt {
+                    Some(text) => self.requests.push(vec!["create-desk".into(), text]),
+                    None => self.requests.push(vec!["create-desk".into()]),
+                }
+                self.notes.push("new agentdesk requested from the start menu".into());
+                self.close_start();
+                true
+            }
+            StartOutcome::Open(app) => {
+                let desk = self.workspaces[self.current].id;
+                self.notes.push(format!("workspace {desk}: opening {app} from the start menu"));
+                self.requests.push(vec!["open-app".into(), desk.to_string(), app]);
+                self.close_start();
+                true
+            }
+        }
+    }
+
+    fn click_start(&mut self, fonts: &Fonts, x: i32, y: i32) -> bool {
+        let Some(menu) = &mut self.start else { return false };
+        let outcome = menu.click(x, y);
+        self.start_outcome(fonts, outcome)
+    }
+
+    fn start_key(&mut self, fonts: &Fonts, key: Key) -> bool {
+        let Some(menu) = &mut self.start else { return false };
+        let outcome = menu.key(key);
+        self.start_outcome(fonts, outcome)
+    }
+
+    fn start_wheel(&mut self, fonts: &Fonts, delta: i32, x: i32, y: i32) -> bool {
+        let Some(menu) = &mut self.start else { return false };
+        let outcome = menu.wheel(delta, x, y);
+        self.start_outcome(fonts, outcome)
+    }
+
+    /// The button on the band: the mark, pressed-looking while the menu is up.
+    fn draw_start_button(&self, canvas: &mut Canvas) {
+        let button = self.start_button_rect(self.current);
+        if self.start.is_some() {
+            canvas.fill_round_rect(button, ui::radius_control(), ui::PRESSED);
+            canvas.stroke_round_rect(button, ui::radius_control(), 1, ui::BORDER);
+        }
+        if let Some(icon) = self.images.icons.get(AGENTWARE_ICON, start_icon()) {
+            canvas.blend_pixmap(
+                icon.as_ref(),
+                button.x + (button.w - start_icon()) / 2,
+                button.y + (button.h - start_icon()) / 2,
+            );
+        }
+    }
+
     // ---- painting ----------------------------------------------------------
 
     pub fn draw(&mut self, canvas: &mut Canvas, fonts: &Fonts, pointer: (i32, i32)) {
@@ -2051,6 +2222,9 @@ impl Screen {
             None => self.draw_empty(canvas, fonts),
         }
 
+        if let Some(menu) = &self.start {
+            menu.draw(canvas, fonts, &self.images, self.start_rect(), self.caret_phase());
+        }
         self.draw_nav(canvas, fonts, pointer);
 
         if self.debug {
@@ -2076,7 +2250,7 @@ impl Screen {
         canvas.fill_rect(regions.background, ui::BACKGROUND);
         if let Some(desk) = desk {
             canvas.clipped(regions.background, |canvas| {
-                desk.draw_region(canvas, fonts, "background")
+                desk.draw_region(canvas, fonts, &self.images, "background")
             });
         }
 
@@ -2088,40 +2262,40 @@ impl Screen {
                 continue;
             }
             let focused = self.focus == Surface::App(window.fd);
-            let Some(client) = self.client(window.fd) else { continue };
-            let icon = self.icons.get(&client.name, title_icon());
             canvas.clipped(regions.apps, |canvas| {
-                draw_window(canvas, fonts, client, icon, window, focused, pointer)
+                self.draw_window(canvas, fonts, window, focused, pointer)
             });
         }
 
+        // The taskbar band: the agentdesk's row of controls on a raised
+        // surface, with the compositor's dock centred over the middle of it.
+        let band = regions.taskbar;
+        canvas.fill_round_rect_vgrad(band, 0, ui::lift(ui::SURFACE, 6), ui::SURFACE);
+        canvas.fill_rect(Rect::new(band.x, band.y, band.w, 1), ui::BORDER);
+        if let Some(desk) = desk {
+            canvas.clipped(band, |canvas| desk.draw_region(canvas, fonts, &self.images, "taskbar"));
+        }
         self.draw_dock(canvas, fonts);
+        self.draw_start_button(canvas);
 
-        // Only the pane has a painted background now; the taskbar region has no
-        // height and the dock is its own floating surface.
         let rect = regions.pane;
         if rect.w > 0 {
             canvas.fill_rect(rect, ui::SURFACE);
             canvas.fill_rect(Rect::new(rect.x, rect.y, 1, rect.h), ui::BORDER);
             if let Some(desk) = desk {
-                canvas.clipped(rect, |canvas| desk.draw_region(canvas, fonts, "pane"));
+                canvas.clipped(rect, |canvas| desk.draw_region(canvas, fonts, &self.images, "pane"));
             }
         }
 
         self.draw_pane_handle(canvas);
     }
 
-    /// The dock: one icon tile per open window, floating over the apps region.
+    /// The dock: one icon tile per open window, on the taskbar band.
     fn draw_dock(&self, canvas: &mut Canvas, fonts: &Fonts) {
         let pills = self.dock_pills(self.current);
         if pills.is_empty() {
             return;
         }
-
-        let dock = self.dock_rect(self.current);
-        canvas.shadow(dock, ui::radius_surface(), ui::sc(14), 110);
-        canvas.fill_round_rect_vgrad(dock, ui::radius_surface(), ui::lift(ui::SURFACE, 8), ui::SURFACE);
-        canvas.stroke_round_rect(dock, ui::radius_surface(), 1, ui::BORDER);
 
         // The fallback for an app without an icon: its initial, drawn large.
         // A letter is not a picture, but it is stable, unique-ish, and honest
@@ -2136,14 +2310,15 @@ impl Screen {
 
             if focused {
                 canvas.fill_round_rect(pill, ui::radius_control(), ui::RAISED);
+                canvas.stroke_round_rect(pill, ui::radius_control(), 1, ui::BORDER);
             }
 
-            match self.icons.get(&client.name, dock_icon()) {
+            match self.images.icons.get(&client.name, dock_icon()) {
                 Some(icon) => {
                     canvas.blend_pixmap(
                         icon.as_ref(),
                         pill.x + (pill.w - dock_icon()) / 2,
-                        pill.y + ui::sc(2),
+                        pill.y + ui::sc(3),
                     );
                 }
                 None => {
@@ -2154,7 +2329,7 @@ impl Screen {
                         fonts,
                         &initial,
                         x,
-                        pill.y + ui::sc(2),
+                        pill.y + ui::sc(3),
                         &style,
                         ink,
                     );
@@ -2223,7 +2398,7 @@ impl Screen {
         };
 
         canvas.clipped(rect, |canvas| {
-            ui::paint_subtree(canvas, fonts, &doc.tree, &self.nav_layout, Document::ROOT, &focus)
+            ui::paint_subtree(canvas, fonts, &self.images, &doc.tree, &self.nav_layout, Document::ROOT, &focus)
         });
 
         // Close glyphs, drawn over each tab's reserved right end the way window
@@ -2344,15 +2519,17 @@ fn content_of(rect: Rect) -> Rect {
 /// are compositor affordances over a client rather than part of any client's
 /// interface, and putting them in the tree would mean every application could
 /// decide whether it was closable.
+impl Screen {
 fn draw_window(
+    &self,
     canvas: &mut Canvas,
     fonts: &Fonts,
-    client: &Client,
-    icon: Option<&tiny_skia::Pixmap>,
     window: &Window,
     focused: bool,
     pointer: (i32, i32),
 ) {
+    let Some(client) = self.client(window.fd) else { return };
+    let icon = self.images.icons.get(&client.name, title_icon());
     let rect = window.rect;
     let maximized = window.maximized;
     let bar = Rect::new(rect.x, rect.y, rect.w, window_title_h());
@@ -2440,10 +2617,11 @@ fn draw_window(
     });
 
     let content = content_of(rect);
-    canvas.clipped(content, |canvas| client.draw(canvas, fonts));
+    canvas.clipped(content, |canvas| client.draw(canvas, fonts, &self.images));
 
     canvas.fill_rect(Rect::new(bar.x, bar.y + bar.h - 1, bar.w, 1), ui::BORDER);
     canvas.stroke_round_rect(rect, ui::radius_window(), 1, ui::BORDER);
+}
 }
 
 /// Keys the compositor keeps for itself, before anything is routed.
@@ -2457,7 +2635,7 @@ pub fn compositor_key(key: Key) -> Option<CompositorKey> {
 }
 
 pub enum CompositorKey {
-    /// F1. A stand-in for the start menu, which does not exist.
+    /// F1. Cycles workspaces from the keyboard, the way the tabs do by pointer.
     CycleWorkspace,
     /// F2. The diagnostic overlay.
     ToggleDebug,

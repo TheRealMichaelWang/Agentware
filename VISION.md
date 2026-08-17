@@ -14,9 +14,9 @@ The core unit of the system is the **agentdesk**: a workspace holding one thread
 
 ## Agentdesks
 * **One Workspace Per Thread of Work:** An agentdesk is an isolated desktop environment holding one task, one conversation, and however many apps that work needs. Multiple apps living together in one workspace is the whole point of it.
-* **Apps Are Opened From Inside:** Each agentdesk carries its own app launcher listing everything installed, and opening one puts it in *that* workspace. This is the only way an app is ever launched, so there is exactly one action for "start something new" and exactly one for "add to what I am doing," and they live in different places.
+* **Apps Are Opened From Inside:** The start menu lists everything installed, and opening one puts it in the workspace on screen; an agent opens one by asking its agentdesk. Either way an app is launched into a workspace, never on its own, so there is exactly one action for "start something new" (a new agentdesk, from the same menu) and exactly one for "add to what I am doing".
 * **First-Class Interaction:** Within its agentdesk, the agent operates exactly like a human user. It can freely open applications, navigate interfaces, and manage tasks.
-* **Minimalist UI:** The agentdesk features a streamlined interface containing only its app launcher and a taskbar for switching between the apps open inside it. Either the human or the agent can open more at any time.
+* **Minimalist UI:** The agentdesk features a streamlined interface: a taskbar with the start button, the dock of what is open, and the clock. Either the human or the agent can open more apps at any time.
 * **Global Navigation:** The human user can quickly move between the home screen and any open agentdesk using a persistent upper navigation bar.
 
 ## The Side Pane

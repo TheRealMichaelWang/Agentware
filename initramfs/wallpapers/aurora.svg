@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080">
+  <defs>
+    <linearGradient id="night" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#070a12"/>
+      <stop offset="1" stop-color="#101626"/>
+    </linearGradient>
+    <linearGradient id="curtain1" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3fbf9a" stop-opacity="0"/>
+      <stop offset="0.4" stop-color="#3fbf9a" stop-opacity="0.35"/>
+      <stop offset="0.7" stop-color="#4f9cf5" stop-opacity="0.25"/>
+      <stop offset="1" stop-color="#4f9cf5" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="curtain2" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#7c5cf5" stop-opacity="0"/>
+      <stop offset="0.5" stop-color="#7c5cf5" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#3fbf9a" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect width="1920" height="1080" fill="url(#night)"/>
+  <path d="M-100 620 C 300 300, 700 200, 1100 380 S 1700 520, 2020 260 L2020 -50 L-100 -50 Z" fill="url(#curtain1)"/>
+  <path d="M-100 780 C 400 560, 900 640, 1300 420 S 1800 200, 2020 360 L2020 -50 L-100 -50 Z" fill="url(#curtain2)"/>
+  <g fill="#e8ebf2">
+    <circle cx="180" cy="120" r="1.6"/><circle cx="420" cy="80" r="1.2"/><circle cx="640" cy="160" r="1.4"/>
+    <circle cx="900" cy="60" r="1.1"/><circle cx="1180" cy="140" r="1.5"/><circle cx="1500" cy="90" r="1.2"/>
+    <circle cx="1720" cy="180" r="1.6"/><circle cx="300" cy="300" r="1.0"/><circle cx="1050" cy="260" r="1.0"/>
+    <circle cx="1620" cy="330" r="1.3"/><circle cx="760" cy="330" r="1.1"/><circle cx="1350" cy="220" r="0.9"/>
+  </g>
+</svg>

@@ -1,6 +1,6 @@
 //! The supervisor control socket.
 //!
-//! `startmenu` and the agentdesks do not fork processes themselves. They ask
+//! The compositor and the agentdesks do not fork processes themselves. They ask
 //! PID 1 over this socket, which is what keeps every process in the system a
 //! direct child of the supervisor with a known owner. See ARCHITECTURE.md for
 //! why that matters more than it looks.

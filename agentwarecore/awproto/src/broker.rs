@@ -13,10 +13,14 @@
 //! control client all speak one implementation. The alternative is three, and
 //! the third one to be written is the one that gets a field order wrong.
 
-use std::io::{self, Write};
+use std::io::{self, IoSliceMut, Write};
+use std::mem::MaybeUninit;
+use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 
-use crate::{SOCKET_PATH, encode, read_frame};
+use rustix::net::{self, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags};
+
+use crate::{HEADER, MAX_FRAME, SOCKET_PATH, encode, read_frame};
 
 pub struct Broker {
     stream: UnixStream,
@@ -83,16 +87,82 @@ impl Broker {
     /// *that* a turn should run, never what it is about.
     ///
     /// The reply carries the agentdesk's end of a private channel to the agent,
-    /// attached with `SCM_RIGHTS`. This reads the reply with an ordinary read,
-    /// which discards it. A real agentdesk must use `recvmsg` instead, because
-    /// that channel is how conversation history goes down and telemetry comes
-    /// back up.
-    pub fn start_agent(&mut self, desk: u32) -> Result<i32, String> {
-        let reply = self.ask(&["start-agent", &desk.to_string()])?;
-        reply
-            .first()
+    /// attached with `SCM_RIGHTS`, so it is read with `recvmsg` rather than an
+    /// ordinary read: a descriptor belongs to the message that explains it, and
+    /// reading the bytes without the ancillary data would close it unseen. That
+    /// channel is how conversation history goes down and telemetry comes back
+    /// up; see [`crate::turn`].
+    pub fn start_agent(&mut self, desk: u32) -> Result<(i32, UnixStream), String> {
+        self.stream
+            .write_all(&encode(&["start-agent", &desk.to_string()]))
+            .map_err(|err| format!("write: {err}"))?;
+
+        let (reply, attached) = self.read_reply_with_fd()?;
+        match reply.first().map(String::as_str) {
+            Some("ok") => {}
+            _ => return Err(reply.join(" ")),
+        }
+        let pid = reply
+            .get(1)
             .and_then(|pid| pid.parse().ok())
-            .ok_or_else(|| "no pid in the reply".to_owned())
+            .ok_or_else(|| "no pid in the reply".to_owned())?;
+        let channel = attached.ok_or_else(|| "no channel to the agent in the reply".to_owned())?;
+        Ok((pid, UnixStream::from(channel)))
+    }
+
+    /// One reply frame, with the descriptor attached to it if there was one.
+    ///
+    /// The supervisor sends a frame and its descriptor in one `sendmsg`, and
+    /// replies are read one at a time, so the descriptor arriving with the
+    /// first bytes of the frame is the descriptor for this frame. Reading the
+    /// header separately from the body would still see it on the header.
+    fn read_reply_with_fd(&mut self) -> Result<(Vec<String>, Option<OwnedFd>), String> {
+        let mut received: Option<OwnedFd> = None;
+        let mut buf = Vec::new();
+        let mut want = HEADER;
+
+        while buf.len() < want {
+            let mut chunk = vec![0u8; want - buf.len()];
+            let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+            let mut control = RecvAncillaryBuffer::new(&mut space);
+            let got = match net::recvmsg(
+                &self.stream,
+                &mut [IoSliceMut::new(&mut chunk)],
+                &mut control,
+                RecvFlags::empty(),
+            ) {
+                Ok(got) => got,
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(err) => return Err(format!("read reply: {err}")),
+            };
+            if got.bytes == 0 {
+                return Err("read reply: the supervisor closed the connection".to_owned());
+            }
+            for message in control.drain() {
+                if let RecvAncillaryMessage::ScmRights(fds) = message {
+                    for fd in fds {
+                        // One descriptor per reply. A second would be a bug on
+                        // the sending side, and closing it here is the honest
+                        // response.
+                        if received.is_none() {
+                            received = Some(fd);
+                        }
+                    }
+                }
+            }
+            buf.extend_from_slice(&chunk[..got.bytes]);
+            if buf.len() == HEADER && want == HEADER {
+                let len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                if len > MAX_FRAME {
+                    return Err(format!("read reply: frame of {len} bytes exceeds the limit"));
+                }
+                want = HEADER + len;
+            }
+        }
+
+        let text = String::from_utf8(buf[HEADER..].to_vec())
+            .map_err(|_| "read reply: frame is not valid UTF-8".to_owned())?;
+        Ok((text.split('\0').map(str::to_owned).collect(), received))
     }
 
     pub fn interrupt(&mut self, desk: u32) -> Result<(), String> {

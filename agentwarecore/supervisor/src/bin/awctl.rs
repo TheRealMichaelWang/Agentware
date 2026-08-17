@@ -1,11 +1,9 @@
 //! Client for the supervisor control socket.
 //!
-//! Three uses. `awctl <verb> [args...]` issues a single request and prints the
+//! Two uses. `awctl <verb> [args...]` issues a single request and prints the
 //! reply, which is the only way to poke at the broker on a machine with no
 //! shell. `awctl selftest` runs a scripted sequence and exits non-zero if any
-//! step misbehaves, which is what the boot-time self-test runs. `awctl demo`
-//! opens one workspace with one application in it, which is what puts something
-//! on screen while `startmenu` does not exist.
+//! step misbehaves, which is what the boot-time self-test runs.
 //!
 //! It speaks the protocol over a real socket rather than calling into the
 //! supervisor, so the framing, the partial-read handling and the dispatch all
@@ -22,7 +20,6 @@ fn main() {
             2
         }
         Some("selftest") => selftest(),
-        Some("demo") => demo(),
         Some(_) => single(&args),
     };
 
@@ -130,37 +127,3 @@ fn selftest() -> i32 {
         1
     }
 }
-
-/// Put two workspaces on screen.
-///
-/// The start menu is what will do this, and it does not exist. Until it does,
-/// the compositor has nothing to render and the display half of the system
-/// cannot be looked at. This is the smallest thing that fills that gap: two
-/// workspaces and nothing else, because a workspace opens its own applications
-/// through its own launcher and being handed them by the start menu would be a
-/// path nothing real will ever take.
-///
-/// Two rather than one because a navigation bar with nowhere to navigate to
-/// proves nothing.
-fn demo() -> i32 {
-    let mut broker = match Broker::connect() {
-        Ok(broker) => broker,
-        Err(err) => {
-            eprintln!("demo: cannot reach the supervisor: {err}");
-            return 1;
-        }
-    };
-
-    for prompt in [None, Some("look at the second workspace")] {
-        match broker.create_desk(prompt) {
-            Ok(id) => println!("demo: workspace {id} created"),
-            Err(err) => {
-                eprintln!("demo: create-desk: {err}");
-                return 1;
-            }
-        }
-    }
-
-    0
-}
-

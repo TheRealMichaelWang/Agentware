@@ -14,14 +14,22 @@
 //! Notice what this file cannot do. It never produces an event, only intents. It
 //! never names a workspace, because it has no way to name one and is never asked
 //! which it is in. It cannot see the agentdesk that started it, so it cannot read
-//! the transcript of its own streamed thoughts.
+//! the transcript of its own streamed thoughts. It cannot open an application
+//! itself: it asks the agentdesk, which asks PID 1, and it finds out whether
+//! that worked the way it finds out everything, by asking the compositor.
+//!
+//! What it says to the agentdesk is the other half of the turn. The context
+//! comes down the private channel first, and everything the agent does goes back
+//! up it as telemetry, so the human watches the turn in the pane rather than in
+//! the kernel log. The reply at the end is what joins the conversation.
 //!
 //! Usage: awagent <desk-id>
 
 use std::io::Write as _;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use awproto::agent::{Link, Outcome};
+use awproto::turn::{self, Turn};
 
 /// A pause between intents, standing in for the time a real agent spends
 /// deciding what to do next.
@@ -31,27 +39,109 @@ use awproto::agent::{Link, Outcome};
 /// makes the fake cursor a blur rather than something a human can follow.
 const THINKING: Duration = Duration::from_millis(300);
 
+/// How long to wait for the calculator to appear after asking for it. An
+/// application is forked by PID 1 and attaches when its first tree arrives,
+/// which is quick, but not instant.
+const OPENING: Duration = Duration::from_secs(5);
+
+/// The agent's two channels, and the words that go up the second.
+struct Agent {
+    link: Link,
+    /// The agentdesk that started this turn. Absent only when something other
+    /// than an agentdesk did, which is what the self-test does; the turn then
+    /// runs with nobody to tell.
+    desk: Option<Turn>,
+}
+
+impl Agent {
+    fn say(&mut self, kind: &str, text: &str) {
+        log(text);
+        if let Some(desk) = &mut self.desk
+            && let Err(err) = desk.telemetry(kind, text)
+        {
+            log(&format!("could not reach the agentdesk: {err}"));
+            self.desk = None;
+        }
+    }
+}
+
 fn main() {
-    let mut link = match Link::inherited() {
+    let link = match Link::inherited() {
         Ok(link) => link,
         Err(err) => {
             log(&format!("no interface connection: {err}"));
             std::process::exit(1);
         }
     };
+    let desk = match Turn::inherited() {
+        Ok(turn) => Some(turn),
+        Err(err) => {
+            log(&format!("no agentdesk channel ({err}); the turn runs untold"));
+            None
+        }
+    };
+    let mut agent = Agent { link, desk };
 
-    // What is open, and what one of them looks like. Both answers are scoped to
-    // this agent's own workspace by the compositor, from what the supervisor
-    // told it at handoff. Nothing here asserts which workspace that is.
-    match link.apps() {
-        Ok(markup) => report("apps", &markup),
+    // The context. A real agent would think about it; this one reports what
+    // it was given so the channel can be seen working end to end.
+    if let Some(desk) = &mut agent.desk {
+        match desk.context() {
+            Ok((history, prompt)) => {
+                let earlier = history.len();
+                agent.say(
+                    turn::KIND_THOUGHT,
+                    &format!("read {earlier} earlier message(s); the prompt is {prompt:?}"),
+                );
+            }
+            Err(err) => {
+                log(&format!("could not read the context: {err}"));
+                agent.desk = None;
+            }
+        }
+    }
+
+    // What is open. The answer is scoped to this agent's own workspace by the
+    // compositor, from what the supervisor told it at handoff. Nothing here
+    // asserts which workspace that is.
+    let apps = match agent.link.apps() {
+        Ok(markup) => markup,
         Err(err) => {
             log(&format!("could not read the workspace: {err}"));
             std::process::exit(1);
         }
+    };
+    report("apps", &apps);
+
+    // The turn needs the calculator. If it is not open, ask the workspace to
+    // open it, then wait until the compositor says it is there.
+    if !apps.contains("awcalc") {
+        agent.say(turn::KIND_ACTION, "opening the calculator");
+        if let Some(desk) = &mut agent.desk
+            && let Err(err) = desk.open_app("awcalc")
+        {
+            log(&format!("could not ask for the calculator: {err}"));
+        }
+        let waited = Instant::now();
+        loop {
+            std::thread::sleep(THINKING);
+            match agent.link.apps() {
+                Ok(markup) if markup.contains("awcalc") => break,
+                Ok(_) if waited.elapsed() < OPENING => continue,
+                Ok(_) => {
+                    agent.say(turn::KIND_ERROR, "the calculator did not open");
+                    finish(&mut agent, "I could not open the calculator, so I could not add the numbers.");
+                    return;
+                }
+                Err(err) => {
+                    log(&format!("could not read the workspace: {err}"));
+                    std::process::exit(1);
+                }
+            }
+        }
+        agent.say(turn::KIND_RESULT, "the calculator is open");
     }
 
-    match link.view("awcalc") {
+    match agent.link.view("awcalc") {
         Ok(markup) => report("view awcalc", &markup),
         Err(err) => log(&format!("could not read awcalc: {err}")),
     }
@@ -89,11 +179,13 @@ fn main() {
         ("awcalc", "type-text", "digit-7", "hello", "unsupported-action"),
     ];
 
+    agent.say(turn::KIND_THOUGHT, "working out 12 + 34 on the calculator, one press at a time");
+
     let mut surprises = 0;
     for &(app, action, target, value, expected) in script {
         std::thread::sleep(THINKING);
 
-        let outcome = match link.act(app, action, target, value) {
+        let outcome = match agent.link.act(app, action, target, value) {
             Ok(outcome) => outcome,
             Err(err) => {
                 log(&format!("connection failed: {err}"));
@@ -106,28 +198,68 @@ fn main() {
             Outcome::Rejected(reason) => reason.clone(),
         };
 
+        let what = if value.is_empty() {
+            format!("{action} {target} in {app}")
+        } else {
+            format!("{action} {value:?} into {target} in {app}")
+        };
         if got == expected {
-            log(&format!("{action} {target} in {app} -> {got}"));
+            agent.say(turn::KIND_ACTION, &format!("{what}: {got}"));
         } else {
             surprises += 1;
-            log(&format!(
-                "{action} {target} in {app} -> {got}, expected {expected}"
-            ));
+            agent.say(turn::KIND_ERROR, &format!("{what}: {got}, expected {expected}"));
         }
     }
 
     // The last thing it does is read the screen again, because an agent that
     // acts without checking the result is the thing this whole design exists to
     // make unnecessary. The display should read 46.
-    if let Ok(markup) = link.view("awcalc") {
-        report("view awcalc after the turn", &markup);
+    let display = match agent.link.view("awcalc") {
+        Ok(markup) => {
+            report("view awcalc after the turn", &markup);
+            display_of(&markup)
+        }
+        Err(_) => None,
+    };
+    if let Some(shown) = &display {
+        agent.say(turn::KIND_RESULT, &format!("the calculator's display reads {shown}"));
     }
 
-    if surprises == 0 {
-        log("turn complete, every intent resolved as expected");
+    let reply = match (surprises, display) {
+        (0, Some(shown)) => format!("12 + 34 = {shown}. Every step went as expected."),
+        (0, None) => "Done, every step went as expected, but I could not read the result back.".to_owned(),
+        (n, Some(shown)) => format!("The display reads {shown}, but {n} step(s) did not go as expected."),
+        (n, None) => format!("{n} step(s) did not go as expected and I could not read the result back."),
+    };
+    log(if surprises == 0 {
+        "turn complete, every intent resolved as expected"
     } else {
-        log(&format!("turn complete with {surprises} surprise(s)"));
+        "turn complete with surprises"
+    });
+    finish(&mut agent, &reply);
+}
+
+/// The reply ends the turn. The agentdesk sees the hangup when this process
+/// exits, which is what tells it the turn is over.
+fn finish(agent: &mut Agent, reply: &str) {
+    if let Some(desk) = &mut agent.desk
+        && let Err(err) = desk.reply(reply)
+    {
+        log(&format!("could not deliver the reply: {err}"));
     }
+}
+
+/// The number the calculator is showing, read out of the agent's view: the
+/// first text that parses as one. The pending line above it is text too, but
+/// reads "12 +" rather than a number, so this finds the display.
+fn display_of(view: &str) -> Option<String> {
+    view.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let inner = line.strip_prefix("<text>")?.strip_suffix("</text>")?;
+            inner.parse::<f64>().ok().map(|_| inner.to_owned())
+        })
+        .next()
 }
 
 fn report(what: &str, markup: &str) {
@@ -139,10 +271,8 @@ fn report(what: &str, markup: &str) {
 
 /// Log to the kernel ring buffer.
 ///
-/// An agent's real output is telemetry to its agentdesk, over the second
-/// descriptor it was handed. That channel is not used here: this stand-in has no
-/// conversation to stream, and the agentdesk stand-in has no pane to stream it
-/// into yet.
+/// The agent's real output is telemetry to its agentdesk; the log carries a
+/// copy so a serial capture tells the same story the pane does.
 fn log(message: &str) {
     let line = format!("<6>awagent: {message}\n");
     if let Ok(mut kmsg) = std::fs::OpenOptions::new().write(true).open("/dev/kmsg") {

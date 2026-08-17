@@ -31,7 +31,7 @@
 //! reimplement their preservation slightly differently.
 
 use std::io::{self, Read, Write};
-use std::os::fd::{FromRawFd, RawFd};
+use std::os::fd::{AsFd, BorrowedFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 
 use crate::{Decoder, HAI_FD_ENV, encode};
@@ -158,6 +158,51 @@ impl Surface {
         Ok(self.version)
     }
 
+    /// The descriptor, for a client that waits on more than one thing.
+    ///
+    /// An application blocks in [`Surface::next_event`] and needs nothing else.
+    /// An agentdesk cannot: it is also listening to its agent and to a clock, so
+    /// it polls this alongside the rest and pulls events with
+    /// [`Surface::pump`].
+    pub fn set_nonblocking(&self, on: bool) -> io::Result<()> {
+        self.stream.set_nonblocking(on)
+    }
+
+    /// Read whatever the compositor has sent without waiting for more.
+    ///
+    /// Only meaningful on a non-blocking surface. Returns `false` once the
+    /// compositor has hung up; the events already read are still available
+    /// through [`Surface::take_event`].
+    pub fn pump(&mut self) -> io::Result<bool> {
+        loop {
+            let mut buf = [0u8; 4096];
+            match self.stream.read(&mut buf) {
+                Ok(0) => return Ok(false),
+                Ok(n) => self.decoder.feed(&buf[..n]),
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(true),
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    /// The next event already read, if there is one.
+    pub fn take_event(&mut self) -> io::Result<Option<Event>> {
+        loop {
+            let frame = self
+                .decoder
+                .next_frame()
+                .map_err(|err| io::Error::other(err.to_string()))?;
+            match frame {
+                Some(fields) => match Event::from_fields(&fields) {
+                    Some(event) => return Ok(Some(event)),
+                    None => continue,
+                },
+                None => return Ok(None),
+            }
+        }
+    }
+
     /// Block until the next event arrives, or `None` if the compositor hung up.
     ///
     /// A message that is not an event is skipped rather than treated as fatal.
@@ -185,6 +230,12 @@ impl Surface {
                 Err(err) => return Err(err),
             }
         }
+    }
+}
+
+impl AsFd for Surface {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.stream.as_fd()
     }
 }
 

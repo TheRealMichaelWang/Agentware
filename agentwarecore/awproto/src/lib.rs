@@ -26,14 +26,17 @@
 //! stand-in binaries speak the same protocol by construction instead of by
 //! copy-paste.
 //!
-//! The same framing carries the display protocol, in [`display`]. That one runs
-//! between a drawing client and the haimanager and never touches PID 1, but it
-//! lives here for the same reason: two processes that must agree on a wire
-//! should read it out of one file.
+//! The same framing carries the display protocol, in [`display`], the agent's
+//! surface in [`agent`], and the agentdesk's private channel to its agent in
+//! [`turn`]. None of those touch PID 1, but they live here for the same
+//! reason: two processes that must agree on a wire should read it out of one
+//! file. [`settings`] is the one contract that is a file rather than a wire.
 
 pub mod agent;
 pub mod broker;
 pub mod display;
+pub mod settings;
+pub mod turn;
 
 use std::fmt;
 use std::io::{self, Read};
@@ -60,7 +63,7 @@ pub const ROLE_HAIMANAGER: &str = "haimanager";
 /// the machine dies. 64 KiB is far more than any command needs.
 pub const MAX_FRAME: usize = 64 * 1024;
 
-const HEADER: usize = 4;
+pub(crate) const HEADER: usize = 4;
 
 #[derive(Debug)]
 pub enum ProtoError {

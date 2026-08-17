@@ -35,6 +35,7 @@ def qemu(monitor_path, qmp_path, serial_path, append, width, height):
             # The same absolute pointing device the interactive window has, so
             # what the tool exercises is what the human uses.
             "-device", "virtio-tablet-pci",
+            "-rtc", "base=localtime",
             "-no-reboot",
             "-display", "none",
             "-serial", "file:" + serial_path,
@@ -205,6 +206,11 @@ def main():
         # with "abs" drive the tablet instead: "abs 0.5 0.9" points at a screen
         # fraction, "abs 0.5 0.9 click" also clicks there.
         for command in args.do:
+            # "sleep N" waits between injected inputs, for gestures that need
+            # the guest to catch up: an agent turn, an app being forked.
+            if command.startswith("sleep "):
+                time.sleep(float(command.split()[1]))
+                continue
             if command.startswith("abs "):
                 parts = command.split()
                 qmp_tablet(qmp_path, float(parts[1]), float(parts[2]),

@@ -22,14 +22,19 @@ obvious alternative was tried and failed.
 
 ```
 agentwarecore/          cargo workspace
-  awproto/              both wire protocols: the control socket, and display
+  awproto/              the wires: control socket, display, agent, desk-agent turn;
+                        and the one file contract, settings
   supervisor/           PID 1: init, service table, spawn broker
     src/bin/            awtest awstubborn awctl awui: self-test stand-ins
   haimanager/           the compositor: DRM, input, AWML, layout, paint, clients
-  awapp/                stand-in agentdesk: the reference desk connection
-  awagent/              stand-in per-turn worker: queries, intents, rejections
+    src/startmenu.rs    the start menu panel: prompt and application grid
+    assets/             the Agentware mark, compiled in
+  agentdesk/            the workspace process: conversation, turns, taskbar clock
+  awsettings/           the settings app (a first-party app that edits system state)
+  awagent/              stand-in per-turn worker: scripted, speaks both channels
 agentwareapps/          cargo workspace: first-party applications
   awcalc/               a calculator, the first real application
+wallpapers/             SVG wallpapers, staged to /wallpapers
 initramfs/              staged image contents (build output, gitignored)
 tools/screenshot.py     boot, inject input, capture the screen as PNG
 kernel-build/           Linux submodule
@@ -116,8 +121,55 @@ reports paint/blit cost while frames are produced):
   paint fell from 14ms avg / 34ms worst to 7.1ms avg / 14ms worst.
 
 **Nothing is left of the original plan.** What is missing now is not
-compositor work: `startmenu`, a real `agentdesk` that streams conversation to
-and from an agent, a real `agent` with a model behind it, and more applications.
+compositor work: a real `agent` with a model behind it, and more applications.
+
+**Milestone 10: the real agentdesk.** `agentdesk/` is the workspace process
+ARCHITECTURE.md always described, and `awapp` is gone. It owns the
+conversation: what the human said, what the agent said back, and between them
+every line the agent reported while it worked, all in the pane as it happens.
+Send starts a turn by asking the broker for an agent, receiving the desk end
+of the private channel on the reply (via `SCM_RIGHTS`; the stand-in used to
+drop it on the floor), streaming history and the prompt down it, and reading
+telemetry back up. The turn ends when the channel hangs up, whether the agent
+finished, died or was stopped, so every ending is one code path. A message
+sent mid-turn is queued and starts the next turn the moment this one ends.
+The wire is `awproto::turn`: `history`/`prompt` down; `telemetry`, `open-app`
+and `reply` up. `open-app` is how an agent opens an application: it asks the
+workspace, which asks PID 1, and finds out whether it worked by asking the
+compositor what is open. `awagent` speaks it now, so the demo turn is watched
+in the pane rather than in the kernel log.
+
+The start menu is a panel, not a process (`haimanager/src/startmenu.rs`).
+The Agentware mark at the left end of the taskbar opens it, centred over the
+workspace and sized to its content: a large prompt on top (Enter makes a new
+agentdesk that begins with it; empty makes one with nothing to do), and below
+it every installed application as a grid three across, icon over name, each
+tile opening the app into the workspace on screen. A click anywhere else, or
+Escape, closes it. It is compositor chrome for the reasons the dock is: it
+needs the icons only the compositor holds, click-out is something only the
+compositor sees, and it must work when the workspace under it does not. It is
+still AWML through the same parser and painter; `button` gained `icon` and
+`tile`, and `height` joined `width` as a compositor-internal hint, all for
+this. Its requests go to PID 1 like the stop button's: `create-desk` and
+`open-app`. The `+` at the end of the nav tabs still creates an empty
+agentdesk, and the compositor asks for a blank one at boot and again whenever
+the last one closes.
+
+The taskbar band, left to right: the start button (compositor), the dock
+centred (compositor), and the clock and date at the far right (the desk's;
+kernel time, and QEMU is booted with `-rtc base=localtime` so it reads as
+the host's). The desk re-renders on a one-second tick for the clock and reads
+the wallpaper setting on the same tick.
+
+The `background` region holds the wallpaper: an `image` element, new to the
+catalogue, whose `src` the compositor loads (SVG via resvg, PNG via tiny-skia),
+fits with `cover`, composites over the system background once per size, and
+blits as opaque rows every frame. `awsettings` is a first-party app in
+`agentwarecore` that lists `/wallpapers` with previews and writes the choice
+to `/run/agentware/settings/wallpaper` (`awproto::settings`), the one setting
+that crosses between processes as a file: every desk picks it up within a
+second, no process is told. `text` wraps now, and `scroll anchor="end"` keeps
+a transcript pinned to its end until the human scrolls away.
 
 First-party applications live in `agentwareapps/`, a separate workspace because
 apps are clients of the display protocol, not parts of the system: they link
@@ -128,14 +180,15 @@ The demo agent turn drives it: 12 + 34, one press at a time, and reads back 46.
 
 An installed app is a **package, not a binary**: `/apps/<name>/` holds `exec`
 (what the supervisor forks), `icon.svg` (what the compositor draws in the title
-bar and the dock; SVG so one file serves every scale), and `description.txt`
-(for whatever lists apps to people and agents, once something does). The
-supervisor only ever touches `exec`; the compositor loads the icon itself under
-the name PID 1 handed over, parses it once per app, rasterizes once per size,
-and caches the miss too, so an iconless app costs one probe, not one per frame.
-The selftest stand-ins ship in the same format so `make selftest` exercises the
-same spawn path. The dock is icon tiles with a running dot, not text pills; an
-app without an icon shows its initial.
+bar and the dock; SVG so one file serves every scale), `description.txt` (what
+the start menu carries per tile and agents will read), and `name.txt` (the
+label under the icon; the folder name if absent). The supervisor only ever touches `exec`; the
+compositor loads the icon itself under the name PID 1 handed over, parses it
+once per app, rasterizes once per size, and caches the miss too, so an iconless
+app costs one probe, not one per frame. The selftest stand-ins ship in the same
+format so `make selftest` exercises the same spawn path, but without a
+description, which is what keeps them out of the start menu. The dock is icon tiles
+with a running dot, not text pills; an app without an icon shows its initial.
 
 Rendering is still the hand-rolled rasterizer, with **tiny-skia behind
 `Canvas`** for what genuinely needs a path engine: resvg renders the icons
@@ -146,11 +199,12 @@ tiny-skia scratch version measurably doubled paint time on a maximized window
 full of buttons. Measured after: drag paint 3-6.5ms avg at 2560x1440, agent
 turn repaints 5-6.8ms avg at 1600x1000.
 
-No `agentdesk`, no `agent`, no `startmenu` exist yet. `awapp` stands in for the
-agentdesk and is the reference client for the desk connection: regions, the
-conversation pane, and the broker requests a workspace makes. The supervisor
-logs and skips what is not installed rather than crash looping against it, so
-the system boots and is useful without them.
+No `agent` exists yet. `Programs::system` names `/bin/agent`; without
+`agentware.demo` a message sent from a desk gets "could not start an agent"
+in the pane and the log, and everything else works. With it, `awagent` stands
+in and answers any message by adding 12 and 34 on the calculator. Either way
+the machine boots to one blank agentdesk, no prompt, and closing the last
+agentdesk opens a blank one, so there is never a display with nothing on it.
 
 ## Building and running
 
@@ -181,7 +235,7 @@ tools/screenshot.py out.png --width 2560 --height 1440
 Screenshots at 1600x1000 and below render at scale 1.0, which keeps the older
 coordinate-scripted captures valid.
 
-Once it is up, F1 cycles workspaces, standing in for the start menu, F2 toggles a
+Once it is up, F1 cycles workspaces, F2 toggles a
 diagnostic overlay listing every connection and the version it is on, and F3
 folds the conversation pane away (animated, 200ms smoothstep; also the grip on
 the pane's edge). Windows have a title bar with chevron/brackets/cross controls
@@ -192,14 +246,11 @@ loop only when a caret exists. Scrollbars hug the content edge, drag (thumb or
 track-jump), and auto-hide 900ms after the content stops moving; the agent's
 `scroll-into-view` lights them the same way.
 
-The agentdesk's `taskbar` region is parked at zero height for now. The strip
-duplicated the dock and spent a full-width band doing it. The region stays in
-the protocol and the layout path, so nothing breaks when a desk declares it; it
-gets no room until there is a design worth giving room to.
-The taskbar's launcher and the pane's Send button both go through the real
-broker, so clicking them forks real processes: Send starts an agent turn, which
-is the whole of milestone 7 running against a live screen. The kernel log carries
-its intents and their outcomes.
+The start menu's tiles and prompt, the nav bar's `+` and the pane's Send
+button all go through the real broker, so clicking them forks real processes:
+Send starts an agent turn, which is the whole of milestone 7 running against a
+live screen, watched in the pane. The stop button ends it, and the pane says
+so.
 
 Builds target `x86_64-unknown-linux-musl`. No sudo is needed: `cpio` records a
 device node's major/minor from `stat` and never opens it.
@@ -216,8 +267,8 @@ tools/screenshot.py out.png --seconds 8 --append "console=ttyS0,115200 agentware
   --do "sendkey h" --do "sendkey shift-l" --do "mouse_move 0 0 -1"
 ```
 
-The `--append` matters: without `agentware.demo` there is nothing on screen to
-photograph. The pointer starts in the middle of the screen and every move is a
+The `--append` matters: without `agentware.demo` there is no agent to answer a
+message, so a turn cannot be photographed; the desk itself is there either way. The pointer starts in the middle of the screen and every move is a
 delta from where it is now.
 
 Use it. Every rendering bug so far was found this way and none would have been
@@ -303,10 +354,25 @@ is the list so it does not get relitigated.
 * Applications choose type and colour. All of it is stripped from the agent's
   view, which is safe because appearance can never carry meaning: descriptions
   are required and actions are derived.
+* There is **no start menu process**. The start menu is a compositor panel:
+  a prompt that becomes a new agentdesk, and the grid of installed apps. Its
+  requests are `create-desk` and `open-app` to PID 1, the way the stop button
+  and a tab's close are; the nav bar's `+` is `create-desk` with no prompt,
+  and the compositor asks for the first workspace at boot. The human opens
+  apps from the menu; an agent opens them only through its agentdesk.
+* **Settings are the one thing that crosses as a file.** A preference set in
+  one process and read by every workspace has no socket to travel on, so it is
+  a plain-text file in the RAM-backed runtime directory, read on the desk's
+  clock tick. Nothing is broadcast and nothing survives a reboot.
+* **The agent opens applications through its agentdesk**, never itself. It has
+  no broker connection; `open-app` up the turn channel is a request, and the
+  agent learns the outcome by asking the compositor what is open.
 
-A `width` attribute on a control is a compositor-internal sizing hint in
-physical pixels (used so the tab rename field keeps its tab's width); it is not
-part of the application catalogue and never reaches an agent.
+`width` and `height` attributes on a control are compositor-internal sizing
+hints in physical pixels (the tab rename field keeps its tab's width; the
+start menu's prompt is a large box), and `icon` and `tile` on a button draw
+an installed app's icon beside or above its label (the start menu's grid).
+None of them is part of the application catalogue and none reaches an agent.
 
 ## Gotchas that cost real time
 
@@ -369,4 +435,19 @@ part of the application catalogue and never reaches an agent.
   maximized window was full of them; the frames log caught it. Anything drawn
   every frame must be row fills, cached tiles, or a blit of something
   rasterized once. tiny-skia is for icons and genuinely curved work, not for
-  shapes a row fill can describe.
+  shapes a row fill can describe. The wallpaper follows the rule: fitted and
+  composited once per size into opaque XRGB rows, blitted per frame (about
+  1.5ms at 2560x1440; steady-state paint with a wallpaper showing measured
+  7.9ms avg there, 2-5ms at 1600x1000). The first fit of a full-screen SVG is
+  one long frame, 160ms at 1600x1000 and 350ms at 2560x1440, once per
+  wallpaper per size; moving it off the paint path is the obvious next step
+  if it ever matters.
+* **The parser decoded entities in attributes and not in text.** Nobody had
+  put a quote in text content until the pane showed the agent's telemetry as
+  `&quot;hello&quot;`. `escape` is used on both, so `unescape` must be too.
+* **A tick-driven client discards clicks it should not, unless it checks
+  versions.** The agentdesk re-renders once a second for its clock, so a click
+  can land against a tree that is one version stale for no reason the human
+  can see. The stale check is by version, so such a click is thrown away; the
+  cost is one lost click a minute at worst and the alternative is acting on a
+  tree the human did not see. Do not "fix" it by skipping the check.

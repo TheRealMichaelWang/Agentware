@@ -33,10 +33,14 @@ DISPLAY_H ?= 1440
 # apart the moment the window is scaled; a tablet is absolute, so the host hands
 # over the position itself. The PS/2 devices stay, because the monitor's
 # injected input and the wheel arrive through them.
+# The guest clock is set from the host's local time rather than UTC. The
+# taskbar shows the kernel's idea of the time as it stands, because there is
+# no timezone database in the image and no setting for one yet; on the host's
+# local time the clock in the corner reads the same as the one on the host.
 QEMU := qemu-system-x86_64 -enable-kvm -m 4G -cpu host \
 	-kernel $(KERNEL) -initrd $(INITRAMFS_ARCHIVE) \
 	-device virtio-vga,xres=$(DISPLAY_W),yres=$(DISPLAY_H) \
-	-device virtio-tablet-pci -no-reboot
+	-device virtio-tablet-pci -rtc base=localtime -no-reboot
 
 # ---------------------------------------------------------
 # Default Target
@@ -84,21 +88,33 @@ pack: build
 	cp $(BIN_DIR)/supervisor $(FS_DIR)/init
 	cp $(BIN_DIR)/haimanager $(FS_DIR)/bin/haimanager
 
-	# 3a. The stand-in agentdesk, which is what gives the compositor a desk
-	# connection to render and diff until the real one exists.
-	cp $(BIN_DIR)/awapp $(FS_DIR)/bin/awapp
-	# The per-turn worker, forked on the agentdesk's request.
+	# 3a. The workspace process, one per agentdesk, forked by PID 1 when a
+	# workspace is created. The stand-in it replaced is removed so a stale
+	# image cannot boot it.
+	rm -f $(FS_DIR)/bin/awapp
+	cp $(BIN_DIR)/agentdesk $(FS_DIR)/bin/agentdesk
+	# The per-turn worker, forked on the agentdesk's request. A scripted
+	# stand-in until an agent with a model behind it exists.
 	cp $(BIN_DIR)/awagent $(FS_DIR)/bin/awagent
 
-	# 3b. First-party applications. An app is a folder, not a binary:
-	# /apps/<name>/ holds exec, icon.svg and description.txt, and the broker
-	# forks /apps/<name>/exec. Binaries stale-shipped under the old layout are
+	# 3b. Applications. An app is a folder, not a binary: /apps/<name>/ holds
+	# exec, icon.svg, description.txt and name.txt, and the broker forks
+	# /apps/<name>/exec. Binaries stale-shipped under the old layout are
 	# removed so the image cannot boot a copy the build no longer produces.
+	# The settings app is built from agentwarecore because what it edits is
+	# system state; the rest come from agentwareapps.
 	rm -f $(FS_DIR)/bin/awnotes $(FS_DIR)/bin/awcalc
-	mkdir -p $(FS_DIR)/apps/awcalc
+	mkdir -p $(FS_DIR)/apps/awcalc $(FS_DIR)/apps/awsettings
 	cp $(APPS_BIN_DIR)/awcalc $(FS_DIR)/apps/awcalc/exec
-	cp $(AW_APPS_DIR)/awcalc/icon.svg $(FS_DIR)/apps/awcalc/icon.svg
-	cp $(AW_APPS_DIR)/awcalc/description.txt $(FS_DIR)/apps/awcalc/description.txt
+	cp $(AW_APPS_DIR)/awcalc/icon.svg $(AW_APPS_DIR)/awcalc/description.txt $(AW_APPS_DIR)/awcalc/name.txt $(FS_DIR)/apps/awcalc/
+	cp $(BIN_DIR)/awsettings $(FS_DIR)/apps/awsettings/exec
+	cp $(AW_CORE_DIR)/awsettings/icon.svg $(AW_CORE_DIR)/awsettings/description.txt $(AW_CORE_DIR)/awsettings/name.txt $(FS_DIR)/apps/awsettings/
+
+	# 3b'. Wallpapers. Read by the compositor when a workspace names one, and
+	# listed by the settings app; SVG so one file serves every display size.
+	rm -rf $(FS_DIR)/wallpapers
+	mkdir -p $(FS_DIR)/wallpapers
+	cp wallpapers/*.svg $(FS_DIR)/wallpapers/
 
 	# 3c. Stand-in binaries used by `make selftest` to exercise the service
 	# table and the control socket. Harmless to ship; nothing starts them
@@ -127,10 +143,10 @@ pack: build
 
 # Boot QEMU (depends on 'pack' being finished)
 #
-# agentware.demo is on the command line because startmenu does not exist yet,
-# so without it nothing would ever ask the broker for a workspace and the
-# compositor would come up with no clients. It substitutes a stand-in start menu
-# and a stand-in agentdesk, and drops out the moment either is written.
+# agentware.demo is on the command line because no agent with a model behind
+# it exists yet: it substitutes a scripted one, so a message sent from a
+# workspace runs a turn on the calculator. Without it the same message is
+# answered with an error. Either way the machine boots to one blank agentdesk.
 run: pack
 	@echo "==> Booting Agentware fullscreen: guest $(DISPLAY_W)x$(DISPLAY_H), host desktop $(if $(HOST_PX),$(HOST_PX),unknown). Ctrl+Alt+F to un-fullscreen."
 	$(QEMU) -display gtk,zoom-to-fit=on,full-screen=on,show-cursor=off -serial stdio \

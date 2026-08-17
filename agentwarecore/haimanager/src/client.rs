@@ -49,6 +49,7 @@ use awproto::display::{self, MAX_TREE};
 
 use crate::awml::{self, Tag};
 use crate::document::Document;
+use crate::images::Images;
 use crate::input::{Button, Event, Key};
 use crate::paint::font::Fonts;
 use crate::paint::{Canvas, Rect};
@@ -424,9 +425,9 @@ impl Client {
 
     /// Paint one branch, for a workspace whose regions do not paint
     /// consecutively.
-    pub fn draw_region(&self, canvas: &mut Canvas, fonts: &Fonts, name: &str) {
+    pub fn draw_region(&self, canvas: &mut Canvas, fonts: &Fonts, images: &Images, name: &str) {
         let (Some(doc), Some(index)) = (&self.doc, self.region(name)) else { return };
-        ui::paint_subtree(canvas, fonts, &doc.tree, &self.layout, index, &self.focus_state());
+        ui::paint_subtree(canvas, fonts, images, &doc.tree, &self.layout, index, &self.focus_state());
     }
 
     /// Where the compositor believes focus and the caret are, in this tree.
@@ -546,9 +547,9 @@ impl Client {
         self.scroll_drag = None;
     }
 
-    pub fn draw(&self, canvas: &mut Canvas, fonts: &Fonts) {
+    pub fn draw(&self, canvas: &mut Canvas, fonts: &Fonts, images: &Images) {
         let Some(doc) = &self.doc else { return };
-        ui::paint(canvas, fonts, &doc.tree, &self.layout, &self.focus_state());
+        ui::paint(canvas, fonts, images, &doc.tree, &self.layout, &self.focus_state());
     }
 
     /// A one-line description of the focused node as an agent would see it.
@@ -844,7 +845,15 @@ impl Client {
         };
 
         let key = doc.key(container).to_owned();
-        let was = self.scroll.get(&key).copied().unwrap_or(0);
+        // From the offset as laid out, not as stored: a container following
+        // its end stores a marker rather than a number.
+        let was = self
+            .layout
+            .scrollers
+            .iter()
+            .find(|scroller| scroller.node == container)
+            .map(|scroller| scroller.offset)
+            .unwrap_or(0);
         self.scroll.insert(key.clone(), was + shift);
         // The bar lights up for the agent's scrolling exactly as it does for
         // the human's wheel, so the human watching sees where the view moved.

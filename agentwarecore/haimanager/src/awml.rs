@@ -33,6 +33,7 @@ pub enum Tag {
     Text,
     Divider,
     Icon,
+    Image,
     // Controls. Require an id and a description; accept actions.
     Button,
     Field,
@@ -54,6 +55,7 @@ impl Tag {
             "text" => Tag::Text,
             "divider" => Tag::Divider,
             "icon" => Tag::Icon,
+            "image" => Tag::Image,
             "button" => Tag::Button,
             "field" => Tag::Field,
             "editor" => Tag::Editor,
@@ -75,6 +77,7 @@ impl Tag {
             Tag::Text => "text",
             Tag::Divider => "divider",
             Tag::Icon => "icon",
+            Tag::Image => "image",
             Tag::Button => "button",
             Tag::Field => "field",
             Tag::Editor => "editor",
@@ -333,7 +336,11 @@ impl<'a> Parser<'a> {
                 // The parser's input arrived as `&str`, so this never actually
                 // loses anything; lossy only so a slicing bug shows up as ?
                 // on screen rather than a crash in the compositor.
-                let collapsed = collapse(&String::from_utf8_lossy(&text));
+                // Entities decode in text the same as in an attribute value. A
+                // client escapes what a human typed before it becomes markup,
+                // and `&lt;` on screen where the human typed `<` would be the
+                // escape showing rather than the text.
+                let collapsed = unescape(&collapse(&String::from_utf8_lossy(&text)));
                 // Text belongs to the element that contains it, not to a
                 // synthetic child. Mixed content is not supported: an element
                 // has text or children, and using both is a client bug that
@@ -517,6 +524,11 @@ fn emit(tree: &Tree, index: usize, depth: usize, out: &mut String) {
     // emphasised is not.
     if let Some(label) = node.attr("label") {
         attrs.push_str(&format!(" label=\"{label}\""));
+    }
+    // A picture's words. An agent that cannot see the picture must still know
+    // what it shows, which is why `alt` is required on one.
+    if let Some(alt) = node.attr("alt") {
+        attrs.push_str(&format!(" alt=\"{alt}\""));
     }
     for state in ["value", "checked", "selected", "invalid", "busy"] {
         if let Some(value) = node.attr(state) {

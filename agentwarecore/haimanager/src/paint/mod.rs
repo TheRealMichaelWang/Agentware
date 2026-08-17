@@ -180,6 +180,17 @@ impl Rect {
 }
 
 /// A frame being drawn.
+/// Opaque pixels, ready to be copied onto a canvas row by row.
+///
+/// What an image becomes once it has been fitted and composited: no alpha, no
+/// stride surprises, XRGB in the canvas's own format, so drawing it is a copy
+/// rather than a blend.
+pub struct Bitmap {
+    pub width: i32,
+    pub height: i32,
+    pub pixels: Vec<Color>,
+}
+
 pub struct Canvas {
     pixels: Vec<Color>,
     width: i32,
@@ -567,6 +578,23 @@ impl Canvas {
                 };
                 self.pixels[dst + column] = mix(p[0], 16) | mix(p[1], 8) | mix(p[2], 0);
             }
+        }
+    }
+
+    /// Copy an opaque bitmap with its top-left corner at `x`, `y`, clipped.
+    ///
+    /// Row copies and nothing else: this is the wallpaper's path, and a
+    /// wallpaper is repainted under every frame that touches the desk.
+    pub fn blit(&mut self, bitmap: &Bitmap, x: i32, y: i32) {
+        let Some(area) = self.clip.intersect(&Rect::new(x, y, bitmap.width, bitmap.height)) else {
+            return;
+        };
+        for row in 0..area.h {
+            let sy = (area.y + row - y) as usize;
+            let src = sy * bitmap.width as usize + (area.x - x) as usize;
+            let dst = ((area.y + row) * self.width + area.x) as usize;
+            self.pixels[dst..dst + area.w as usize]
+                .copy_from_slice(&bitmap.pixels[src..src + area.w as usize]);
         }
     }
 

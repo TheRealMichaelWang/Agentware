@@ -98,7 +98,7 @@ It speaks the same AWML over the same kind of connection, and the haimanager run
 | Region | Owner | Contents |
 | --- | --- | --- |
 | `background` | agentdesk | wallpaper |
-| `taskbar` | agentdesk | open apps, launcher button |
+| `taskbar` | agentdesk | the clock and date, at the right; the compositor's start button and dock share the band |
 | `pane` | agentdesk | chat transcript, input box |
 | `apps` | app processes | application windows |
 
@@ -106,7 +106,9 @@ Above all workspaces sits the navigation bar, drawn by the haimanager itself bec
 
 **Window chrome is the compositor's, not the application's.** The title bar, the shadow, and the window controls are drawn by the haimanager around a client, from the `title` the application declared. The controls are stroke glyphs at the bar's right end, quiet until hovered: a chevron pointing down at the dock the window will join, corner brackets that push outward and flip inward once there is nowhere further to go, and a cross. They are the only controls in the system that are not AWML, and that is the point: putting them in the tree would let every application decide whether it was closable, and would make an agent's view of a window include the button that destroys it.
 
-Every open window appears as an icon tile in a dock along the bottom of the `apps` region, drawn by the compositor from the `icon.svg` in the app's package: a window on screen carries a dot under its tile, and an app without an icon shows its initial. The same icon leads the window's title bar. Not in the agentdesk's taskbar, even though a taskbar is where one would expect it, because switching between windows is what a dock is for and which window is where is not something the agentdesk is told. Its taskbar holds what it does own: the launcher, and what it has opened.
+Every open window appears as an icon tile in a dock centred in the taskbar band, drawn by the compositor from the `icon.svg` in the app's package: a window on screen carries a dot under its tile, and an app without an icon shows its initial. The same icon leads the window's title bar. The dock is compositor chrome even though it sits in the agentdesk's band, because switching between windows is what a dock is for and which window is where is not something the agentdesk is told. At the left end of the same band the compositor draws the start button, the Agentware mark, which opens the start menu: a panel centred over the workspace holding a prompt that becomes a new agentdesk and a grid of every installed application, closed by a click anywhere else. The agentdesk keeps both ends of its taskbar clear for these the way it leaves the title bars alone: by design, not by protocol. What the agentdesk draws in the band is what it does own: the clock and date, at the far right.
+
+The `background` region holds the wallpaper, an `image` element naming a file the compositor loads and fits. It is the one region laid out without breathing room, because a wallpaper reaches the edges. Which file is a setting: the settings application writes it to the runtime directory, and every agentdesk reads it once a second alongside its clock and re-renders when it changes. No process is told and nothing is broadcast; the same tick that moves the clock notices the setting.
 
 **Collapsing the pane is the compositor's too.** The grip that folds it away is drawn on its edge and the width of the region is compositor geometry. The reasoning is the stop button's: the pane is a fifth of the screen, and a wedged agentdesk must not be able to keep it. An agentdesk that drew its own toggle would mean a human who cannot reclaim their own display.
 
@@ -135,7 +137,7 @@ The freeze is scoped to that one region, and specifically **not** to the screen:
 
 The Supervisor is the only path by which a process comes into existence.
 
-**A workspace.** `startmenu` sends `CreateDesk`, with the prompt the human typed or with nothing. The Supervisor forks the agentdesk, handing it a descriptor to the haimanager, and passes the opening prompt as an argument. That prompt is the only user text the Supervisor ever handles; it exists because a brand new workspace has no other way to learn what it was created for.
+**A workspace.** The haimanager sends `CreateDesk`: from the start menu with the prompt the human typed, from the plus at the end of the navigation bar's tabs with none, and with none at startup and whenever the last workspace closes, so there is always one. The Supervisor forks the agentdesk, handing it a descriptor to the haimanager, and passes the opening prompt as an argument. That prompt is the only user text the Supervisor ever handles; it exists because a brand new workspace has no other way to learn what it was created for.
 
 Creating a workspace does not start a turn. The agentdesk reads its opening prompt and asks for an agent itself.
 
@@ -143,7 +145,9 @@ Creating a workspace does not start a turn. The agentdesk reads its opening prom
 
 History is not passed as an argument or as a path to a file. A socket has no cleanup problem, needs no filesystem capability once agents run in their own mount namespace, and is the same channel telemetry flows back up. One mechanism instead of three.
 
-**An application.** Either the human or the agent opens one from the workspace's launcher; the agentdesk sends `OpenApp { desk_id, app }`. The Supervisor forks it into the workspace's cgroup and hands the haimanager its descriptor tagged `app-attached <desk> <app> <pid>`. That tag is what tells the haimanager which workspace to render it in and which agent is permitted to see it.
+The channel's vocabulary is small. Down: `history <role> <text>` for every earlier message, then `prompt <text>` for the one that starts the turn. Up: `telemetry <kind> <text>` for anything the human should watch as it happens (a thought, an action, a result, an error), `open-app <name>` to ask the workspace to open an application, since the agent has no broker connection and no way to get one, and finally `reply <text>`, the turn's answer, which joins the conversation. The turn is over when the agent hangs up, whether it finished, failed or was interrupted, so every ending looks the same to the agentdesk and none needs a message of its own. A message the human sends while a turn is running is queued and starts the next turn the moment this one ends.
+
+**An application.** The human opens one from the start menu, and the haimanager sends `OpenApp { desk_id, app }` for the workspace on screen; an agent asks its agentdesk over the turn channel, and the agentdesk sends the same request. The Supervisor forks it into the workspace's cgroup and hands the haimanager its descriptor tagged `app-attached <desk> <app> <pid>`. That tag is what tells the haimanager which workspace to render it in and which agent is permitted to see it.
 
 ## Why the Supervisor is in the middle of all this
 
