@@ -124,6 +124,8 @@ struct Desk {
     opened: Vec<String>,
     /// The wallpaper path currently shown, or none for a plain background.
     wallpaper: Option<String>,
+    /// The time zone, as minutes east of UTC, from the same settings file.
+    utc_offset: i32,
     /// When the settings file was last read, so a tick re-reads it only when
     /// it has changed.
     settings_seen: Option<SystemTime>,
@@ -233,7 +235,8 @@ fn main() {
 
 impl Desk {
     fn new(id: u32) -> Self {
-        Desk {
+        let stored = settings::Settings::load();
+        let mut desk = Desk {
             id,
             broker: None,
             lines: Vec::new(),
@@ -244,10 +247,15 @@ impl Desk {
             status: "ready".into(),
             installed: installed_apps(),
             opened: Vec::new(),
-            wallpaper: settings::Settings::load().wallpaper,
+            wallpaper: None,
+            utc_offset: 0,
             settings_seen: settings::modified(),
-            clock: clock_text(),
-        }
+            clock: String::new(),
+        };
+        desk.wallpaper = stored.wallpaper;
+        desk.utc_offset = stored.utc_offset;
+        desk.clock = clock_text(desk.utc_offset);
+        desk
     }
 
     // ---- the broker ----------------------------------------------------------
@@ -442,7 +450,7 @@ impl Desk {
     /// anything on screen changed.
     fn tick(&mut self) -> bool {
         let mut dirty = false;
-        let clock = clock_text();
+        let clock = clock_text(self.utc_offset);
         if clock != self.clock {
             self.clock = clock;
             dirty = true;
@@ -452,14 +460,24 @@ impl Desk {
         let seen = settings::modified();
         if seen != self.settings_seen {
             self.settings_seen = seen;
-            let wallpaper = settings::Settings::load().wallpaper;
-            if wallpaper != self.wallpaper {
+            let stored = settings::Settings::load();
+            if stored.wallpaper != self.wallpaper {
                 log(&format!(
                     "desk {}: wallpaper is now {}",
                     self.id,
-                    wallpaper.as_deref().unwrap_or("none")
+                    stored.wallpaper.as_deref().unwrap_or("none")
                 ));
-                self.wallpaper = wallpaper;
+                self.wallpaper = stored.wallpaper;
+                dirty = true;
+            }
+            if stored.utc_offset != self.utc_offset {
+                log(&format!(
+                    "desk {}: time zone is now UTC{}",
+                    self.id,
+                    settings::format_offset(stored.utc_offset)
+                ));
+                self.utc_offset = stored.utc_offset;
+                self.clock = clock_text(self.utc_offset);
                 dirty = true;
             }
         }
@@ -547,7 +565,7 @@ impl Desk {
   </hstack>
 "#,
             clock = escape(&self.clock),
-            date = escape(&date_text()),
+            date = escape(&date_text(self.utc_offset)),
         );
 
         // The pane. The transcript, and the field that adds to it.
@@ -668,7 +686,9 @@ fn installed_apps() -> Vec<Installed> {
 
 // ---- the clock -------------------------------------------------------------------
 
-/// Seconds since the epoch, as the kernel has it.
+/// Seconds since the epoch, as the kernel has it: UTC. The kernel keeps one
+/// clock and knows nothing of zones; the offset from settings is applied
+/// here, by the thing showing the time, and nowhere else.
 fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -676,15 +696,20 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// Hours and minutes, twenty-four hour.
-fn clock_text() -> String {
-    let secs = now_secs().rem_euclid(86_400);
+/// The wall clock's seconds since the epoch: UTC shifted by the zone.
+fn local_secs(utc_offset: i32) -> i64 {
+    now_secs() + utc_offset as i64 * 60
+}
+
+/// Hours and minutes, twenty-four hour, in the zone.
+fn clock_text(utc_offset: i32) -> String {
+    let secs = local_secs(utc_offset).rem_euclid(86_400);
     format!("{:02}:{:02}", secs / 3600, (secs % 3600) / 60)
 }
 
-/// Weekday, day and month, like `Sat 16 Aug`.
-fn date_text() -> String {
-    let days = now_secs().div_euclid(86_400);
+/// Weekday, day and month, like `Sat 16 Aug`, in the zone.
+fn date_text(utc_offset: i32) -> String {
+    let days = local_secs(utc_offset).div_euclid(86_400);
     let (year, month, day) = civil_from_days(days);
     let _ = year;
     const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];

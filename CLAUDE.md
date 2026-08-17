@@ -161,10 +161,14 @@ agentdesk, and the compositor asks for a blank one at boot and again whenever
 the last one closes.
 
 The taskbar band, left to right: the start button (compositor), the dock
-centred (compositor), and the clock and date at the far right (the desk's;
-kernel time, and QEMU is booted with `-rtc base=localtime` so it reads as
-the host's). The desk re-renders on a one-second tick for the clock and reads
-the wallpaper setting on the same tick.
+centred (compositor), and the clock and date at the far right (the desk's).
+The kernel keeps one clock, UTC, and knows nothing of zones; the image has no
+zone database; so the zone is a setting, an offset from UTC chosen on the
+Settings app's Time page from a scrolling list of the offsets places keep,
+stored as `<time><utc-offset>+05:30</utc-offset></time>`, and applied by the
+desk when it shows the time. No daylight saving. A first run shows UTC until
+told. The desk re-renders on a one-second tick for the clock and re-reads the
+settings file on the same tick when it has changed.
 
 The `background` region holds the wallpaper: an `image` element, new to the
 catalogue, whose `src` the compositor loads (SVG via resvg, PNG via tiny-skia),

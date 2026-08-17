@@ -27,8 +27,8 @@ use awkit::{Answer, FileDialog};
 use awproto::display::{self, Event, Surface, escape};
 use awproto::settings::{self, Settings as Stored};
 
-/// The categories down the rail. One so far.
-const CATEGORIES: &[(&str, &str)] = &[("desktop", "Desktop")];
+/// The categories down the rail.
+const CATEGORIES: &[(&str, &str)] = &[("desktop", "Desktop"), ("time", "Time")];
 
 /// The dropdown's option for opening the file dialog.
 const CHOOSE: &str = "choose";
@@ -39,6 +39,8 @@ struct Settings {
     defaults: Vec<(String, String)>,
     /// The current choice, `None` for a plain background.
     current: Option<String>,
+    /// The time zone, as minutes east of UTC.
+    utc_offset: i32,
     /// When the settings file was last read, so a change made elsewhere is
     /// picked up before the next render rather than overwritten.
     seen: Option<SystemTime>,
@@ -62,6 +64,7 @@ fn main() {
         category: CATEGORIES[0].0,
         defaults: settings::wallpapers(),
         current: Stored::load().wallpaper,
+        utc_offset: Stored::load().utc_offset,
         seen: settings::modified(),
         open: false,
         choosing: None,
@@ -108,7 +111,9 @@ impl Settings {
         let seen = settings::modified();
         if seen != self.seen {
             self.seen = seen;
-            self.current = Stored::load().wallpaper;
+            let stored = Stored::load();
+            self.current = stored.wallpaper;
+            self.utc_offset = stored.utc_offset;
         }
 
         // The dialog first: it owns its ids and ignores the rest.
@@ -153,6 +158,25 @@ impl Settings {
                         }
                     }
                 }
+            }
+
+            (target, display::ACTION_CLICK) if target.starts_with("zone-") => {
+                let Some(minutes) = target["zone-".len()..].parse::<usize>().ok()
+                    .and_then(|i| settings::utc_offsets().get(i).map(|(_, m)| *m))
+                else {
+                    return false;
+                };
+                let mut stored = Stored::load();
+                stored.utc_offset = minutes;
+                match stored.save() {
+                    Ok(()) => {
+                        self.utc_offset = minutes;
+                        self.seen = settings::modified();
+                        self.status = format!("time zone set to UTC{}", settings::format_offset(minutes));
+                    }
+                    Err(err) => self.status = format!("could not save the setting: {err}"),
+                }
+                log(&self.status);
             }
 
             (target, display::ACTION_CLICK) if target.starts_with("category-") => {
@@ -203,6 +227,7 @@ impl Settings {
         out.push_str("    <scroll grow=\"true\">\n      <vstack gap=\"md\">\n");
         match self.category {
             "desktop" => self.render_desktop(&mut out),
+            "time" => self.render_time(&mut out),
             _ => out.push_str("        <text color=\"muted\">Nothing here yet.</text>\n"),
         }
         out.push_str("      </vstack>\n    </scroll>\n");
@@ -288,6 +313,53 @@ impl Settings {
             let _ = writeln!(out, r#"        <text role="caption" color="muted">{}</text>"#, escape(&self.status));
         }
     }
+}
+
+impl Settings {
+    /// The Time page: the zone as an offset from UTC, picked from a list.
+    ///
+    /// An offset rather than a named zone, because the image carries no zone
+    /// database and the kernel has no notion of one either: it keeps UTC and
+    /// nothing else, and a zone is whatever userspace adds when it shows a
+    /// time. A list rather than a dropdown, because forty rows want a
+    /// scrolling list, not a menu hanging off a box.
+    fn render_time(&self, out: &mut String) {
+        let now = local_clock(self.utc_offset);
+        let _ = write!(
+            out,
+            r#"        <text role="heading">Time</text>
+        <group label="Time zone">
+          <vstack gap="sm">
+            <text>Now {now}, UTC{offset}</text>
+            <text role="caption" color="muted">The clock is kept in UTC and shown shifted by this. No daylight saving: set it again when the clocks change.</text>
+            <scroll grow="true">
+              <list>
+"#,
+            offset = settings::format_offset(self.utc_offset),
+        );
+        for (index, (label, minutes)) in settings::utc_offsets().iter().enumerate() {
+            let _ = writeln!(
+                out,
+                r#"                <item id="zone-{index}" label="{label}"{selected} description="Sets the time zone to {label}"/>"#,
+                selected = if *minutes == self.utc_offset { r#" selected="true""# } else { "" },
+            );
+        }
+        out.push_str("              </list>\n            </scroll>\n          </vstack>\n        </group>\n");
+        if !self.status.is_empty() {
+            let _ = writeln!(out, r#"        <text role="caption" color="muted">{}</text>"#, escape(&self.status));
+        }
+    }
+}
+
+/// Hours and minutes in the zone, as the taskbar would show them right now.
+fn local_clock(utc_offset: i32) -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+        + utc_offset as i64 * 60;
+    let secs = secs.rem_euclid(86_400);
+    format!("{:02}:{:02}", secs / 3600, (secs % 3600) / 60)
 }
 
 fn log(message: &str) {

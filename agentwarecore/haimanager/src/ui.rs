@@ -453,10 +453,23 @@ impl Layout {
     /// id: `scroll-into-view` names the node it wants seen and the compositor
     /// works out what to move.
     pub fn scroller_at(&self, x: i32, y: i32) -> Option<&Scroller> {
+        self.scrollers_at(x, y).next()
+    }
+
+    /// Every scroll container under a point, innermost first.
+    ///
+    /// The wheel wants the list, not just the innermost: a container that has
+    /// nowhere further to go in the wheel's direction hands the notch to the
+    /// one enclosing it, which is how a list inside a page scrolls the page
+    /// once the list is at its end, and how a list that never overflowed
+    /// does not swallow the wheel and leave the page stuck. Without this a
+    /// pointer that landed on an inner container after the first notch made
+    /// every notch after it do nothing.
+    pub fn scrollers_at(&self, x: i32, y: i32) -> impl Iterator<Item = &Scroller> {
         self.scrollers
             .iter()
             .rev()
-            .find(|scroller| self.visible_at(scroller.node, x, y))
+            .filter(move |scroller| self.visible_at(scroller.node, x, y))
     }
 }
 

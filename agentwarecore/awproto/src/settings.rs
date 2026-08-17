@@ -15,8 +15,21 @@
 //!   <desktop>
 //!     <wallpaper>/default_wallpapers/dusk.svg</wallpaper>
 //!   </desktop>
+//!   <time>
+//!     <utc-offset>+00:00</utc-offset>
+//!   </time>
 //! </settings>
 //! ```
+//!
+//! ## Time
+//!
+//! The kernel keeps one clock, UTC, and knows nothing of time zones; a zone
+//! is a userspace convention for turning that clock into the numbers on a
+//! wall. Agentware has no zone database in its image, so its zone is the
+//! simplest true thing: an offset from UTC, chosen once here and applied by
+//! whatever shows a time. No daylight saving: an offset is what it says, and
+//! a person who moves between the two sets it twice a year, which is what a
+//! wall clock asks of them too.
 //!
 //! Elements nest by category, text is the value, and the five XML entities
 //! are escaped, so a person can read it with `cat` and a future setting is one
@@ -66,11 +79,15 @@ pub struct Settings {
     /// The wallpaper every workspace shows: a path, or `None` for a plain
     /// background.
     pub wallpaper: Option<String>,
+    /// The time zone, as minutes east of UTC. Zero until someone says
+    /// otherwise, which is the one honest default for a machine that cannot
+    /// know where it is.
+    pub utc_offset: i32,
 }
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { wallpaper: Some(DEFAULT_WALLPAPER.to_owned()) }
+        Settings { wallpaper: Some(DEFAULT_WALLPAPER.to_owned()), utc_offset: 0 }
     }
 }
 
@@ -121,10 +138,46 @@ impl Settings {
     pub fn to_xml(&self) -> String {
         let wallpaper = self.wallpaper.as_deref().unwrap_or(WALLPAPER_NONE);
         format!(
-            "<settings>\n  <desktop>\n    <wallpaper>{}</wallpaper>\n  </desktop>\n</settings>\n",
-            escape(wallpaper)
+            "<settings>\n  <desktop>\n    <wallpaper>{}</wallpaper>\n  </desktop>\n  <time>\n    <utc-offset>{}</utc-offset>\n  </time>\n</settings>\n",
+            escape(wallpaper),
+            format_offset(self.utc_offset),
         )
     }
+}
+
+/// `+05:30` for 330 minutes, `-04:00` for -240, `+00:00` for none.
+pub fn format_offset(minutes: i32) -> String {
+    let sign = if minutes < 0 { '-' } else { '+' };
+    let minutes = minutes.abs();
+    format!("{sign}{:02}:{:02}", minutes / 60, minutes % 60)
+}
+
+/// The offset in `+HH:MM` or `-HH:MM`, or `None` for anything else.
+pub fn parse_offset(text: &str) -> Option<i32> {
+    let text = text.trim();
+    let (sign, rest) = match text.chars().next()? {
+        '+' => (1, &text[1..]),
+        '-' => (-1, &text[1..]),
+        _ => return None,
+    };
+    let (hours, minutes) = rest.split_once(':')?;
+    let hours: i32 = hours.parse().ok()?;
+    let minutes: i32 = minutes.parse().ok()?;
+    if !(0..=14).contains(&hours) || !(0..60).contains(&minutes) {
+        return None;
+    }
+    Some(sign * (hours * 60 + minutes))
+}
+
+/// The offsets a settings page offers, as (label, minutes), west to east:
+/// every whole hour from -12 to +14, and the half and three-quarter hours
+/// that places actually keep.
+pub fn utc_offsets() -> Vec<(String, i32)> {
+    let mut all: Vec<i32> = (-12..=14).map(|h| h * 60).collect();
+    all.extend([-570, -210, 210, 270, 330, 345, 390, 525, 570, 630, 765]);
+    all.sort_unstable();
+    all.dedup();
+    all.into_iter().map(|minutes| (format!("UTC{}", format_offset(minutes)), minutes)).collect()
 }
 
 /// When the file last changed, for a reader that polls. `None` if there is no
@@ -206,7 +259,13 @@ fn parse(text: &str) -> Option<Settings> {
         Some(WALLPAPER_NONE) | Some("") => None,
         Some(path) => Some(path.to_owned()),
     };
-    Some(Settings { wallpaper })
+    // A missing or malformed offset is UTC, not a refusal: an old file, or a
+    // hand edit that went wrong, should not lose the wallpaper with it.
+    let utc_offset = values
+        .get("settings/time/utc-offset")
+        .and_then(|text| parse_offset(text))
+        .unwrap_or(0);
+    Some(Settings { wallpaper, utc_offset })
 }
 
 /// Every element's text, keyed by its path from the root, `a/b/c`. Elements
@@ -294,10 +353,21 @@ mod tests {
 
     #[test]
     fn round_trips() {
-        let settings = Settings { wallpaper: Some("/pictures/a & b.png".into()) };
+        let settings = Settings { wallpaper: Some("/pictures/a & b.png".into()), utc_offset: -300 };
         assert_eq!(parse(&settings.to_xml()), Some(settings));
-        let none = Settings { wallpaper: None };
+        let none = Settings { wallpaper: None, utc_offset: 345 };
         assert_eq!(parse(&none.to_xml()), Some(none));
+    }
+
+    #[test]
+    fn offsets() {
+        assert_eq!(format_offset(330), "+05:30");
+        assert_eq!(format_offset(-240), "-04:00");
+        assert_eq!(parse_offset("+05:30"), Some(330));
+        assert_eq!(parse_offset("-04:00"), Some(-240));
+        assert_eq!(parse_offset("05:30"), None);
+        assert_eq!(parse_offset("+25:00"), None);
+        assert!(utc_offsets().iter().any(|(label, m)| label == "UTC+05:45" && *m == 345));
     }
 
     #[test]

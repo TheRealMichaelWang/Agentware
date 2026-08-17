@@ -44,7 +44,6 @@ def qemu(monitor_path, qmp_path, serial_path, append, width, height, state, keep
             # The same absolute pointing device the interactive window has, so
             # what the tool exercises is what the human uses.
             "-device", "virtio-tablet-pci",
-            "-rtc", "base=localtime",
             "-no-reboot",
             "-display", "none",
             "-serial", "file:" + serial_path,

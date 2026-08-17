@@ -953,16 +953,18 @@ impl Client {
 
     fn wheel(&mut self, fonts: &Fonts, delta: i32, x: i32, y: i32) -> bool {
         let Some(doc) = &self.doc else { return false };
-        let Some(scroller) = self.layout.scroller_at(x, y) else { return false };
 
-        let key = doc.key(scroller.node).to_owned();
-        let furthest = (scroller.content - scroller.viewport).max(0);
-        // Positive delta is a push away from the human, which moves the content
-        // down and the viewport up.
-        let next = (scroller.offset - delta * ui::wheel_step()).clamp(0, furthest);
-        if next == scroller.offset {
+        // Innermost first, and the first that can still move takes the
+        // notch: a container at its end, or one that never overflowed, hands
+        // it outward rather than swallowing it. Positive delta is a push away
+        // from the human, which moves the content down and the viewport up.
+        let Some((key, next, furthest)) = self.layout.scrollers_at(x, y).find_map(|scroller| {
+            let furthest = (scroller.content - scroller.viewport).max(0);
+            let next = (scroller.offset - delta * ui::wheel_step()).clamp(0, furthest);
+            (next != scroller.offset).then(|| (doc.key(scroller.node).to_owned(), next, furthest))
+        }) else {
             return false;
-        }
+        };
 
         self.scroll.insert(key.clone(), next);
         self.scroll_shown = Some((key, Instant::now()));

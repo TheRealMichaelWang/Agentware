@@ -33,14 +33,14 @@ DISPLAY_H ?= 1440
 # apart the moment the window is scaled; a tablet is absolute, so the host hands
 # over the position itself. The PS/2 devices stay, because the monitor's
 # injected input and the wheel arrive through them.
-# The guest clock is set from the host's local time rather than UTC. The
-# taskbar shows the kernel's idea of the time as it stands, because there is
-# no timezone database in the image and no setting for one yet; on the host's
-# local time the clock in the corner reads the same as the one on the host.
+# The guest clock is UTC, QEMU's default, which is what the kernel expects of
+# a hardware clock. The time zone is a setting (Settings, Time), applied by
+# whatever shows a time; the machine cannot know where it is, so a first run
+# shows UTC until told.
 QEMU := qemu-system-x86_64 -enable-kvm -m 4G -cpu host \
 	-kernel $(KERNEL) -initrd $(INITRAMFS_ARCHIVE) \
 	-device virtio-vga,xres=$(DISPLAY_W),yres=$(DISPLAY_H) \
-	-device virtio-tablet-pci -rtc base=localtime -no-reboot
+	-device virtio-tablet-pci -no-reboot
 
 # The state volume: the one thing that outlives a boot. A small ext4 image the
 # supervisor mounts at /state, where settings.xml lives. Made once, kept across
