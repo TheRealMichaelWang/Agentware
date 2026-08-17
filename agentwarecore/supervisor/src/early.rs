@@ -145,12 +145,78 @@ pub fn mount_virtual_filesystems() -> io::Result<()> {
     Ok(())
 }
 
+/// Where the state volume is mounted: the one directory that outlives the
+/// machine, holding `settings.xml` and whatever else earns a place there.
+pub const STATE_DIR: &str = "/state";
+
+/// The block device the state volume is expected on: the virtio drive QEMU
+/// is booted with. `agentware.state=/dev/...` on the kernel command line
+/// names another, which is how a partition on real hardware will be reached
+/// until the supervisor can find one by label.
+const STATE_DEVICE: &str = "/dev/vda";
+
+/// How long to wait for the state device to appear. virtio-blk is built in
+/// and there before init runs; the bound keeps a machine without a drive,
+/// which the self-test is, from waiting long on one.
+const STATE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Mount the state volume, if the machine has one.
+///
+/// Not fatal without: `/state` is then a directory in the RAM image, settings
+/// last until power off, and the log says so. This is the whole of persistence
+/// in Agentware: workspaces, applications and conversations still live in
+/// RAM and die with the machine, by choice; preferences are the one thing a
+/// person expects to find as they left them.
+pub fn mount_state() {
+    if let Err(err) = fs::create_dir_all(STATE_DIR) {
+        kwarn!("could not create {STATE_DIR}: {err}");
+        return;
+    }
+    let device = kernel_arg("agentware.state").unwrap_or_else(|| STATE_DEVICE.to_owned());
+
+    let deadline = std::time::Instant::now() + STATE_WAIT;
+    while !Path::new(&device).exists() {
+        if std::time::Instant::now() >= deadline {
+            kwarn!("state: no volume at {device}; settings will not outlive this boot");
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    match mount::mount(
+        device.as_str(),
+        STATE_DIR,
+        "ext4",
+        MountFlags::NOSUID.union(MountFlags::NODEV),
+        None,
+    ) {
+        Ok(()) => kinfo!("state: mounted {device} on {STATE_DIR}"),
+        Err(err) => kwarn!("state: could not mount {device} on {STATE_DIR}: {err}; settings will not outlive this boot"),
+    }
+}
+
+/// One `key=value` from the kernel command line.
+fn kernel_arg(key: &str) -> Option<String> {
+    let cmdline = fs::read_to_string("/proc/cmdline").ok()?;
+    cmdline
+        .split_whitespace()
+        .find_map(|word| word.strip_prefix(key).and_then(|rest| rest.strip_prefix('=')))
+        .map(str::to_owned)
+}
+
 /// Unmount everything in reverse order, best effort. Called during shutdown.
 ///
 /// `DETACH` is a lazy unmount: it detaches the tree immediately even if
 /// something still holds a reference. During shutdown that is exactly what we
-/// want, because the alternative is hanging forever on a stuck process.
+/// want, because the alternative is hanging forever on a stuck process. The
+/// state volume goes first and gets a proper unmount attempt before the lazy
+/// one, since it is the one filesystem whose contents matter afterwards.
 pub fn unmount_all() {
+    if mount::unmount(STATE_DIR, UnmountFlags::empty()).is_err()
+        && let Err(err) = mount::unmount(STATE_DIR, UnmountFlags::DETACH)
+    {
+        kwarn!("could not unmount {STATE_DIR}: {err}");
+    }
     for mp in MOUNTS.iter().rev() {
         if let Err(err) = mount::unmount(mp.target, UnmountFlags::DETACH) {
             kwarn!("could not unmount {}: {err}", mp.target);

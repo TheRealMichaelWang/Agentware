@@ -14,9 +14,9 @@
 //! which the compositor honours only because this arrived on a desk connection.
 //!
 //! * `background`: the wallpaper, an `image` whose source is whatever the
-//!   settings say. Read from the settings file on the clock tick, so a choice
-//!   made in the settings application reaches every workspace within a second
-//!   without any process being told about it.
+//!   settings say. The settings file is stat'd on the clock tick and re-read
+//!   when it has changed, so a choice made in the settings application reaches
+//!   every workspace within a second without any process being told about it.
 //! * `taskbar`: the clock and date at the far right. The compositor draws the
 //!   start button at the left end of the same band and the dock in the middle
 //!   of it, so the desk keeps both clear: by design, not by protocol.
@@ -124,6 +124,9 @@ struct Desk {
     opened: Vec<String>,
     /// The wallpaper path currently shown, or none for a plain background.
     wallpaper: Option<String>,
+    /// When the settings file was last read, so a tick re-reads it only when
+    /// it has changed.
+    settings_seen: Option<SystemTime>,
     /// The clock as last rendered, so a tick that changes nothing sends nothing.
     clock: String,
 }
@@ -241,7 +244,8 @@ impl Desk {
             status: "ready".into(),
             installed: installed_apps(),
             opened: Vec::new(),
-            wallpaper: settings::wallpaper(),
+            wallpaper: settings::Settings::load().wallpaper,
+            settings_seen: settings::modified(),
             clock: clock_text(),
         }
     }
@@ -443,15 +447,21 @@ impl Desk {
             self.clock = clock;
             dirty = true;
         }
-        let wallpaper = settings::wallpaper();
-        if wallpaper != self.wallpaper {
-            log(&format!(
-                "desk {}: wallpaper is now {}",
-                self.id,
-                wallpaper.as_deref().unwrap_or("none")
-            ));
-            self.wallpaper = wallpaper;
-            dirty = true;
+        // The settings file, re-read only when its clock says it changed: a
+        // stat a second is nothing, a parse a second is needless.
+        let seen = settings::modified();
+        if seen != self.settings_seen {
+            self.settings_seen = seen;
+            let wallpaper = settings::Settings::load().wallpaper;
+            if wallpaper != self.wallpaper {
+                log(&format!(
+                    "desk {}: wallpaper is now {}",
+                    self.id,
+                    wallpaper.as_deref().unwrap_or("none")
+                ));
+                self.wallpaper = wallpaper;
+                dirty = true;
+            }
         }
         dirty
     }

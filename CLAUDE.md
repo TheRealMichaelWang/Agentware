@@ -36,8 +36,10 @@ agentwarecore/          cargo workspace
 agentwareapps/          cargo workspace: first-party applications
   awcalc/               a calculator, the first real application
   awfiles/              a file explorer, and where the shared dialogs are seen
-home/                   sample files, staged to /home (RAM, like everything)
+home/                   sample files, staged to /home (RAM; lost at power off)
 default_wallpapers/     the wallpapers that ship, staged to /default_wallpapers
+state.img               the state volume: ext4, mounted at /state, holds
+                        settings.xml; made on first `make run`, gitignored
 initramfs/              staged image contents (build output, gitignored)
 tools/screenshot.py     boot, inject input, capture the screen as PNG
 kernel-build/           Linux submodule
@@ -172,9 +174,22 @@ blits as opaque rows every frame. `awsettings` is a first-party app in
 the page beside it, where a `select` dropdown offers the pictures in
 `/default_wallpapers` plus "Choose an image...", which opens the shared file
 dialog filtered to SVG and PNG anywhere on the machine. The choice is written
-to `/run/agentware/settings/wallpaper` (`awproto::settings`), the one setting
-that crosses between processes as a file: every desk picks it up within a
-second, no process is told. `select`/`option` are implemented for it (the
+to `/state/settings.xml` (`awproto::settings`: `Settings::load()` creates the
+file with defaults on a first run, `save()` writes it whole, synced, and
+renamed into place; a small reader that understands only what it writes),
+the one thing that crosses between processes as a file: every desk stats it
+on its clock tick and re-reads it when it changed, and the settings app
+re-reads it before acting, so nothing ever writes a choice the machine has
+moved past. `/state` is the **state volume**, the one filesystem that
+outlives a boot: `state.img`, a 64MB ext4 image the Makefile creates on first
+`make run` (`mkfs.ext4` on a file, no root) and QEMU attaches as a virtio
+drive; the supervisor mounts `/dev/vda` (or `agentware.state=/dev/...`) on
+`/state` right after the virtual filesystems and says so in the log, or says
+settings will not outlive the boot if there is no drive. `make cleanstate`
+deletes it, which is the first-run case. `tools/screenshot.py` boots against a
+throwaway snapshot of it by default so captures never change the machine's
+state; `--keep-state` writes for real, which is how persistence across boots
+was verified. `select`/`option` are implemented for it (the
 app owns `open`; the compositor sends `open`/`close`, floats the options over
 what follows, and closes on a press elsewhere). `text` wraps, and `scroll
 anchor="end"` keeps a transcript pinned to its end until the human scrolls
@@ -366,7 +381,11 @@ is the list so it does not get relitigated.
   resurrect.
 * Interrupting an agent is `SIGTERM` to a process that owns nothing.
 * A message arriving mid-turn is **queued** by the agentdesk, never refused.
-* Nothing survives a reboot. No persistent storage layer, by choice.
+* Workspaces, applications, windows and conversations do not survive a
+  reboot, by choice: no session restore, no on-disk state for any of them.
+  **Settings do.** They live in `settings.xml` on the state volume, the one
+  filesystem the supervisor mounts from disk, and nothing else is written
+  there until it earns a place.
 * The supervisor never sees prompts, conversation, telemetry or markup. It
   creates sockets and steps out of the way.
 * Identity is a capability, not a claim: the haimanager knows which workspace a
@@ -414,8 +433,10 @@ is the list so it does not get relitigated.
   apps from the menu; an agent opens them only through its agentdesk.
 * **Settings are the one thing that crosses as a file.** A preference set in
   one process and read by every workspace has no socket to travel on, so it is
-  a plain-text file in the RAM-backed runtime directory, read on the desk's
-  clock tick. Nothing is broadcast and nothing survives a reboot.
+  one file, `settings.xml` on the state volume, written whole and atomically
+  by whoever changes it and re-read by everyone else when its clock changes.
+  Nothing is broadcast, and the file is the truth: a first run creates it
+  with the defaults, and every reader agrees with it from then on.
 * **The agent opens applications through its agentdesk**, never itself. It has
   no broker connection; `open-app` up the turn channel is a request, and the
   agent learns the outcome by asking the compositor what is open.

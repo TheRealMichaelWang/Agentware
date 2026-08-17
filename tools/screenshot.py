@@ -24,11 +24,20 @@ KERNEL = os.path.join(ROOT, "kernel-build/arch/x86/boot/bzImage")
 INITRAMFS = os.path.join(ROOT, "initramfs.cpio.gz")
 
 
-def qemu(monitor_path, qmp_path, serial_path, append, width, height):
+def qemu(monitor_path, qmp_path, serial_path, append, width, height, state, keep_state):
+    # The state volume. By default a capture boots against a throwaway copy of
+    # the machine's state (QEMU's snapshot mode writes to a temp file), so a
+    # test never changes what `make run` sees; --keep-state boots against the
+    # image for real, which is how persistence across boots is checked. A
+    # missing image means no drive, and the guest says so at boot.
+    drive = []
+    if state and os.path.exists(state):
+        drive = ["-drive", "file=%s,if=virtio,format=raw%s" % (state, "" if keep_state else ",snapshot=on")]
     return subprocess.Popen(
         [
             "qemu-system-x86_64", "-enable-kvm", "-m", "4G", "-cpu", "host",
             "-kernel", KERNEL, "-initrd", INITRAMFS,
+            *drive,
             # virtio-vga's preferred mode is the one the compositor picks, so
             # these two numbers decide the whole guest display.
             "-device", "virtio-vga,xres=%d,yres=%d" % (width, height),
@@ -180,6 +189,11 @@ def main():
                         help="guest display width")
     parser.add_argument("--height", type=int, default=1000,
                         help="guest display height")
+    parser.add_argument("--state", default=os.path.join(ROOT, "state.img"),
+                        help="the state volume image (default: state.img in the repo)")
+    parser.add_argument("--keep-state", action="store_true",
+                        help="write to the state image for real instead of a "
+                             "throwaway snapshot; for checking persistence")
     parser.add_argument("--do", action="append", default=[], metavar="CMD",
                         help="a QEMU monitor command to run before capturing, "
                              "repeatable. e.g. --do 'sendkey a' "
@@ -195,7 +209,8 @@ def main():
     ppm_path = os.path.join(workdir, "screen.ppm")
     serial_path = args.serial or os.path.join(workdir, "serial.log")
 
-    guest = qemu(monitor_path, qmp_path, serial_path, args.append, args.width, args.height)
+    guest = qemu(monitor_path, qmp_path, serial_path, args.append, args.width, args.height,
+                 args.state, args.keep_state)
     try:
         time.sleep(args.seconds)
         if guest.poll() is not None:

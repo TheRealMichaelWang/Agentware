@@ -1,9 +1,9 @@
 Welcome to Agentware.
 
-This is /home, the folder the file browser opens in. Everything here lives in
-memory: the whole system boots from an image into RAM and nothing is written to
-a disk, so what you make here lasts until the machine is switched off. That is
-by choice, for now.
+This is /home, the folder the file explorer opens in. Everything here lives in
+memory: the system boots from an image into RAM, so what you make here lasts
+until the machine is switched off. That is by choice, for now. Settings are the
+exception: they live on the state volume and are there again after a reboot.
 
 The file explorer (Files, in the start menu) walks folders and marks files and
 folders to rename, copy, move or delete. Every question it asks, where to,

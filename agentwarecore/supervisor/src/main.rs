@@ -99,6 +99,10 @@ fn main() {
     early::disable_ctrl_alt_del();
     early::set_hostname("agentware");
     early::boot_report();
+    // The one filesystem that outlives the machine. After the virtual ones,
+    // because it needs /dev, and before any service, because the first thing
+    // to ask for a setting writes the defaults if there are none.
+    early::mount_state();
 
     // Stage 3. This has to happen before the first child is spawned: the signal
     // mask survives fork and exec, so anything started beforehand would inherit

@@ -4,10 +4,10 @@
 //! page beside it. One category so far, Desktop, and one setting on it: the
 //! wallpaper, a dropdown of the pictures that ship with the system plus
 //! "Choose an image...", which opens the shared file dialog on any SVG or PNG
-//! on the machine. Choosing writes one small file in the runtime directory;
-//! every agentdesk reads it on its clock tick and re-renders its background.
-//! No process is told, nothing is broadcast, and the setting is gone at reboot
-//! with everything else.
+//! on the machine. Choosing writes `settings.xml` on the state volume; every
+//! agentdesk stats it on its clock tick and re-renders its background when it
+//! has changed. No process is told, nothing is broadcast, and the choice is
+//! there again after a reboot, because the volume is the machine's disk.
 //!
 //! Written the way every application is written: a model, a `render`, whole
 //! tree every time, hand-written stable ids, no diffing and no ephemeral state.
@@ -21,9 +21,11 @@ use std::fmt::Write as _;
 use std::io::Write as IoWrite;
 use std::path::Path;
 
+use std::time::SystemTime;
+
 use awkit::{Answer, FileDialog};
 use awproto::display::{self, Event, Surface, escape};
-use awproto::settings;
+use awproto::settings::{self, Settings as Stored};
 
 /// The categories down the rail. One so far.
 const CATEGORIES: &[(&str, &str)] = &[("desktop", "Desktop")];
@@ -37,6 +39,9 @@ struct Settings {
     defaults: Vec<(String, String)>,
     /// The current choice, `None` for a plain background.
     current: Option<String>,
+    /// When the settings file was last read, so a change made elsewhere is
+    /// picked up before the next render rather than overwritten.
+    seen: Option<SystemTime>,
     /// Whether the wallpaper dropdown is showing its options.
     open: bool,
     /// The file dialog, while one is up.
@@ -56,7 +61,8 @@ fn main() {
     let mut app = Settings {
         category: CATEGORIES[0].0,
         defaults: settings::wallpapers(),
-        current: settings::wallpaper(),
+        current: Stored::load().wallpaper,
+        seen: settings::modified(),
         open: false,
         choosing: None,
         status: String::new(),
@@ -94,6 +100,15 @@ impl Settings {
         // mean what it meant. Discarded, not guessed at.
         if surface.is_stale(event) && event.action == display::ACTION_CLICK {
             return false;
+        }
+
+        // The file is the truth. If something else wrote it since it was last
+        // read, take that before acting, so this window never shows or saves
+        // a choice the machine has already moved past.
+        let seen = settings::modified();
+        if seen != self.seen {
+            self.seen = seen;
+            self.current = Stored::load().wallpaper;
         }
 
         // The dialog first: it owns its ids and ignores the rest.
@@ -154,13 +169,19 @@ impl Settings {
 
     /// Record a wallpaper and say so.
     fn choose(&mut self, choice: Option<String>) {
-        match settings::set_wallpaper(choice.as_deref()) {
+        let mut stored = Stored::load();
+        stored.wallpaper = choice.clone();
+        match stored.save() {
             Ok(()) => {
                 self.status = match &choice {
                     Some(path) => format!("wallpaper set to {path}"),
                     None => "wallpaper cleared".to_owned(),
                 };
+                if !settings::persistent() {
+                    self.status.push_str(" (no state volume: kept until power off)");
+                }
                 self.current = choice;
+                self.seen = settings::modified();
             }
             Err(err) => self.status = format!("could not save the setting: {err}"),
         }
@@ -207,9 +228,10 @@ impl Settings {
     fn render_desktop(&self, out: &mut String) {
         out.push_str("        <text role=\"heading\">Desktop</text>\n");
 
-        // One setting, one labelled group: what it is and what it does on
-        // the left, the control on the right, and what is set below.
-        out.push_str("        <group label=\"Wallpaper\">\n          <vstack gap=\"md\">\n            <hstack gap=\"lg\">\n              <vstack gap=\"sm\" grow=\"true\">\n                <text>Picture</text>\n                <text role=\"caption\" color=\"muted\">Every agentdesk shows the same picture behind its windows.</text>\n              </vstack>\n");
+        // One setting, one labelled group, stacked: the dropdown, then what
+        // it chose, seen. The words are the group's label and the options'
+        // names; the picture says the rest.
+        out.push_str("        <group label=\"Wallpaper\">\n          <vstack gap=\"sm\">\n            <hstack>\n");
 
         // The dropdown. The value names the option chosen; a wallpaper from
         // outside the shipped set appears as its own option so the box can
@@ -254,10 +276,10 @@ impl Settings {
         if let Some(path) = &self.current {
             let _ = writeln!(
                 out,
-                r#"            <hstack gap="md">
+                r#"            <hstack>
               <image src="{path}" alt="The current wallpaper" fit="cover"/>
-              <text role="caption" color="muted">{path}</text>
-            </hstack>"#,
+            </hstack>
+            <text role="caption" color="muted">{path}</text>"#,
                 path = escape(path),
             );
         }

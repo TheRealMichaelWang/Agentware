@@ -8,7 +8,7 @@ TARGET := x86_64-unknown-linux-musl
 BIN_DIR := $(AW_CORE_DIR)/target/$(TARGET)/release
 APPS_BIN_DIR := $(AW_APPS_DIR)/target/$(TARGET)/release
 
-.PHONY: all build buildcore buildapps pack run selftest clean
+.PHONY: all build buildcore buildapps pack run selftest clean cleanstate
 
 # Guest display size. virtio-vga defaults to 1280x800 and the compositor takes
 # the driver's preferred mode, so these two numbers are the whole of it.
@@ -41,6 +41,13 @@ QEMU := qemu-system-x86_64 -enable-kvm -m 4G -cpu host \
 	-kernel $(KERNEL) -initrd $(INITRAMFS_ARCHIVE) \
 	-device virtio-vga,xres=$(DISPLAY_W),yres=$(DISPLAY_H) \
 	-device virtio-tablet-pci -rtc base=localtime -no-reboot
+
+# The state volume: the one thing that outlives a boot. A small ext4 image the
+# supervisor mounts at /state, where settings.xml lives. Made once, kept across
+# `make clean`, and never shipped: it is this machine's, the way a disk is.
+# `make cleanstate` starts over, which is the "first run" case.
+STATE_IMG := state.img
+STATE_DRIVE := -drive file=$(STATE_IMG),if=virtio,format=raw
 
 # ---------------------------------------------------------
 # Default Target
@@ -150,15 +157,22 @@ pack: build
 	# archive regardless of who ran the build.
 	cd $(FS_DIR) && find . -print0 | cpio --null -o --format=newc -R 0:0 --quiet | gzip -9 > ../$(INITRAMFS_ARCHIVE)
 
+# The state volume, made on first use. mkfs.ext4 on a plain file needs no
+# root: it writes a filesystem into the file the way it would into a device.
+$(STATE_IMG):
+	@echo "==> Creating the state volume $(STATE_IMG) (first run)..."
+	qemu-img create -f raw $(STATE_IMG) 64M
+	mkfs.ext4 -q -F -L agentware-state $(STATE_IMG)
+
 # Boot QEMU (depends on 'pack' being finished)
 #
 # agentware.demo is on the command line because no agent with a model behind
 # it exists yet: it substitutes a scripted one, so a message sent from a
 # workspace runs a turn on the calculator. Without it the same message is
 # answered with an error. Either way the machine boots to one blank agentdesk.
-run: pack
+run: pack $(STATE_IMG)
 	@echo "==> Booting Agentware fullscreen: guest $(DISPLAY_W)x$(DISPLAY_H), host desktop $(if $(HOST_PX),$(HOST_PX),unknown). Ctrl+Alt+F to un-fullscreen."
-	$(QEMU) -display gtk,zoom-to-fit=on,full-screen=on,show-cursor=off -serial stdio \
+	$(QEMU) $(STATE_DRIVE) -display gtk,zoom-to-fit=on,full-screen=on,show-cursor=off -serial stdio \
 		-append "console=tty0 console=ttyS0,115200 agentware.demo"
 
 # Headless boot that exercises the supervisor end to end and powers itself off.
@@ -173,6 +187,10 @@ selftest: pack
 # ---------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------
+cleanstate:
+	@echo "==> Removing the state volume; the next boot is a first run."
+	rm -f $(STATE_IMG)
+
 clean:
 	@echo "==> Cleaning build artifacts..."
 	cd $(AW_CORE_DIR) && cargo clean
