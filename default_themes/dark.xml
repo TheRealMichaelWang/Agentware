@@ -1,0 +1,15 @@
+<theme>
+  <background>#0e1016</background>
+  <surface>#1a1e28</surface>
+  <raised>#252b39</raised>
+  <pressed>#323a4c</pressed>
+  <border>#2e3545</border>
+  <text>#e8ebf2</text>
+  <muted>#949db2</muted>
+  <accent>#4f9cf5</accent>
+  <accent-deep>#2f77cc</accent-deep>
+  <danger>#e05a5a</danger>
+  <danger-deep>#b84242</danger-deep>
+  <ok>#5ac88a</ok>
+  <selected>#2b3f5e</selected>
+</theme>
