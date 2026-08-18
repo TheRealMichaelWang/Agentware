@@ -2185,6 +2185,22 @@ impl Screen {
                 self.close_start();
                 true
             }
+            // Real power, by the same path as everything else the chrome
+            // asks for: a request to PID 1, which runs the orderly shutdown.
+            // The menu still closes, because the request travels on the next
+            // loop pass and a menu frozen on screen would read as a hang.
+            StartOutcome::PowerOff => {
+                self.requests.push(vec!["poweroff".into()]);
+                self.notes.push("power off requested from the start menu".into());
+                self.close_start();
+                true
+            }
+            StartOutcome::Restart => {
+                self.requests.push(vec!["reboot".into()]);
+                self.notes.push("restart requested from the start menu".into());
+                self.close_start();
+                true
+            }
         }
     }
 

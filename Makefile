@@ -37,10 +37,13 @@ DISPLAY_H ?= 1440
 # a hardware clock. The time zone is a setting (Settings, Time), applied by
 # whatever shows a time; the machine cannot know where it is, so a first run
 # shows UTC until told.
+# No -no-reboot here: the start menu's Restart ends in a real guest reset,
+# and the interactive machine must come back up from it rather than vanish.
+# The selftest adds the flag itself, because there QEMU exiting is the point.
 QEMU := qemu-system-x86_64 -enable-kvm -m 4G -cpu host \
 	-kernel $(KERNEL) -initrd $(INITRAMFS_ARCHIVE) \
 	-device virtio-vga,xres=$(DISPLAY_W),yres=$(DISPLAY_H) \
-	-device virtio-tablet-pci -no-reboot
+	-device virtio-tablet-pci
 
 # The state volume: the one thing that outlives a boot. A small ext4 image the
 # supervisor mounts at /state, where settings.xml lives. Made once, kept across
@@ -210,7 +213,7 @@ run: pack $(STATE_IMG)
 # hangs, something in that chain is broken.
 selftest: pack
 	@echo "==> Running supervisor selftest (headless)..."
-	$(QEMU) -display none -serial stdio \
+	$(QEMU) -no-reboot -display none -serial stdio \
 		-append "console=ttyS0,115200 agentware.selftest"
 # ---------------------------------------------------------
 # Utilities

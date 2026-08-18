@@ -156,9 +156,15 @@ compositor sees, and it must work when the workspace under it does not. It is
 still AWML through the same parser and painter; `button` gained `icon` and
 `tile`, and `height` joined `width` as a compositor-internal hint, all for
 this. Its requests go to PID 1 like the stop button's: `create-desk` and
-`open-app`. The `+` at the end of the nav tabs still creates an empty
-agentdesk, and the compositor asks for a blank one at boot and again whenever
-the last one closes.
+`open-app`, and from the power controls in its lower-left corner, `poweroff`
+and `reboot`, which the supervisor turns into the signals its shutdown path
+already handles, so the buttons run the same orderly teardown Ctrl-Alt-Del
+does; `make run` no longer passes `-no-reboot`, so Restart boots the machine
+fresh rather than exiting QEMU. There is deliberately no Sleep: the kernel
+could suspend, but QEMU wakes a guest only from the host monitor, and a sleep
+the keyboard cannot end is a power-off wearing the wrong label. The `+` at
+the end of the nav tabs still creates an empty agentdesk, and the compositor
+asks for a blank one at boot and again whenever the last one closes.
 
 The taskbar band, left to right: the start button (compositor), the dock
 centred (compositor), and the clock and date at the far right (the desk's).
@@ -430,8 +436,9 @@ is the list so it does not get relitigated.
   view, which is safe because appearance can never carry meaning: descriptions
   are required and actions are derived.
 * There is **no start menu process**. The start menu is a compositor panel:
-  a prompt that becomes a new agentdesk, and the grid of installed apps. Its
-  requests are `create-desk` and `open-app` to PID 1, the way the stop button
+  a prompt that becomes a new agentdesk, the grid of installed apps, and the
+  machine's power controls. Its requests are `create-desk`, `open-app`,
+  `poweroff` and `reboot` to PID 1, the way the stop button
   and a tab's close are; the nav bar's `+` is `create-desk` with no prompt,
   and the compositor asks for the first workspace at boot. The human opens
   apps from the menu; an agent opens them only through its agentdesk.

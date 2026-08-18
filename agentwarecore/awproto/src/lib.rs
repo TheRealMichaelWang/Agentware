@@ -18,6 +18,8 @@
 //!   interrupt    <desk>
 //!   close-desk   <desk>
 //!   list-desks
+//!   poweroff
+//!   reboot
 //!
 //! Responses are `ok` followed by zero or more result fields, or `err`
 //! followed by a message.

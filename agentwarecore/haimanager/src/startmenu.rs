@@ -63,6 +63,11 @@ pub enum StartOutcome {
     CreateDesk(Option<String>),
     /// Open this application into the workspace on screen.
     Open(String),
+    /// Shut the machine down. Real power-off, not a screen that pretends:
+    /// PID 1 runs the same orderly shutdown the machine's power button gets.
+    PowerOff,
+    /// Shut everything down and boot fresh.
+    Restart,
 }
 
 /// An installed application, as the menu lists it.
@@ -172,7 +177,23 @@ impl StartMenu {
         if self.apps.is_empty() {
             out.push_str("        <text color=\"muted\">No applications are installed.</text>\n");
         }
-        out.push_str("      </vstack>\n    </scroll>\n  </vstack>\n</window>\n");
+        out.push_str("      </vstack>\n    </scroll>\n");
+
+        // The machine's power, in the panel's lower-left corner. Here rather
+        // than in a workspace because turning the machine off belongs to no
+        // workspace, and the start menu is the one piece of chrome that is
+        // the machine's rather than a desk's. No sleep button: the kernel
+        // could suspend, but nothing could wake it, and a sleep that cannot
+        // be woken from the keyboard is a power-off wearing the wrong label.
+        out.push_str(
+            "    <divider/>\n    <hstack gap=\"sm\">\n\
+             \x20     <button id=\"power-off\" label=\"Power off\" emphasis=\"danger\" \
+             description=\"Shuts the machine down. Every agentdesk, its apps and its conversation end; settings survive.\"/>\n\
+             \x20     <button id=\"restart\" label=\"Restart\" \
+             description=\"Shuts everything down and starts the machine again from scratch\"/>\n\
+             \x20     <text grow=\"true\"/>\n    </hstack>\n",
+        );
+        out.push_str("  </vstack>\n</window>\n");
         out
     }
 
@@ -192,6 +213,12 @@ impl StartMenu {
 
         if id == "start-go" {
             return self.submit();
+        }
+        if id == "power-off" {
+            return StartOutcome::PowerOff;
+        }
+        if id == "restart" {
+            return StartOutcome::Restart;
         }
         if let Some(app) = id.strip_prefix("launch-") {
             return StartOutcome::Open(app.to_owned());

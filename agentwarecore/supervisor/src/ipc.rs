@@ -19,6 +19,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 
 use rustix::event::epoll;
 use rustix::net::{self, SendAncillaryBuffer, SendAncillaryMessage};
+use rustix::process::{Pid, Signal, kill_process};
 
 use awproto::{self as proto, Decoder, ROLE_HAIMANAGER, SOCKET_PATH};
 
@@ -381,6 +382,15 @@ impl Control {
 
         "list-desks" => Ok(desks.list()),
 
+        // The power controls, from the start menu. The work does not happen
+        // here: the verb becomes the signal the machine's own power button
+        // would send, picked up by the signalfd in the main loop, where the
+        // orderly shutdown runs with the service table in hand. The reply
+        // still goes out first, so the compositor is answered rather than
+        // hung up on.
+        "poweroff" => signal_self(Signal::USR1).map(|()| vec![]),
+        "reboot" => signal_self(Signal::USR2).map(|()| vec![]),
+
         other => Err(format!("unknown request {other:?}")),
     };
 
@@ -412,4 +422,14 @@ impl Control {
 /// The desk id out of a request that has already been parsed once.
 fn id_text(fields: &[String]) -> String {
     fields.get(1).cloned().unwrap_or_default()
+}
+
+/// Queue a signal to PID 1 itself.
+///
+/// The handled signals are blocked and read from a signalfd, so this does not
+/// interrupt anything: the signal waits in the kernel until the main loop's
+/// next pass, which is after the reply to the request that asked for it.
+fn signal_self(sig: Signal) -> Result<(), String> {
+    let pid = Pid::from_raw(1).ok_or_else(|| "PID 1 is not a pid".to_owned())?;
+    kill_process(pid, sig).map_err(|err| format!("could not signal the supervisor: {err}"))
 }

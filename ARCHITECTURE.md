@@ -13,7 +13,7 @@ The `agentwarecore` repository is structured to separate the boot-critical super
 * `awsettings/` - The settings application. In this workspace rather than `agentwareapps` because what it edits is system state every workspace reads, but an ordinary application in every other way: it links the protocol crate and nothing else.
 * `agent/` - The per-turn worker. Spawned to execute one prompt and gone when that prompt is finished. Not built yet; `awagent/` is a scripted stand-in.
 
-There is no start menu process. The start menu is a panel the haimanager draws: the Agentware mark at the left end of the taskbar opens it, centred over the workspace, with a prompt that becomes a new agentdesk and a grid of every installed application. It is chrome for the reasons the dock is (it needs the icons only the haimanager holds, it must vanish on a click anywhere else, and it must work when the workspace under it does not), and its requests go to the Supervisor the way the stop button's does. The plus at the end of the navigation bar's tabs creates an agentdesk with nothing to do; the haimanager asks for a blank one itself when it comes up and again whenever the last one closes, so the machine boots to a workspace and never shows a display with nothing on it.
+There is no start menu process. The start menu is a panel the haimanager draws: the Agentware mark at the left end of the taskbar opens it, centred over the workspace, with a prompt that becomes a new agentdesk, a grid of every installed application, and the machine's power controls in its lower-left corner. It is chrome for the reasons the dock is (it needs the icons only the haimanager holds, it must vanish on a click anywhere else, and it must work when the workspace under it does not), and its requests go to the Supervisor the way the stop button's does. The plus at the end of the navigation bar's tabs creates an agentdesk with nothing to do; the haimanager asks for a blank one itself when it comes up and again whenever the last one closes, so the machine boots to a workspace and never shows a display with nothing on it.
 
 First-party applications live in a second workspace, `agentwareapps`, beside `agentwarecore` rather than inside it. Apps are clients of the display protocol, not parts of the system: they link the protocol crate, and the toolkit when they need a dialog, and nothing else; the separate workspace makes that boundary a directory rather than a convention. `awcalc` is a calculator; `awfiles` is a file explorer, and the place the shared dialogs are seen at work.
 
@@ -93,7 +93,14 @@ CloseApp   { desk_id, pid }         -> ends one app, leaving the workspace open
 StartAgent { desk_id }              -> forks a per-turn agent, returns a channel to it
 Interrupt  { desk_id }              -> SIGTERM the desk's current agent
 CloseDesk  { desk_id }              -> tear down the desk and everything in it
+PowerOff   {}                       -> orderly shutdown, then power off
+Reboot     {}                       -> orderly shutdown, then a fresh boot
 ```
+
+`PowerOff` and `Reboot` come from the start menu's power controls. The
+Supervisor does not act on them inline: each becomes the signal the machine's
+own power button would send, picked up by the signalfd in the main loop, so
+the one shutdown path serves the button, the keystroke and the request alike.
 
 `CreateDesk` carries a prompt or nothing, matching the two ways a workspace is made: the start menu's prompt, and the navigation bar's plus. That opening prompt is the only piece of user text the Supervisor ever handles, and it exists solely because a brand new workspace has no other way to learn what it was created for. It is handed to the agentdesk, not to an agent.
 
