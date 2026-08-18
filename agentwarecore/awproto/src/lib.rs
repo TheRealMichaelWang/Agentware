@@ -38,6 +38,7 @@ pub mod agent;
 pub mod broker;
 pub mod display;
 pub mod settings;
+pub mod theme;
 pub mod turn;
 
 use std::fmt;

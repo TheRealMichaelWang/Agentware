@@ -158,6 +158,13 @@ pack: build
 	mkdir -p $(FS_DIR)/default_wallpapers
 	cp default_wallpapers/*.svg $(FS_DIR)/default_wallpapers/
 
+	# 3b'''. The themes that ship with the system: the compositor's palette
+	# as a file, one XML per theme, listed by the settings app the way the
+	# wallpapers are. dark.xml is the palette the compositor was born with.
+	rm -rf $(FS_DIR)/default_themes
+	mkdir -p $(FS_DIR)/default_themes
+	cp default_themes/*.xml $(FS_DIR)/default_themes/
+
 	# 3b''. /home, where the file browser opens, with a few files to find.
 	# In RAM like everything else: what is made there lasts until power off.
 	rm -rf $(FS_DIR)/home

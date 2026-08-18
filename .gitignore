@@ -6,6 +6,7 @@ initramfs/init
 initramfs/bin/
 initramfs/apps/
 initramfs/default_wallpapers/
+initramfs/default_themes/
 initramfs/home/
 # The state volume is this machine's, like a disk. Made by `make run`.
 state.img

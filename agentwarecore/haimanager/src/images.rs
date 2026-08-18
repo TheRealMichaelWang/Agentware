@@ -93,6 +93,19 @@ impl Images {
         bitmap
     }
 
+    /// Change what shows through where a picture is transparent.
+    ///
+    /// Called when the theme changes. Every fitted picture composited the old
+    /// backdrop into its rows, so they are all stale; the decoded sources are
+    /// not, and refitting from them is the cheap half of the work.
+    pub fn set_background(&mut self, background: Color) {
+        if self.background == background {
+            return;
+        }
+        self.background = background;
+        self.fitted.borrow_mut().clear();
+    }
+
     fn source(&self, path: &str) -> Option<Rc<Source>> {
         if let Some(hit) = self.sources.borrow().get(path) {
             return hit.clone();

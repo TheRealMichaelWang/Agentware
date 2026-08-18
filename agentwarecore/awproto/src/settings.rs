@@ -14,6 +14,7 @@
 //! <settings>
 //!   <desktop>
 //!     <wallpaper>/default_wallpapers/dusk.svg</wallpaper>
+//!     <theme>/default_themes/dark.xml</theme>
 //!   </desktop>
 //!   <time>
 //!     <utc-offset>+00:00</utc-offset>
@@ -79,6 +80,10 @@ pub struct Settings {
     /// The wallpaper every workspace shows: a path, or `None` for a plain
     /// background.
     pub wallpaper: Option<String>,
+    /// The theme the compositor paints with: a path to a theme file. Always
+    /// something, because the screen always has a palette; a path that stops
+    /// loading leaves the compositor on the palette it already holds.
+    pub theme: String,
     /// The time zone, as minutes east of UTC. Zero until someone says
     /// otherwise, which is the one honest default for a machine that cannot
     /// know where it is.
@@ -87,7 +92,11 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { wallpaper: Some(DEFAULT_WALLPAPER.to_owned()), utc_offset: 0 }
+        Settings {
+            wallpaper: Some(DEFAULT_WALLPAPER.to_owned()),
+            theme: crate::theme::DEFAULT_THEME.to_owned(),
+            utc_offset: 0,
+        }
     }
 }
 
@@ -138,8 +147,9 @@ impl Settings {
     pub fn to_xml(&self) -> String {
         let wallpaper = self.wallpaper.as_deref().unwrap_or(WALLPAPER_NONE);
         format!(
-            "<settings>\n  <desktop>\n    <wallpaper>{}</wallpaper>\n  </desktop>\n  <time>\n    <utc-offset>{}</utc-offset>\n  </time>\n</settings>\n",
+            "<settings>\n  <desktop>\n    <wallpaper>{}</wallpaper>\n    <theme>{}</theme>\n  </desktop>\n  <time>\n    <utc-offset>{}</utc-offset>\n  </time>\n</settings>\n",
             escape(wallpaper),
+            escape(&self.theme),
             format_offset(self.utc_offset),
         )
     }
@@ -218,8 +228,9 @@ pub fn wallpapers() -> Vec<(String, String)> {
     found
 }
 
-/// `deep-space` becomes `Deep space`.
-fn display_name(stem: &str) -> String {
+/// `deep-space` becomes `Deep space`. Shared with the theme listing, which
+/// names its files the same way.
+pub(crate) fn display_name(stem: &str) -> String {
     let mut out = String::with_capacity(stem.len());
     for (at, part) in stem.split(['-', '_']).enumerate() {
         if at > 0 {
@@ -259,19 +270,26 @@ fn parse(text: &str) -> Option<Settings> {
         Some(WALLPAPER_NONE) | Some("") => None,
         Some(path) => Some(path.to_owned()),
     };
+    // A file from before themes existed has no element; the default theme is
+    // what such a machine was showing anyway.
+    let theme = match values.get("settings/desktop/theme").map(String::as_str) {
+        Some(path) if !path.is_empty() => path.to_owned(),
+        _ => crate::theme::DEFAULT_THEME.to_owned(),
+    };
     // A missing or malformed offset is UTC, not a refusal: an old file, or a
     // hand edit that went wrong, should not lose the wallpaper with it.
     let utc_offset = values
         .get("settings/time/utc-offset")
         .and_then(|text| parse_offset(text))
         .unwrap_or(0);
-    Some(Settings { wallpaper, utc_offset })
+    Some(Settings { wallpaper, theme, utc_offset })
 }
 
 /// Every element's text, keyed by its path from the root, `a/b/c`. Elements
 /// with children have their own entry too, with whatever text sits between
-/// them (usually nothing but whitespace, trimmed away).
-fn read_elements(text: &str) -> Option<BTreeMap<String, String>> {
+/// them (usually nothing but whitespace, trimmed away). Shared with the
+/// theme reader, which follows the same shape of file.
+pub(crate) fn read_elements(text: &str) -> Option<BTreeMap<String, String>> {
     let mut values: BTreeMap<String, String> = BTreeMap::new();
     let mut stack: Vec<String> = Vec::new();
     let mut rest = text;
@@ -353,9 +371,13 @@ mod tests {
 
     #[test]
     fn round_trips() {
-        let settings = Settings { wallpaper: Some("/pictures/a & b.png".into()), utc_offset: -300 };
+        let settings = Settings {
+            wallpaper: Some("/pictures/a & b.png".into()),
+            theme: "/themes/mine & yours.xml".into(),
+            utc_offset: -300,
+        };
         assert_eq!(parse(&settings.to_xml()), Some(settings));
-        let none = Settings { wallpaper: None, utc_offset: 345 };
+        let none = Settings { wallpaper: None, utc_offset: 345, ..Settings::default() };
         assert_eq!(parse(&none.to_xml()), Some(none));
     }
 

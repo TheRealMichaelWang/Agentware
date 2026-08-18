@@ -38,6 +38,8 @@ agentwareapps/          cargo workspace: first-party applications
   awfiles/              a file explorer, and where the shared dialogs are seen
 home/                   sample files, staged to /home (RAM; lost at power off)
 default_wallpapers/     the wallpapers that ship, staged to /default_wallpapers
+default_themes/         the palettes that ship, one XML each; dark.xml is the
+                        palette the compositor paints with unless told otherwise
 state.img               the state volume: ext4, mounted at /state, holds
                         settings.xml; made on first `make run`, gitignored
 initramfs/              staged image contents (build output, gitignored)
@@ -204,6 +206,24 @@ app owns `open`; the compositor sends `open`/`close`, floats the options over
 what follows, and closes on a press elsewhere). `text` wraps, and `scroll
 anchor="end"` keeps a transcript pinned to its end until the human scrolls
 away.
+
+**The palette is a theme, and a theme is a file.** The thirteen colours the
+compositor paints with (`ui::background()` and friends, atomics read at paint
+time) come from one XML file per theme in `/default_themes`, the original
+hardcoded palette shipped as `dark.xml`, so far alone; another theme is a
+file dropped beside it, nothing registered anywhere. Which
+one is `<desktop><theme>` in `settings.xml`, chosen from a dropdown under
+the wallpaper's on the Settings app's Desktop page; the compositor stats the
+settings file once per idle loop pass and swaps the palette when it names
+another theme, so the whole machine changes within a second, no restart. A
+theme names every colour or is refused whole: there is deliberately no
+palette in the code to patch a file with (`awproto::theme`), only an
+emergency monochrome the screen wears if no theme file loads at all, ugly on
+purpose so a broken image gets reported rather than shipped. The wallpaper
+cache is the one thing that bakes a colour in (composites over the
+background), so a theme change clears it. Floating dropdown options clip to
+the document, not their container, which the theme dropdown discovered by
+living in a group one row tall.
 
 First-party applications live in `agentwareapps/`, a separate workspace because
 apps are clients of the display protocol, not parts of the system: they link

@@ -265,8 +265,8 @@ impl StartMenu {
     /// phase; the caret is in the prompt while the menu is open.
     pub fn draw(&self, canvas: &mut Canvas, fonts: &Fonts, images: &Images, panel: Rect, caret_lit: bool) {
         canvas.shadow(panel, ui::radius_surface(), ui::sc(28), 160);
-        canvas.fill_round_rect_vgrad(panel, ui::radius_surface(), ui::lift(ui::SURFACE, 6), ui::SURFACE);
-        canvas.stroke_round_rect(panel, ui::radius_surface(), 1, ui::BORDER);
+        canvas.fill_round_rect_vgrad(panel, ui::radius_surface(), ui::lift(ui::surface(), 6), ui::surface());
+        canvas.stroke_round_rect(panel, ui::radius_surface(), 1, ui::border());
 
         let Some(doc) = &self.doc else { return };
         let focus = Focus {

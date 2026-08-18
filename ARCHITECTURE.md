@@ -21,6 +21,8 @@ An installed application is a folder, `/apps/<name>/`, holding four things: `exe
 
 The wallpapers that ship live in `/default_wallpapers/`, one SVG or PNG each. The settings application offers them in a dropdown, or any picture on the machine through the shared file dialog, and records the choice in `settings.xml` on the state volume, the one thing that crosses between processes on the filesystem rather than over a socket and the one thing that outlives a boot; every agentdesk stats it on its clock tick, re-reads it when it has changed, and names the picture in an `image` element in its background region, and the haimanager loads and fits it.
 
+The themes that ship live in `/default_themes/`, one XML file per palette, and travel the same road: the settings application offers them in a dropdown, the choice goes in `settings.xml`, and the haimanager, the one process that paints, stats that file itself and swaps its palette when the choice changes. The palette exists only in the theme files; the code carries no copy to drift from, just an emergency monochrome for a machine whose theme directory is gone.
+
 ## The Supervisor (PID 1)
 The Supervisor is the absolute root of the userland.
 * Runs as process ID 1 immediately after the Linux kernel finishes booting.

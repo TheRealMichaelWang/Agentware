@@ -26,6 +26,7 @@ use std::time::SystemTime;
 use awkit::{Answer, FileDialog};
 use awproto::display::{self, Event, Surface, escape};
 use awproto::settings::{self, Settings as Stored};
+use awproto::theme;
 
 /// The categories down the rail.
 const CATEGORIES: &[(&str, &str)] = &[("desktop", "Desktop"), ("time", "Time")];
@@ -39,6 +40,11 @@ struct Settings {
     defaults: Vec<(String, String)>,
     /// The current choice, `None` for a plain background.
     current: Option<String>,
+    /// The themes that ship with the system, as (name, path).
+    themes: Vec<(String, String)>,
+    /// The theme in use, as a path. Always something: the screen always has
+    /// a palette.
+    theme: String,
     /// The time zone, as minutes east of UTC.
     utc_offset: i32,
     /// When the settings file was last read, so a change made elsewhere is
@@ -46,6 +52,8 @@ struct Settings {
     seen: Option<SystemTime>,
     /// Whether the wallpaper dropdown is showing its options.
     open: bool,
+    /// Whether the theme dropdown is showing its options.
+    theme_open: bool,
     /// The file dialog, while one is up.
     choosing: Option<FileDialog>,
     status: String,
@@ -60,13 +68,17 @@ fn main() {
         }
     };
 
+    let stored = Stored::load();
     let mut app = Settings {
         category: CATEGORIES[0].0,
         defaults: settings::wallpapers(),
-        current: Stored::load().wallpaper,
-        utc_offset: Stored::load().utc_offset,
+        current: stored.wallpaper,
+        themes: theme::themes(),
+        theme: stored.theme,
+        utc_offset: stored.utc_offset,
         seen: settings::modified(),
         open: false,
+        theme_open: false,
         choosing: None,
         status: String::new(),
     };
@@ -113,6 +125,7 @@ impl Settings {
             self.seen = seen;
             let stored = Stored::load();
             self.current = stored.wallpaper;
+            self.theme = stored.theme;
             self.utc_offset = stored.utc_offset;
         }
 
@@ -137,6 +150,24 @@ impl Settings {
         match (event.target.as_str(), event.action.as_str()) {
             ("wallpaper", display::ACTION_OPEN) => self.open = true,
             ("wallpaper", display::ACTION_CLOSE) => self.open = false,
+
+            ("theme", display::ACTION_OPEN) => self.theme_open = true,
+            ("theme", display::ACTION_CLOSE) => self.theme_open = false,
+
+            (target, display::ACTION_SELECT) if target.starts_with("theme-") => {
+                self.theme_open = false;
+                match &target["theme-".len()..] {
+                    "current" => {}
+                    index => {
+                        if let Some((_, path)) =
+                            index.parse::<usize>().ok().and_then(|i| self.themes.get(i))
+                        {
+                            let path = path.clone();
+                            self.choose_theme(path);
+                        }
+                    }
+                }
+            }
 
             (target, display::ACTION_SELECT) if target.starts_with("wallpaper-") => {
                 self.open = false;
@@ -210,6 +241,31 @@ impl Settings {
             Err(err) => self.status = format!("could not save the setting: {err}"),
         }
         log(&self.status);
+    }
+
+    /// Record a theme and say so. The compositor notices the file's clock
+    /// moved, exactly as every agentdesk notices a wallpaper, so the palette
+    /// changes within a second of the click.
+    fn choose_theme(&mut self, path: String) {
+        let mut stored = Stored::load();
+        stored.theme = path.clone();
+        match stored.save() {
+            Ok(()) => {
+                self.status = format!("theme set to {path}");
+                if !settings::persistent() {
+                    self.status.push_str(" (no state volume: kept until power off)");
+                }
+                self.theme = path;
+                self.seen = settings::modified();
+            }
+            Err(err) => self.status = format!("could not save the setting: {err}"),
+        }
+        log(&self.status);
+    }
+
+    /// Whether the current theme is one of the shipped ones.
+    fn theme_is_default(&self) -> bool {
+        self.themes.iter().any(|(_, path)| *path == self.theme)
     }
 
     /// Whether the current wallpaper is one of the shipped ones.
@@ -309,6 +365,46 @@ impl Settings {
             );
         }
         out.push_str("          </vstack>\n        </group>\n");
+
+        // The theme: the palette the compositor paints everything with,
+        // chosen from the ones that ship. The compositor re-reads the
+        // settings file when its clock moves, so the choice takes hold
+        // within a second, this window included.
+        out.push_str("        <group label=\"Theme\">\n          <vstack gap=\"sm\">\n            <hstack>\n");
+        let value = match self.themes.iter().position(|(_, path)| *path == self.theme) {
+            Some(index) => index.to_string(),
+            None => "current".to_owned(),
+        };
+        let _ = writeln!(
+            out,
+            r#"              <select id="theme" value="{value}"{open} placeholder="Theme" description="Chooses the colours everything on the machine is drawn in">"#,
+            open = if self.theme_open { r#" open="true""# } else { "" },
+        );
+        for (index, (name, path)) in self.themes.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                r#"                <option id="theme-{index}" label="{name}" value="{index}"{selected} description="Sets the theme to {name}"/>"#,
+                name = escape(name),
+                selected = if self.theme == *path { r#" selected="true""# } else { "" },
+            );
+        }
+        if !self.theme_is_default() {
+            let name = Path::new(&self.theme).file_stem().and_then(|n| n.to_str()).unwrap_or(&self.theme);
+            let _ = writeln!(
+                out,
+                r#"                <option id="theme-current" label="{name}" value="current" selected="true" description="The theme currently set, {path}"/>"#,
+                name = escape(name),
+                path = escape(&self.theme),
+            );
+        }
+        out.push_str("              </select>\n            </hstack>\n");
+        let _ = writeln!(
+            out,
+            r#"            <text role="caption" color="muted">{}</text>"#,
+            escape(&self.theme),
+        );
+        out.push_str("          </vstack>\n        </group>\n");
+
         if !self.status.is_empty() {
             let _ = writeln!(out, r#"        <text role="caption" color="muted">{}</text>"#, escape(&self.status));
         }

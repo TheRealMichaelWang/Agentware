@@ -39,25 +39,78 @@ use crate::awml::{Node, Tag, Tree};
 use crate::document::Document;
 use crate::images::Images;
 use crate::paint::font::{Family, Fonts, Style, Weight};
-use crate::paint::{Canvas, Color, Rect, rgb};
+use crate::paint::{Canvas, Color, Rect};
 
 // The palette an application names colours out of. An app may also give a hex
 // value; these exist so the common cases stay consistent between applications
-// and follow the system theme if it ever changes.
-pub const BACKGROUND: Color = rgb(0x0e, 0x10, 0x16);
-pub const SURFACE: Color = rgb(0x1a, 0x1e, 0x28);
-pub const RAISED: Color = rgb(0x25, 0x2b, 0x39);
-/// One step above RAISED, for a control under the pointer or being pressed.
-pub const PRESSED: Color = rgb(0x32, 0x3a, 0x4c);
-pub const BORDER: Color = rgb(0x2e, 0x35, 0x45);
-pub const TEXT: Color = rgb(0xe8, 0xeb, 0xf2);
-pub const MUTED: Color = rgb(0x94, 0x9d, 0xb2);
-pub const ACCENT: Color = rgb(0x4f, 0x9c, 0xf5);
-pub const ACCENT_DEEP: Color = rgb(0x2f, 0x77, 0xcc);
-pub const DANGER: Color = rgb(0xe0, 0x5a, 0x5a);
-pub const DANGER_DEEP: Color = rgb(0xb8, 0x42, 0x42);
-pub const OK: Color = rgb(0x5a, 0xc8, 0x8a);
-pub const SELECTED: Color = rgb(0x2b, 0x3f, 0x5e);
+// and follow the system theme.
+//
+// The palette is the theme: it comes from the theme file the settings name
+// (`awproto::theme`), installed whole by [`set_theme`] at startup and again
+// when the setting changes. One struct behind one static rather than a
+// colour per static, so the palette cannot be half-swapped and adding a
+// colour is one field, not four edits. It is a static rather than a value
+// threaded through every paint call for the same reason the scale is:
+// one value, set at one moment, read everywhere. Everything paints by
+// asking, so the frame after a theme change is simply in the new palette.
+//
+// The initial value is deliberately NOT a theme. Themes live in
+// /default_themes and only there; a palette compiled in here would drift
+// from the file it copied and defeat the point of loading one. This is the
+// emergency monochrome the screen wears when no theme file loads at all:
+// legible enough to reach the settings and fix it, wrong enough that nobody
+// mistakes a broken image for a working one. A fallback that looked right
+// would be a bug nobody reports.
+use awproto::theme::Theme;
+use std::sync::RwLock;
+
+const EMERGENCY: Theme = Theme {
+    background: 0x000000,
+    surface: 0x161616,
+    raised: 0x2a2a2a,
+    pressed: 0x3d3d3d,
+    border: 0x555555,
+    text: 0xffffff,
+    muted: 0x9a9a9a,
+    accent: 0xd0d0d0,
+    accent_deep: 0xb0b0b0,
+    danger: 0xe8e8e8,
+    danger_deep: 0xc8c8c8,
+    ok: 0xd0d0d0,
+    selected: 0x3d3d3d,
+};
+
+static THEME: RwLock<Theme> = RwLock::new(EMERGENCY);
+
+/// The palette as it stands. The lock is uncontended on a one-thread
+/// compositor and cannot be poisoned by [`set_theme`]'s panic-free write,
+/// so the emergency arm is unreachable and honest rather than load-bearing.
+fn theme() -> Theme {
+    THEME.read().map(|held| *held).unwrap_or(EMERGENCY)
+}
+
+/// Install a palette, whole.
+pub fn set_theme(theme: &Theme) {
+    if let Ok(mut held) = THEME.write() {
+        *held = *theme;
+    }
+}
+
+/// The deepest layer: the desk behind everything, window bodies.
+pub fn background() -> Color { theme().background }
+pub fn surface() -> Color { theme().surface }
+pub fn raised() -> Color { theme().raised }
+/// One step above raised, for a control under the pointer or being pressed.
+pub fn pressed() -> Color { theme().pressed }
+pub fn border() -> Color { theme().border }
+pub fn text() -> Color { theme().text }
+pub fn muted() -> Color { theme().muted }
+pub fn accent() -> Color { theme().accent }
+pub fn accent_deep() -> Color { theme().accent_deep }
+pub fn danger() -> Color { theme().danger }
+pub fn danger_deep() -> Color { theme().danger_deep }
+pub fn ok() -> Color { theme().ok }
+pub fn selected() -> Color { theme().selected }
 
 /// A colour nudged brighter, for the top edge of a gradient.
 ///
@@ -245,11 +298,11 @@ pub fn color_at(tree: &Tree, index: usize, default: Color) -> Color {
     };
 
     match value {
-        "text" => TEXT,
-        "muted" => MUTED,
-        "accent" => ACCENT,
-        "danger" => DANGER,
-        "ok" => OK,
+        "text" => text(),
+        "muted" => muted(),
+        "accent" => accent(),
+        "danger" => danger(),
+        "ok" => ok(),
         hex => parse_hex(hex).unwrap_or(default),
     }
 }
@@ -784,8 +837,14 @@ impl Placer<'_> {
             let row = control_height(self.fonts, tree, index);
             let count = children.len() as i32;
             let below = area.y + area.h;
-            let fits_below = below + row * count <= clip.y + clip.h;
-            let top = if fits_below || area.y - row * count < clip.y {
+            // Floating over what follows means escaping the container's clip:
+            // the options answer to the document's, not to the group or list
+            // the box happens to sit in. Clipping them locally silently ate
+            // every option past a short container's edge, which the theme
+            // dropdown found by living in a group exactly one row tall.
+            let float_clip = self.clips[Tree::ROOT];
+            let fits_below = below + row * count <= float_clip.y + float_clip.h;
+            let top = if fits_below || area.y - row * count < float_clip.y {
                 below
             } else {
                 area.y - row * count
@@ -797,7 +856,7 @@ impl Placer<'_> {
                     Rect::new(0, 0, 0, 0)
                 };
                 self.rects[child] = rect;
-                self.clips[child] = if open { clip } else { Rect::new(0, 0, 0, 0) };
+                self.clips[child] = if open { float_clip } else { Rect::new(0, 0, 0, 0) };
             }
             return;
         }
@@ -1212,7 +1271,7 @@ fn paint_scrollbar(canvas: &mut Canvas, layout: &Layout, index: usize, lit: Opti
     };
     // No track drawn, only the thumb. A permanent groove down the side of
     // every scrollable thing is most of what makes a list look heavy.
-    canvas.fill_round_rect(thumb, track.w / 2, MUTED);
+    canvas.fill_round_rect(thumb, track.w / 2, muted());
 }
 
 /// An open dropdown's options: a raised panel hanging off the box, over
@@ -1235,11 +1294,13 @@ fn paint_popup(
     if panel.w <= 0 || panel.h <= 0 {
         return;
     }
-    let clip = layout.clips[select];
+    // The options' clip, not the box's: the panel floats with them, past
+    // whatever container the box itself is confined to.
+    let clip = layout.clips[first];
     canvas.clipped(clip, |canvas| {
         canvas.shadow(panel, radius_control(), sc(10), 120);
-        canvas.fill_round_rect(panel, radius_control(), RAISED);
-        canvas.stroke_round_rect(panel, radius_control(), 1, BORDER);
+        canvas.fill_round_rect(panel, radius_control(), raised());
+        canvas.stroke_round_rect(panel, radius_control(), 1, border());
     });
     for &option in options {
         paint_node(canvas, fonts, images, tree, layout, option, focus);
@@ -1268,7 +1329,7 @@ fn paint_node(
 
     // Disabled always wins over a colour the application chose: a control that
     // cannot be used must not look like one that can.
-    let ink = if disabled { MUTED } else { color_at(tree, index, TEXT) };
+    let ink = if disabled { muted() } else { color_at(tree, index, text()) };
 
     // Text sits vertically centred in whatever box it was given.
     let centred = |height: i32| rect.y + (height - fonts.line_height(&style)) / 2;
@@ -1279,7 +1340,7 @@ fn paint_node(
     let clip = layout.clips[index];
 
     canvas.clipped(clip, |canvas| match node.tag {
-        Tag::Window => canvas.fill_rect(rect, BACKGROUND),
+        Tag::Window => canvas.fill_rect(rect, background()),
 
         // Text sits in the vertical middle of whatever box it was given. In a
         // column the box is exactly its lines and this changes nothing; in a
@@ -1295,7 +1356,7 @@ fn paint_node(
             }
         }
 
-        Tag::Divider => canvas.fill_rect(rect, BORDER),
+        Tag::Divider => canvas.fill_rect(rect, border()),
 
         // A picture, fitted to cover its rectangle. A source that cannot be
         // loaded leaves the words meant for an agent: the alt text, muted, so a
@@ -1303,14 +1364,14 @@ fn paint_node(
         Tag::Image => match node.attr("src").and_then(|src| images.get(src, rect.w, rect.h)) {
             Some(bitmap) => canvas.blit(&bitmap, rect.x, rect.y),
             None => {
-                canvas.fill_rect(rect, SURFACE);
+                canvas.fill_rect(rect, surface());
                 canvas.draw_text(
                     fonts,
                     node.attr("alt").unwrap_or("?"),
                     rect.x + control_pad(),
                     rect.y + control_pad(),
                     &style,
-                    MUTED,
+                    muted(),
                 );
             }
         },
@@ -1322,16 +1383,16 @@ fn paint_node(
                 rect.x,
                 centred(rect.h),
                 &style,
-                MUTED,
+                muted(),
             );
         }
 
         Tag::Dialog => {
             canvas.shadow(rect, radius_surface(), 18, 120);
-            canvas.fill_round_rect(rect, radius_surface(), RAISED);
-            canvas.stroke_round_rect(rect, radius_surface(), 1, BORDER);
+            canvas.fill_round_rect(rect, radius_surface(), raised());
+            canvas.stroke_round_rect(rect, radius_surface(), 1, border());
             if let Some(label) = node.attr("label") {
-                canvas.draw_text(fonts, label, rect.x + padding(), rect.y + padding(), &style, MUTED);
+                canvas.draw_text(fonts, label, rect.x + padding(), rect.y + padding(), &style, muted());
             }
         }
 
@@ -1343,22 +1404,24 @@ fn paint_node(
             let heading = style_at(tree, index);
             let heading = Style { size: heading.size * 0.85, ..heading };
             if let Some(label) = node.attr("label") {
-                canvas.draw_text(fonts, label, rect.x, rect.y, &heading, MUTED);
+                canvas.draw_text(fonts, label, rect.x, rect.y, &heading, muted());
                 let rule = rect.y + fonts.line_height(&heading) + 3;
-                canvas.fill_rect(Rect::new(rect.x, rule, rect.w, 1), BORDER);
+                canvas.fill_rect(Rect::new(rect.x, rule, rect.w, 1), border());
             }
         }
 
         Tag::Button => {
             let emphasis = node.attr("emphasis");
             let fill = match (disabled, pressed, emphasis) {
-                (true, _, _) => SURFACE,
-                (_, true, Some("primary")) => ACCENT_DEEP,
-                (_, true, Some("danger")) => DANGER_DEEP,
-                (_, true, _) => PRESSED,
-                (_, _, Some("primary")) => ACCENT,
-                (_, _, Some("danger")) => DANGER,
-                _ => RAISED,
+                (true, _, _) => surface(),
+                (_, true, Some("primary")) => accent_deep(),
+                (_, true, Some("danger")) => danger_deep(),
+                // `self::`, because the local `pressed` above shadows the
+                // palette function here.
+                (_, true, _) => self::pressed(),
+                (_, _, Some("primary")) => accent(),
+                (_, _, Some("danger")) => danger(),
+                _ => raised(),
             };
             // Lit faintly from above, except when disabled (flat says inert)
             // or pressed (a control being pushed in should not look raised).
@@ -1368,9 +1431,9 @@ fn paint_node(
                 canvas.fill_round_rect_vgrad(rect, radius_control(), lift(fill, 10), fill);
             }
             if focused && !disabled {
-                canvas.stroke_round_rect(rect, radius_control(), 2, ACCENT);
+                canvas.stroke_round_rect(rect, radius_control(), 2, accent());
             } else if emphasis.is_none() {
-                canvas.stroke_round_rect(rect, radius_control(), 1, BORDER);
+                canvas.stroke_round_rect(rect, radius_control(), 1, border());
             }
 
             let label = label_of(node);
@@ -1401,11 +1464,11 @@ fn paint_node(
         }
 
         Tag::Field | Tag::Editor => {
-            canvas.fill_round_rect(rect, radius_control(), BACKGROUND);
+            canvas.fill_round_rect(rect, radius_control(), background());
             let edge = match (focused, node.flag("invalid")) {
-                (_, true) => DANGER,
-                (true, _) => ACCENT,
-                _ => BORDER,
+                (_, true) => danger(),
+                (true, _) => accent(),
+                _ => border(),
             };
             canvas.stroke_round_rect(rect, radius_control(), if focused { 2 } else { 1 }, edge);
 
@@ -1416,7 +1479,7 @@ fn paint_node(
             } else {
                 value.clone()
             };
-            let color = if empty { MUTED } else { ink };
+            let color = if empty { muted() } else { ink };
 
             let x = rect.x + control_pad();
             let top = if node.tag == Tag::Editor { rect.y + control_pad() } else { centred(rect.h) };
@@ -1447,7 +1510,7 @@ fn paint_node(
                 let (row, column) = caret_position(&value, focus.caret, node.tag);
                 let line = value.lines().nth(row).unwrap_or("");
                 let caret_x = x + fonts.measure(prefix(line, column), &style);
-                inner.fill_rect(Rect::new(caret_x, top + row as i32 * step, sc(2).max(2), step), ACCENT);
+                inner.fill_rect(Rect::new(caret_x, top + row as i32 * step, sc(2).max(2), step), accent());
             });
         }
 
@@ -1462,13 +1525,13 @@ fn paint_node(
             canvas.fill_round_rect(
                 box_rect,
                 radius_small(),
-                if checked && !disabled { ACCENT } else { BACKGROUND },
+                if checked && !disabled { accent() } else { background() },
             );
             if !checked || disabled {
-                canvas.stroke_round_rect(box_rect, radius_small(), 1, if focused { ACCENT } else { BORDER });
+                canvas.stroke_round_rect(box_rect, radius_small(), 1, if focused { accent() } else { border() });
             }
             if checked && disabled {
-                canvas.fill_round_rect(box_rect.inset(4), 2, MUTED);
+                canvas.fill_round_rect(box_rect.inset(4), 2, muted());
             } else if checked {
                 // A tick rather than a filled square: a square inside a square
                 // reads as a loading state. Drawn as two strokes stepped along
@@ -1483,7 +1546,7 @@ fn paint_node(
                     (low, (t.x as f32 + w * 0.90, t.y as f32 + h * 0.12)),
                 ];
                 for ((ax, ay), (bx, by)) in strokes {
-                    canvas.stroke_line(ax, ay, bx, by, sc(2).max(2), BACKGROUND);
+                    canvas.stroke_line(ax, ay, bx, by, sc(2).max(2), background());
                 }
             }
             canvas.draw_text(
@@ -1501,8 +1564,8 @@ fn paint_node(
         // last, so they float over what follows.
         Tag::Select => {
             let open = node.flag("open");
-            canvas.fill_round_rect(rect, radius_control(), BACKGROUND);
-            let edge = if focused || open { ACCENT } else { BORDER };
+            canvas.fill_round_rect(rect, radius_control(), background());
+            let edge = if focused || open { accent() } else { border() };
             canvas.stroke_round_rect(rect, radius_control(), if focused || open { 2 } else { 1 }, edge);
             let chosen = node.attr("value").unwrap_or("");
             let shown = node
@@ -1514,7 +1577,7 @@ fn paint_node(
                 .filter(|label| !label.is_empty());
             let (words, color) = match shown {
                 Some(label) => (label.to_owned(), ink),
-                None => (node.attr("placeholder").unwrap_or("").to_owned(), MUTED),
+                None => (node.attr("placeholder").unwrap_or("").to_owned(), muted()),
             };
             canvas.clipped(Rect::new(rect.x, rect.y, rect.w - chevron_w(), rect.h), |canvas| {
                 canvas.draw_text(fonts, &words, rect.x + control_pad(), centred(rect.h), &style, color);
@@ -1525,26 +1588,26 @@ fn paint_node(
             let r = sc(3) as f32;
             let t = sc(1).max(1);
             let dy = if open { -r * 0.7 } else { r * 0.7 };
-            canvas.stroke_line(cx - r, cy - dy * 0.5, cx, cy + dy * 0.5, t, MUTED);
-            canvas.stroke_line(cx, cy + dy * 0.5, cx + r, cy - dy * 0.5, t, MUTED);
+            canvas.stroke_line(cx - r, cy - dy * 0.5, cx, cy + dy * 0.5, t, muted());
+            canvas.stroke_line(cx, cy + dy * 0.5, cx + r, cy - dy * 0.5, t, muted());
         }
 
         Tag::Option => {
             if node.flag("selected") {
-                canvas.fill_rect(rect, SELECTED);
+                canvas.fill_rect(rect, selected());
             }
             if focused {
-                canvas.stroke_rect(rect, 1, ACCENT);
+                canvas.stroke_rect(rect, 1, accent());
             }
             canvas.draw_text(fonts, label_of(node), rect.x + control_pad(), centred(rect.h), &style, ink);
         }
 
         Tag::Item => {
             if node.flag("selected") {
-                canvas.fill_rect(rect, SELECTED);
+                canvas.fill_rect(rect, selected());
             }
             if focused {
-                canvas.stroke_rect(rect, 1, ACCENT);
+                canvas.stroke_rect(rect, 1, accent());
             }
             canvas.draw_text(
                 fonts,

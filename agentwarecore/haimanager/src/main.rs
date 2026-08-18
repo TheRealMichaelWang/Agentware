@@ -82,6 +82,11 @@ fn main() {
     ui::set_scale(scale);
     log(&format!("interface scale {scale}"));
 
+    // The theme the settings name, before anything is painted, so the first
+    // frame is already in it and the wallpaper cache composites over the
+    // right background from the start.
+    let theming = Theming::start();
+
     let mut input = Input::new(width as i32, height as i32);
 
     let fonts = match Fonts::load() {
@@ -100,7 +105,74 @@ fn main() {
     redraw(&mut display, &mut canvas, &fonts, &input, &mut screen);
     log(&format!("{} glyphs rasterized for the first frame", fonts.glyph_count()));
 
-    run(&mut display, &mut canvas, &fonts, &mut input, &mut screen, supervisor);
+    run(&mut display, &mut canvas, &fonts, &mut input, &mut screen, supervisor, theming);
+}
+
+/// The theme, watched the way every settings change is watched: the file's
+/// clock moved, so re-read it.
+///
+/// The compositor is the one process that paints, so it is the one that has
+/// to notice. The wallpaper reaches it inside the agentdesks' trees, but no
+/// tree carries the palette, so the compositor stats the settings file
+/// itself, once per pass of a loop that wakes at most every second when idle.
+struct Theming {
+    seen: Option<std::time::SystemTime>,
+    /// The theme file in use, so a settings change that names the same one
+    /// is not a reload.
+    path: String,
+}
+
+impl Theming {
+    /// Load the theme the settings name. The first process to ask writes the
+    /// defaults, and on a machine without a state volume that is this one.
+    fn start() -> Theming {
+        let stored = awproto::settings::Settings::load();
+        let mut theming = Theming { seen: awproto::settings::modified(), path: String::new() };
+        if !theming.apply(&stored.theme) && stored.theme != awproto::theme::DEFAULT_THEME {
+            // The named theme is gone or broken. The shipped default file is
+            // the next honest answer; only if that fails too does the screen
+            // wear the emergency monochrome, which is what a machine missing
+            // its own theme directory deserves to look like.
+            theming.apply(awproto::theme::DEFAULT_THEME);
+        }
+        theming
+    }
+
+    /// Install the theme at `path`, if it loads.
+    ///
+    /// One that does not leaves the palette exactly as it stands: the screen
+    /// always has one, and a broken file should cost the machine nothing but
+    /// a log line.
+    fn apply(&mut self, path: &str) -> bool {
+        self.path = path.to_owned();
+        match awproto::theme::Theme::load(path) {
+            Some(theme) => {
+                ui::set_theme(&theme);
+                log(&format!("theme: {path}"));
+                true
+            }
+            None => {
+                log(&format!("theme: could not read {path}; keeping the palette as it was"));
+                false
+            }
+        }
+    }
+
+    /// Notice a settings change. True if the palette was swapped and the
+    /// scene needs repainting.
+    fn check(&mut self) -> bool {
+        let seen = awproto::settings::modified();
+        if seen == self.seen {
+            return false;
+        }
+        self.seen = seen;
+        let stored = awproto::settings::Settings::load();
+        if stored.theme == self.path {
+            return false;
+        }
+        self.apply(&stored.theme);
+        true
+    }
 }
 
 /// Wait for something to happen and repaint when it does.
@@ -117,6 +189,7 @@ fn run(
     input: &mut Input,
     screen: &mut Screen,
     supervisor: Option<UnixStream>,
+    mut theming: Theming,
 ) -> ! {
     let epoll = match epoll::create(epoll::CreateFlags::CLOEXEC) {
         Ok(epoll) => epoll,
@@ -236,6 +309,14 @@ fn run(
         let tick_dirty = screen.tick(fonts);
         let mut dirty = tick_dirty;
         let mut only_pointer = !tick_dirty;
+
+        // A changed theme repaints the world: every colour on screen came
+        // from the palette that was just swapped out.
+        if theming.check() {
+            screen.retheme();
+            dirty = true;
+            only_pointer = false;
+        }
         for event in &events[..count] {
             let token = event.data.u64();
             if token < TOKEN_INPUT_BASE {

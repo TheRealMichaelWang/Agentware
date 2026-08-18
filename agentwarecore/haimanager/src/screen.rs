@@ -339,7 +339,7 @@ pub struct Screen {
 
 impl Screen {
     pub fn new(bounds: Rect, fonts: &Fonts) -> Screen {
-        let mut images = Images::new(ui::BACKGROUND);
+        let mut images = Images::new(ui::background());
         images.icons.install(AGENTWARE_ICON, AGENTWARE_SVG);
         images.icons.prepare(AGENTWARE_ICON, &[start_icon()]);
         Screen {
@@ -783,6 +783,15 @@ impl Screen {
         self.reframe(fonts);
         self.nav = None;
         Some(label)
+    }
+
+    /// The palette changed under everything painted.
+    ///
+    /// Colours are read at paint time, so the next frame is simply in the new
+    /// palette; the one thing that baked a colour in is the wallpaper cache,
+    /// whose composites hold the old background behind any transparency.
+    pub fn retheme(&mut self) {
+        self.images.set_background(ui::background());
     }
 
     pub fn client_mut(&mut self, fd: RawFd) -> Option<&mut Client> {
@@ -2226,8 +2235,8 @@ impl Screen {
     fn draw_start_button(&self, canvas: &mut Canvas) {
         let button = self.start_button_rect(self.current);
         if self.start.is_some() {
-            canvas.fill_round_rect(button, ui::radius_control(), ui::PRESSED);
-            canvas.stroke_round_rect(button, ui::radius_control(), 1, ui::BORDER);
+            canvas.fill_round_rect(button, ui::radius_control(), ui::pressed());
+            canvas.stroke_round_rect(button, ui::radius_control(), 1, ui::border());
         }
         if let Some(icon) = self.images.icons.get(AGENTWARE_ICON, start_icon()) {
             canvas.blend_pixmap(
@@ -2255,7 +2264,7 @@ impl Screen {
             client.caret_on = keyboard == Some(client.fd()) && phase;
         }
 
-        canvas.fill_rect(canvas.bounds(), ui::BACKGROUND);
+        canvas.fill_rect(canvas.bounds(), ui::background());
 
         match self.workspaces.get(self.current) {
             Some(_) => self.draw_workspace(canvas, fonts, pointer),
@@ -2287,7 +2296,7 @@ impl Screen {
         let workspace = &self.workspaces[self.current];
         let desk = workspace.desk.and_then(|fd| self.client(fd));
 
-        canvas.fill_rect(regions.background, ui::BACKGROUND);
+        canvas.fill_rect(regions.background, ui::background());
         if let Some(desk) = desk {
             canvas.clipped(regions.background, |canvas| {
                 desk.draw_region(canvas, fonts, &self.images, "background")
@@ -2310,8 +2319,8 @@ impl Screen {
         // The taskbar band: the agentdesk's row of controls on a raised
         // surface, with the compositor's dock centred over the middle of it.
         let band = regions.taskbar;
-        canvas.fill_round_rect_vgrad(band, 0, ui::lift(ui::SURFACE, 6), ui::SURFACE);
-        canvas.fill_rect(Rect::new(band.x, band.y, band.w, 1), ui::BORDER);
+        canvas.fill_round_rect_vgrad(band, 0, ui::lift(ui::surface(), 6), ui::surface());
+        canvas.fill_rect(Rect::new(band.x, band.y, band.w, 1), ui::border());
         if let Some(desk) = desk {
             canvas.clipped(band, |canvas| desk.draw_region(canvas, fonts, &self.images, "taskbar"));
         }
@@ -2320,8 +2329,8 @@ impl Screen {
 
         let rect = regions.pane;
         if rect.w > 0 {
-            canvas.fill_rect(rect, ui::SURFACE);
-            canvas.fill_rect(Rect::new(rect.x, rect.y, 1, rect.h), ui::BORDER);
+            canvas.fill_rect(rect, ui::surface());
+            canvas.fill_rect(Rect::new(rect.x, rect.y, 1, rect.h), ui::border());
             if let Some(desk) = desk {
                 canvas.clipped(rect, |canvas| desk.draw_region(canvas, fonts, &self.images, "pane"));
             }
@@ -2349,8 +2358,8 @@ impl Screen {
             let focused = self.focus == Surface::App(fd);
 
             if focused {
-                canvas.fill_round_rect(pill, ui::radius_control(), ui::RAISED);
-                canvas.stroke_round_rect(pill, ui::radius_control(), 1, ui::BORDER);
+                canvas.fill_round_rect(pill, ui::radius_control(), ui::raised());
+                canvas.stroke_round_rect(pill, ui::radius_control(), 1, ui::border());
             }
 
             match self.images.icons.get(&client.name, dock_icon()) {
@@ -2363,7 +2372,7 @@ impl Screen {
                 }
                 None => {
                     let initial = client.title().chars().next().unwrap_or('?').to_string();
-                    let ink = if minimized { ui::MUTED } else { ui::TEXT };
+                    let ink = if minimized { ui::muted() } else { ui::text() };
                     let x = pill.x + (pill.w - fonts.measure(&initial, &style)) / 2;
                     canvas.draw_text(
                         fonts,
@@ -2388,7 +2397,7 @@ impl Screen {
                         dot,
                     ),
                     dot / 2,
-                    ui::ACCENT,
+                    ui::accent(),
                 );
             }
         }
@@ -2397,11 +2406,11 @@ impl Screen {
     /// The grip that folds the conversation pane away.
     fn draw_pane_handle(&self, canvas: &mut Canvas) {
         let grip = self.pane_handle(self.current);
-        canvas.fill_round_rect(grip, pane_handle_w() / 2, ui::RAISED);
-        canvas.stroke_round_rect(grip, pane_handle_w() / 2, 1, ui::BORDER);
+        canvas.fill_round_rect(grip, pane_handle_w() / 2, ui::raised());
+        canvas.stroke_round_rect(grip, pane_handle_w() / 2, 1, ui::border());
         canvas.fill_rect(
             Rect::new(grip.x + grip.w / 2 - 1, grip.y + 14, 2, grip.h - 28),
-            ui::MUTED,
+            ui::muted(),
         );
     }
 
@@ -2415,13 +2424,13 @@ impl Screen {
             (canvas.width() - width) / 2,
             canvas.height() / 2,
             &style,
-            ui::MUTED,
+            ui::muted(),
         );
     }
 
     fn draw_nav(&self, canvas: &mut Canvas, fonts: &Fonts, _pointer: (i32, i32)) {
         let rect = self.nav_rect();
-        canvas.fill_rect(rect, ui::RAISED);
+        canvas.fill_rect(rect, ui::raised());
         let Some(doc) = &self.nav else { return };
 
         // While a tab is being renamed its field carries the caret, on the same
@@ -2466,15 +2475,16 @@ impl Screen {
             && let Some(workspace) = self.workspaces.iter().find(|w| w.id == id)
         {
             // Blank the tab's resting place so it reads as picked up. The nav
-            // document's own window paints BACKGROUND across the bar, so that
-            // is what the empty slot has to be; RAISED here left a grey patch
+            // document's own window paints the background colour across the
+            // bar, so that is what the empty slot has to be; the raised
+            // colour here left a grey patch
             // over the black.
-            canvas.fill_rect(home, ui::BACKGROUND);
+            canvas.fill_rect(home, ui::background());
 
             let ghost = Rect::new(ghost_x, home.y, home.w, home.h);
             let active = current_id == Some(id);
             canvas.shadow(ghost, ui::radius_control(), ui::sc(8), 110);
-            canvas.fill_round_rect(ghost, ui::radius_control(), if active { ui::ACCENT } else { ui::PRESSED });
+            canvas.fill_round_rect(ghost, ui::radius_control(), if active { ui::accent() } else { ui::pressed() });
             let style = Style { size: 11.0 * ui::scale(), ..Style::default() };
             let label = self.tab_name(workspace);
             canvas.clipped(ghost.inset(2), |canvas| {
@@ -2484,13 +2494,13 @@ impl Screen {
                     ghost.x + ui::sc(12),
                     ghost.y + (ghost.h - fonts.line_height(&style)) / 2,
                     &style,
-                    ui::TEXT,
+                    ui::text(),
                 );
             });
             Self::draw_tab_close(canvas, ghost, active);
         }
 
-        canvas.fill_rect(Rect::new(rect.x, rect.y + rect.h - 1, rect.w, 1), ui::BORDER);
+        canvas.fill_rect(Rect::new(rect.x, rect.y + rect.h - 1, rect.w, 1), ui::border());
     }
 
     /// The close glyph at a tab's right end.
@@ -2498,7 +2508,7 @@ impl Screen {
         let cx = (tab.x + tab.w - tab_close_w() / 2 - ui::sc(2)) as f32;
         let cy = (tab.y + tab.h / 2) as f32;
         let r = ui::sc(3) as f32;
-        let ink = if active { ui::TEXT } else { ui::MUTED };
+        let ink = if active { ui::text() } else { ui::muted() };
         let t = ui::sc(1).max(1);
         canvas.stroke_line(cx - r, cy - r, cx + r, cy + r, t, ink);
         canvas.stroke_line(cx - r, cy + r, cx + r, cy - r, t, ink);
@@ -2509,8 +2519,8 @@ impl Screen {
         let style = Style { family: Family::Mono, size: 13.0 * ui::scale(), ..Style::default() };
         let height = 20 * (self.clients.len() as i32 + 4);
         let panel = Rect::new(8, self.nav_rect().h + 8, 620, height);
-        canvas.fill_rect(panel, ui::SURFACE);
-        canvas.stroke_rect(panel, 1, ui::ACCENT);
+        canvas.fill_rect(panel, ui::surface());
+        canvas.stroke_rect(panel, 1, ui::accent());
 
         let mut y = panel.y + 6;
         let workspace = self
@@ -2518,7 +2528,7 @@ impl Screen {
             .get(self.current)
             .map(|w| format!("workspace {} ({} windows)", w.id, w.windows.len()))
             .unwrap_or_else(|| "no workspace".into());
-        canvas.draw_text(fonts, &workspace, panel.x + 8, y, &style, ui::ACCENT);
+        canvas.draw_text(fonts, &workspace, panel.x + 8, y, &style, ui::accent());
         y += 20;
 
         for client in &self.clients {
@@ -2533,11 +2543,11 @@ impl Screen {
                 panel.x + 8,
                 y,
                 &style,
-                ui::TEXT,
+                ui::text(),
             );
             y += 20;
             if front == "*" {
-                canvas.draw_text(fonts, &client.focus_summary(), panel.x + 20, y, &style, ui::MUTED);
+                canvas.draw_text(fonts, &client.focus_summary(), panel.x + 20, y, &style, ui::muted());
                 y += 20;
             }
         }
@@ -2576,13 +2586,13 @@ fn draw_window(
 
     // Depth rather than a heavy outline. A focused window sits higher.
     canvas.shadow(rect, ui::radius_window(), ui::sc(if focused { 22 } else { 12 }), 130);
-    canvas.fill_round_rect(rect, ui::radius_window(), ui::BACKGROUND);
+    canvas.fill_round_rect(rect, ui::radius_window(), ui::background());
 
     // The bar is the top of the same rounded shape, clipped to its own height so
     // the two lower corners stay square against the content below. Lit faintly
     // from above like every other raised surface.
     canvas.clipped(bar, |canvas| {
-        let base = if focused { ui::RAISED } else { ui::SURFACE };
+        let base = if focused { ui::raised() } else { ui::surface() };
         canvas.fill_round_rect_vgrad(
             Rect::new(bar.x, bar.y, bar.w, bar.h + ui::radius_window()),
             ui::radius_window(),
@@ -2601,14 +2611,14 @@ fn draw_window(
     for (action, button) in Screen::title_buttons(rect) {
         let hovered = button.contains(pointer.0, pointer.1);
         if hovered {
-            let chip = if action == Title::Close { ui::DANGER } else { ui::PRESSED };
+            let chip = if action == Title::Close { ui::danger() } else { ui::pressed() };
             canvas.fill_round_rect(button.inset(ui::sc(4)), ui::radius_small(), chip);
         }
 
         let ink = match (hovered, focused) {
-            (true, _) => ui::TEXT,
-            (false, true) => ui::MUTED,
-            (false, false) => ui::BORDER,
+            (true, _) => ui::text(),
+            (false, true) => ui::muted(),
+            (false, false) => ui::border(),
         };
         let (cx, cyf) = (
             (button.x + button.w / 2) as f32,
@@ -2640,7 +2650,7 @@ fn draw_window(
     }
 
     let style = Style { size: 13.0 * ui::scale(), ..Style::default() };
-    let ink = if focused { ui::TEXT } else { ui::MUTED };
+    let ink = if focused { ui::text() } else { ui::muted() };
     let title = client.title();
     // The icon leads and the title follows it. The title starts at the bar's
     // text inset rather than being centred: centred text between asymmetric
@@ -2659,8 +2669,8 @@ fn draw_window(
     let content = content_of(rect);
     canvas.clipped(content, |canvas| client.draw(canvas, fonts, &self.images));
 
-    canvas.fill_rect(Rect::new(bar.x, bar.y + bar.h - 1, bar.w, 1), ui::BORDER);
-    canvas.stroke_round_rect(rect, ui::radius_window(), 1, ui::BORDER);
+    canvas.fill_rect(Rect::new(bar.x, bar.y + bar.h - 1, bar.w, 1), ui::border());
+    canvas.stroke_round_rect(rect, ui::radius_window(), 1, ui::border());
 }
 }
 
