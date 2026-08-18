@@ -68,12 +68,13 @@ The boundary that makes this reliable is a **cgroup per agentdesk**. The Supervi
 
 Closing an agentdesk reuses the same escalation the Supervisor already applies at system shutdown, scoped to one workspace:
 
-1. `SIGTERM` the agentdesk, so it can detach cleanly from `haimanager` and release its workspace.
+1. `SIGTERM` the workspace's agent, if a turn is running. Its work is disposable, so it goes first.
 2. `SIGTERM` its apps, so they can flush open documents to the filesystem.
-3. After a grace period, `cgroup.kill` as the backstop, which terminates everything remaining in the cgroup atomically.
-4. Reap. Every process involved is a direct child of PID 1, so the existing reaper collects them all with no special case.
+3. `SIGTERM` the agentdesk, so it can detach cleanly from `haimanager` and release its workspace. The reverse of how the workspace was built up.
+4. After a grace period, `cgroup.kill` as the backstop, which terminates everything remaining in the cgroup atomically.
+5. Reap. Every process involved is a direct child of PID 1, so the existing reaper collects them all with no special case.
 
-Step 4 is the reason apps are forked by the Supervisor rather than by the agentdesk that requested them. If a workspace forked its own apps and was itself killed first, those apps would orphan mid-teardown and outlive the thing that owned them.
+Step 5 is the reason apps are forked by the Supervisor rather than by the agentdesk that requested them. If a workspace forked its own apps and was itself killed first, those apps would orphan mid-teardown and outlive the thing that owned them.
 
 The per-agentdesk cgroup earns its keep twice more. It is where resource limits go, which is how a runaway agent is capped without affecting other workspaces. And it provides per-workspace memory accounting, which is exactly the signal needed to decide which idle agentdesk to suspend next.
 
