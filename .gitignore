@@ -1,12 +1,9 @@
-# Build outputs. The initramfs and everything in it is produced by `make pack`
-# from the sources in agentwarecore, so none of it belongs in the repository.
+# Build outputs. The boot stage, the system image and the staging tree it is
+# written from are produced by `make pack` from the sources in agentwarecore,
+# so none of it belongs in the repository.
 target/
 initramfs.cpio.gz
-initramfs/init
-initramfs/bin/
-initramfs/apps/
-initramfs/default_wallpapers/
-initramfs/default_themes/
-initramfs/home/
+system.img
+sysroot/
 # The state volume is this machine's, like a disk. Made by `make run`.
 state.img

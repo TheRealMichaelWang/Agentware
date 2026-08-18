@@ -36,13 +36,21 @@ agentwarecore/          cargo workspace
 agentwareapps/          cargo workspace: first-party applications
   awcalc/               a calculator, the first real application
   awfiles/              a file explorer, and where the shared dialogs are seen
-home/                   sample files, staged to /home (RAM; lost at power off)
+home/                   sample files, staged to /home on the system image; what
+                        is saved there persists across boots, and is reset
+                        when `make pack` rebuilds the image
 default_wallpapers/     the wallpapers that ship, staged to /default_wallpapers
 default_themes/         the palettes that ship, one XML each; dark.xml is the
                         palette the compositor paints with unless told otherwise
-state.img               the state volume: ext4, mounted at /state, holds
-                        settings.xml; made on first `make run`, gitignored
-initramfs/              staged image contents (build output, gitignored)
+state.img               the state volume: ext4 on /dev/vdb, mounted at /state,
+                        holds settings.xml; made on first `make run`, gitignored
+initramfs.cpio.gz       the boot stage: the supervisor and /dev/console,
+                        nothing else; written by tools/mkinitramfs.py
+system.img              the OS: an ext4 volume (/dev/vda) the supervisor
+                        mounts and binds into the root, demand-paged; rebuilt
+                        whole by `make pack`
+sysroot/                the staging tree system.img is written from (build
+                        output, gitignored)
 tools/screenshot.py     boot, inject input, capture the screen as PNG
 kernel-build/           Linux submodule
 ```
@@ -192,12 +200,13 @@ renamed into place; a small reader that understands only what it writes),
 the one thing that crosses between processes as a file: every desk stats it
 on its clock tick and re-reads it when it changed, and the settings app
 re-reads it before acting, so nothing ever writes a choice the machine has
-moved past. `/state` is the **state volume**, the one filesystem that
-outlives a boot: `state.img`, a 64MB ext4 image the Makefile creates on first
-`make run` (`mkfs.ext4` on a file, no root) and QEMU attaches as a virtio
-drive; the supervisor mounts `/dev/vda` (or `agentware.state=/dev/...`) on
-`/state` right after the virtual filesystems and says so in the log, or says
-settings will not outlive the boot if there is no drive. `make cleanstate`
+moved past. `/state` is the **state volume**, the machine's own disk as
+opposed to the OS image: `state.img`, a 64MB ext4 image the Makefile creates
+on first `make run` (`mkfs.ext4` on a file, no root) and QEMU attaches as
+the second virtio drive; the supervisor mounts `/dev/vdb` (or
+`agentware.state=/dev/...`) on `/state` right after the virtual filesystems
+and says so in the log, or says settings will not outlive the boot if there
+is no drive. `make pack` rebuilds the OS image and never touches it. `make cleanstate`
 deletes it, which is the first-run case. `tools/screenshot.py` boots against a
 throwaway snapshot of it by default so captures never change the machine's
 state; `--keep-state` writes for real, which is how persistence across boots
@@ -308,7 +317,7 @@ agentdesk opens a blank one, so there is never a display with nothing on it.
 ```
 make selftest    # headless supervisor self-test, exits 0 on success
 make run         # boot in a QEMU window
-make pack        # build and pack the initramfs without booting
+make pack        # build the boot stage and system image without booting
 ```
 
 The guest display is a custom 2560x1440 monitor QEMU invents, opened fullscreen
@@ -349,8 +358,28 @@ Send starts an agent turn, which is the whole of milestone 7 running against a
 live screen, watched in the pane. The stop button ends it, and the pane says
 so.
 
-Builds target `x86_64-unknown-linux-musl`. No sudo is needed: `cpio` records a
-device node's major/minor from `stat` and never opens it.
+Builds target `x86_64-unknown-linux-musl`. No sudo is needed anywhere:
+`mkfs.ext4 -d` populates the system image from the staging tree as an
+ordinary user, and the initramfs's console node is written straight into the
+archive by `tools/mkinitramfs.py`, because a device node only needs
+privileges to exist on a filesystem, not in an archive.
+
+**Boot is two stages, like an actual OS.** The initramfs holds exactly what
+must exist before any disk does: the supervisor and `/dev/console`, about
+250KB. PID 1's pages live in RAM, so a missing or dying disk is something it
+reports rather than something that takes it down: booted without the system
+drive, the machine comes up with a live supervisor saying "no volume at
+/dev/vda; nothing beyond the supervisor can run" instead of a kernel panic.
+Everything else is the **system volume**, `system.img` on `/dev/vda`
+(`agentware.system=` overrides): the supervisor mounts it at `/system` and
+bind-mounts its top-level directories (`bin`, `apps`, the wallpapers and
+themes, `home`) over the root, so no path anywhere else in the userland
+changed. The kernel demand-pages all of it, so code is in memory only while
+it runs. Writes are real: files in `/home` persist across boots like an
+actual OS, and are reset when `make pack` rewrites the image, which is a
+reinstall. Workspaces and conversations still die at reboot; they always
+were process state. At shutdown the binds come off and the volume properly
+unmounts, which PID 1 living off-disk is what makes possible.
 
 ## Verifying graphics
 
@@ -413,9 +442,11 @@ is the list so it does not get relitigated.
 * A message arriving mid-turn is **queued** by the agentdesk, never refused.
 * Workspaces, applications, windows and conversations do not survive a
   reboot, by choice: no session restore, no on-disk state for any of them.
-  **Settings do.** They live in `settings.xml` on the state volume, the one
-  filesystem the supervisor mounts from disk, and nothing else is written
-  there until it earns a place.
+  They are process state and die with their processes. **Files do survive**,
+  now that the system volume is a disk: what an app saves is saved, like an actual
+  OS. **Settings do too**, on the state volume in `settings.xml`, which is
+  the machine's own disk as opposed to the OS image, and nothing else is
+  written there until it earns a place.
 * The supervisor never sees prompts, conversation, telemetry or markup. It
   creates sockets and steps out of the way.
 * Identity is a capability, not a claim: the haimanager knows which workspace a

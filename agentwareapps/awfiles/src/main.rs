@@ -15,10 +15,10 @@
 //! file by naming its checkbox, exactly as a human does by pressing it, and
 //! neither has to hold anything down.
 //!
-//! Everything it walks lives in memory. The system boots from an image into
-//! RAM and writes nothing to a disk, so what is made or moved here lasts until
-//! the machine is switched off. It opens in `/home`, which ships with a few
-//! files for exactly this reason.
+//! Everything it walks lives on the root filesystem, which is a disk: what
+//! is made or moved here survives a reboot the way files on a computer do,
+//! and is reset only when the OS image is rebuilt. It opens in `/home`,
+//! which ships with a few files so there is something to find.
 //!
 //! Written the way every application is written: a model and a `render`, whole
 //! tree every time, hand-written stable ids, no diffing and no ephemeral state.

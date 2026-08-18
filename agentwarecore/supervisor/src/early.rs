@@ -5,7 +5,10 @@
 //! `/dev/dri/card0` and `/dev/input/event*`, both of which only appear once
 //! devtmpfs is mounted. Note that `CONFIG_DEVTMPFS_MOUNT=y` does *not* help
 //! here: the kernel only auto-mounts devtmpfs when booting a real root
-//! filesystem, never for an initramfs. We have to do it ourselves.
+//! filesystem, never for an initramfs, and the supervisor boots from an
+//! initramfs on purpose. PID 1 must not depend on the disk it exists to
+//! bring up, so its pages live in RAM and the disk is something it mounts:
+//! the system volume, holding everything else the OS is.
 
 use std::fs;
 use std::io;
@@ -126,6 +129,12 @@ pub fn mount_virtual_filesystems() -> io::Result<()> {
 
         match mount::mount(mp.source, mp.target, mp.fstype, mp.flags, mp.data) {
             Ok(()) => kinfo!("mounted {} on {}", mp.fstype, mp.target),
+            // Already mounted, which is what the kernel's own devtmpfs
+            // automount looks like from here: the state this stage exists to
+            // reach, not a failure.
+            Err(rustix::io::Errno::BUSY) => {
+                kinfo!("{} already mounted on {}", mp.fstype, mp.target)
+            }
             Err(err) if mp.required => {
                 return Err(io::Error::other(format!(
                     "could not mount {} on {}: {err}",
@@ -145,20 +154,92 @@ pub fn mount_virtual_filesystems() -> io::Result<()> {
     Ok(())
 }
 
+/// Where the system volume is mounted: the OS itself, everything except the
+/// supervisor. The supervisor rides the initramfs so that a missing or dying
+/// disk is something it reports rather than something that takes it down;
+/// this volume is the first thing it goes looking for.
+pub const SYSTEM_DIR: &str = "/system";
+
+/// The block device the system volume is expected on: the first virtio
+/// drive. `agentware.system=/dev/...` on the kernel command line names
+/// another.
+const SYSTEM_DEVICE: &str = "/dev/vda";
+
+/// The directories the system volume provides, bound over the root so that
+/// no path anywhere else in the userland changes: `/bin/haimanager` is
+/// `/system/bin/haimanager` without any process having to know it.
+const SYSTEM_DIRS: &[&str] = &["bin", "apps", "default_wallpapers", "default_themes", "home"];
+
+/// How long to wait for a volume's device to appear. virtio-blk is built in
+/// and there before init runs; the bound keeps a machine without a drive
+/// from waiting long on one.
+const VOLUME_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Mount the system volume and bind its directories into the root.
+///
+/// Everything the OS is, beyond PID 1, arrives here: binaries, applications,
+/// wallpapers, themes, `/home`. All of it demand-pages from the disk, so
+/// code costs memory only while it runs. Failure is loud but not fatal:
+/// the supervisor stays up with the console alive and says exactly what is
+/// missing, which is the entire reason it does not live on this volume.
+pub fn mount_system() {
+    if let Err(err) = fs::create_dir_all(SYSTEM_DIR) {
+        kerr!("could not create {SYSTEM_DIR}: {err}");
+        return;
+    }
+    let device = kernel_arg("agentware.system").unwrap_or_else(|| SYSTEM_DEVICE.to_owned());
+
+    let deadline = std::time::Instant::now() + VOLUME_WAIT;
+    while !Path::new(&device).exists() {
+        if std::time::Instant::now() >= deadline {
+            kerr!("system: no volume at {device}; nothing beyond the supervisor can run");
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // Read-write, because /home lives here and files a person saves are
+    // theirs to keep.
+    if let Err(err) = mount::mount(
+        device.as_str(),
+        SYSTEM_DIR,
+        "ext4",
+        MountFlags::NOSUID.union(MountFlags::NODEV),
+        None,
+    ) {
+        kerr!("system: could not mount {device} on {SYSTEM_DIR}: {err}; nothing beyond the supervisor can run");
+        return;
+    }
+    kinfo!("system: mounted {device} on {SYSTEM_DIR}");
+
+    for name in SYSTEM_DIRS {
+        let source = format!("{SYSTEM_DIR}/{name}");
+        if !Path::new(&source).is_dir() {
+            kwarn!("system: the volume has no {name}/");
+            continue;
+        }
+        let target = format!("/{name}");
+        if let Err(err) = fs::create_dir_all(&target) {
+            kwarn!("system: could not create {target}: {err}");
+            continue;
+        }
+        match mount::mount_bind(&source, &target) {
+            Ok(()) => kinfo!("system: {target} is {source}"),
+            Err(err) => kwarn!("system: could not bind {source} on {target}: {err}"),
+        }
+    }
+}
+
 /// Where the state volume is mounted: the one directory that outlives the
 /// machine, holding `settings.xml` and whatever else earns a place there.
 pub const STATE_DIR: &str = "/state";
 
-/// The block device the state volume is expected on: the virtio drive QEMU
-/// is booted with. `agentware.state=/dev/...` on the kernel command line
-/// names another, which is how a partition on real hardware will be reached
-/// until the supervisor can find one by label.
-const STATE_DEVICE: &str = "/dev/vda";
-
-/// How long to wait for the state device to appear. virtio-blk is built in
-/// and there before init runs; the bound keeps a machine without a drive,
-/// which the self-test is, from waiting long on one.
-const STATE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+/// The block device the state volume is expected on: the second virtio
+/// drive QEMU is booted with, the first being the root filesystem.
+/// `agentware.state=/dev/...` on the kernel command line names another,
+/// which is how a partition on real hardware will be reached until the
+/// supervisor can find one by label.
+const STATE_DEVICE: &str = "/dev/vdb";
 
 /// Mount the state volume, if the machine has one.
 ///
@@ -174,7 +255,7 @@ pub fn mount_state() {
     }
     let device = kernel_arg("agentware.state").unwrap_or_else(|| STATE_DEVICE.to_owned());
 
-    let deadline = std::time::Instant::now() + STATE_WAIT;
+    let deadline = std::time::Instant::now() + VOLUME_WAIT;
     while !Path::new(&device).exists() {
         if std::time::Instant::now() >= deadline {
             kwarn!("state: no volume at {device}; settings will not outlive this boot");
@@ -216,6 +297,18 @@ pub fn unmount_all() {
         && let Err(err) = mount::unmount(STATE_DIR, UnmountFlags::DETACH)
     {
         kwarn!("could not unmount {STATE_DIR}: {err}");
+    }
+    // The binds come off before the volume under them, and the volume gets a
+    // proper unmount attempt before the lazy one, because it is a disk whose
+    // contents matter afterwards. This is why PID 1 does not live on it:
+    // nothing is left running from it by now, so it actually unmounts.
+    for name in SYSTEM_DIRS.iter().rev() {
+        let _ = mount::unmount(format!("/{name}"), UnmountFlags::DETACH);
+    }
+    if mount::unmount(SYSTEM_DIR, UnmountFlags::empty()).is_err()
+        && let Err(err) = mount::unmount(SYSTEM_DIR, UnmountFlags::DETACH)
+    {
+        kwarn!("could not unmount {SYSTEM_DIR}: {err}");
     }
     for mp in MOUNTS.iter().rev() {
         if let Err(err) = mount::unmount(mp.target, UnmountFlags::DETACH) {

@@ -1,7 +1,16 @@
 # Variables
 KERNEL := kernel-build/arch/x86/boot/bzImage
-INITRAMFS_ARCHIVE := initramfs.cpio.gz
-FS_DIR := initramfs
+# Boot is two stages, like an actual OS. The initramfs holds exactly what
+# must exist before any disk does: the supervisor, PID 1, whose pages live
+# in RAM so a missing or dying disk is something it reports rather than
+# something that takes it down. Everything else is the system volume, an
+# ext4 image the supervisor mounts and binds into the root, and which the
+# kernel demand-pages, so a binary costs memory only while it runs and only
+# for the pages it touches. `make pack` rebuilds both the way an installer
+# would; the state volume below is the one disk it never touches.
+INITRAMFS := initramfs.cpio.gz
+SYSTEM_IMG := system.img
+FS_DIR := sysroot
 AW_CORE_DIR := agentwarecore
 AW_APPS_DIR := agentwareapps
 TARGET := x86_64-unknown-linux-musl
@@ -40,8 +49,11 @@ DISPLAY_H ?= 1440
 # No -no-reboot here: the start menu's Restart ends in a real guest reset,
 # and the interactive machine must come back up from it rather than vanish.
 # The selftest adds the flag itself, because there QEMU exiting is the point.
+# The system image is the first drive, so it is /dev/vda; the state volume,
+# where a target attaches it, is the second and therefore /dev/vdb.
 QEMU := qemu-system-x86_64 -enable-kvm -m 4G -cpu host \
-	-kernel $(KERNEL) -initrd $(INITRAMFS_ARCHIVE) \
+	-kernel $(KERNEL) -initrd $(INITRAMFS) \
+	-drive file=$(SYSTEM_IMG),if=virtio,format=raw \
 	-device virtio-vga,xres=$(DISPLAY_W),yres=$(DISPLAY_H) \
 	-device virtio-tablet-pci
 
@@ -109,21 +121,22 @@ build: buildcore buildapps
 # Packaging & Execution
 # ---------------------------------------------------------
 
-# Pack the virtual hard drive (depends on the full 'build')
+# Build the boot stage and the system image (depends on the full 'build')
 pack: build
-	@echo "==> Packing initramfs..."
-	
-	# 1. Create the directories the image needs
-	mkdir -p $(FS_DIR)/dev $(FS_DIR)/bin $(FS_DIR)/apps
-	
-	# 2. Create the console device node (Requires sudo)
-	@if [ ! -c $(FS_DIR)/dev/console ]; then \
-		echo "Creating /dev/console..."; \
-		sudo mknod -m 600 $(FS_DIR)/dev/console c 5 1; \
-	fi
-	
+	@echo "==> Building the boot stage and the system image..."
+
+	# 1. Create the directories the system volume needs.
+	mkdir -p $(FS_DIR)/bin $(FS_DIR)/apps
+
+	# 2. The boot stage: an initramfs holding the supervisor and its console,
+	# and nothing else. PID 1 rides in RAM so the disk is something it
+	# mounts, never something it depends on. The archive is written directly
+	# rather than packed from a staging tree, because the console node only
+	# needs privileges to exist on a filesystem, not in an archive, and that
+	# is what keeps sudo out of the build.
+	tools/mkinitramfs.py $(BIN_DIR)/supervisor $(INITRAMFS)
+
 	# 3. Copy the compiled Rust binaries
-	cp $(BIN_DIR)/supervisor $(FS_DIR)/init
 	cp $(BIN_DIR)/haimanager $(FS_DIR)/bin/haimanager
 
 	# 3a. The workspace process, one per agentdesk, forked by PID 1 when a
@@ -188,12 +201,12 @@ pack: build
 	cp $(BIN_DIR)/awtest $(FS_DIR)/apps/awtest/exec
 	cp $(BIN_DIR)/awstubborn $(FS_DIR)/apps/awstubborn/exec
 	
-	# 4. Pack the filesystem.
-	#
-	# No sudo needed: cpio records a device node's major/minor from stat, it
-	# never opens the device. -R 0:0 makes everything root-owned inside the
-	# archive regardless of who ran the build.
-	cd $(FS_DIR) && find . -print0 | cpio --null -o --format=newc -R 0:0 --quiet | gzip -9 > ../$(INITRAMFS_ARCHIVE)
+	# 4. Write the system volume. mkfs.ext4 -d populates the image from the
+	# staging tree without root privileges, the way it would populate a
+	# device. Recreated whole every time, like an OS install; the image is
+	# sparse, so the file costs what the tree costs, not its full size.
+	qemu-img create -q -f raw $(SYSTEM_IMG) 512M
+	mkfs.ext4 -q -F -L agentware-system -d $(FS_DIR) $(SYSTEM_IMG)
 
 # The state volume, made on first use. mkfs.ext4 on a plain file needs no
 # root: it writes a filesystem into the file the way it would into a device.
@@ -233,5 +246,5 @@ clean:
 	@echo "==> Cleaning build artifacts..."
 	cd $(AW_CORE_DIR) && cargo clean
 	cd $(AW_APPS_DIR) && cargo clean
-	rm -f $(INITRAMFS_ARCHIVE)
+	rm -f $(SYSTEM_IMG) $(INITRAMFS)
 	rm -f $(FS_DIR)/init

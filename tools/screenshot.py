@@ -22,17 +22,21 @@ import zlib
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KERNEL = os.path.join(ROOT, "kernel-build/arch/x86/boot/bzImage")
 INITRAMFS = os.path.join(ROOT, "initramfs.cpio.gz")
+SYSTEM_IMG = os.path.join(ROOT, "system.img")
 
 
 def qemu(monitor_path, qmp_path, serial_path, append, width, height, state, keep_state):
+    # The system volume, always against a throwaway snapshot: a capture must
+    # never change the OS it is photographing. It is the first drive, so it
+    # is /dev/vda, where the supervisor looks for it.
+    drive = ["-drive", "file=%s,if=virtio,format=raw,snapshot=on" % SYSTEM_IMG]
     # The state volume. By default a capture boots against a throwaway copy of
-    # the machine's state (QEMU's snapshot mode writes to a temp file), so a
-    # test never changes what `make run` sees; --keep-state boots against the
-    # image for real, which is how persistence across boots is checked. A
-    # missing image means no drive, and the guest says so at boot.
-    drive = []
+    # the machine's state too, so a test never changes what `make run` sees;
+    # --keep-state boots against the image for real, which is how persistence
+    # across boots is checked. A missing image means no drive, and the guest
+    # says so at boot.
     if state and os.path.exists(state):
-        drive = ["-drive", "file=%s,if=virtio,format=raw%s" % (state, "" if keep_state else ",snapshot=on")]
+        drive += ["-drive", "file=%s,if=virtio,format=raw%s" % (state, "" if keep_state else ",snapshot=on")]
     return subprocess.Popen(
         [
             "qemu-system-x86_64", "-enable-kvm", "-m", "4G", "-cpu", "host",
