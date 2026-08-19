@@ -76,7 +76,10 @@ pub struct BackendConfig {
     pub model: &'static str,
 }
 
-/// Every configuration an agentdesk offers, in the order shown.
+/// Every configuration an agentdesk offers, in the order shown: most capable
+/// first, fastest last. The small end matters as much as the large: a Haiku
+/// or a small Sonnet answers in a beat, which is what shows the interaction
+/// model off rather than the model's own depth.
 pub const BACKENDS: &[BackendConfig] = &[
     BackendConfig {
         id: "claude-opus-5",
@@ -85,10 +88,22 @@ pub const BACKENDS: &[BackendConfig] = &[
         model: "claude-opus-5",
     },
     BackendConfig {
+        id: "claude-opus-4-8",
+        label: "Claude Opus 4.8",
+        backend: "claude",
+        model: "claude-opus-4-8",
+    },
+    BackendConfig {
         id: "claude-sonnet-5",
         label: "Claude Sonnet 5",
         backend: "claude",
         model: "claude-sonnet-5",
+    },
+    BackendConfig {
+        id: "claude-sonnet-4-6",
+        label: "Claude Sonnet 4.6",
+        backend: "claude",
+        model: "claude-sonnet-4-6",
     },
     BackendConfig {
         id: "claude-haiku-4-5",

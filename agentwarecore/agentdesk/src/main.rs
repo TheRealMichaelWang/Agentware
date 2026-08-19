@@ -544,7 +544,7 @@ impl Desk {
                 self.composing = event.value.clone();
                 self.status = "composing".into();
             }
-            ("send-message", display::ACTION_CLICK) => {
+            ("message", display::ACTION_SUBMIT) | ("send-message", display::ACTION_CLICK) => {
                 let text = self.composing.trim().to_owned();
                 if text.is_empty() {
                     self.status = "nothing to send".into();
@@ -732,8 +732,8 @@ impl Desk {
             r#"      </vstack>
     </scroll>
     <hstack gap="sm">
-      <editor id="message" grow="true" placeholder="Message the agent" value="{message}"
-             description="Composes a message to the agent working in this workspace. Enter starts a new line; the send button sends"/>
+      <editor id="message" grow="true" enter-submits="true" placeholder="Message the agent" value="{message}"
+             description="Composes a message to the agent working in this workspace. Enter sends; Shift and Enter starts a new line"/>
       <button id="send-message" glyph="send" emphasis="primary"
               description="Sends the composed message, which starts an agent turn or queues for the running one"/>
 "#,

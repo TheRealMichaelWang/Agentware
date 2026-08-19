@@ -24,6 +24,10 @@ pub enum Key {
     /// A key that produces text. The character already accounts for shift.
     Char(char),
     Enter,
+    /// Enter with shift held: the one modifier chord that means something,
+    /// because chat convention says Enter sends and Shift+Enter breaks the
+    /// line, and a compositor that cannot tell them apart cannot offer it.
+    ShiftEnter,
     Backspace,
     Tab,
     Escape,

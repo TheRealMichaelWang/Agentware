@@ -327,9 +327,10 @@ desk's own clock tick, so a model thinking quietly still visibly exists.
 Stopping a turn has three doors, all ending in the same `interrupt` to PID 1:
 the nav bar's Stop, a stop square beside the pane's send button while a turn
 runs, and a click anywhere in the workspace's apps region, which is the human
-taking the workspace back. The composer is an `editor`, multi-line: Enter
-starts a new line, the paper-plane button sends, and the send button stays
-through a turn because a message sent mid-turn queues. `backends/claude.rs` speaks the Anthropic
+taking the workspace back. The composer is an `editor`, multi-line and
+marked `enter-submits`: Enter sends, Shift+Enter starts a new line, the
+paper-plane button sends too, and the send button stays through a turn
+because a message sent mid-turn queues. `backends/claude.rs` speaks the Anthropic
 Messages API: raw HTTPS over rustls with the ring provider and webpki's CA
 bundle compiled in (`http.rs` is the whole client: HTTP/1.1, chunked
 transfer, SSE), streaming, adaptive thinking with summarized display, the
@@ -339,8 +340,8 @@ PID 1 and awproto stay dependency-free.
 
 **Which model answers is chosen in the pane.** The turn wire's `backend`
 message names one of the configurations in `awproto::turn::BACKENDS` (label,
-backend, model: three Claude models today), a dropdown the agentdesk draws at
-the top of its pane. Per workspace, deliberately: which model answers is a
+backend, model: five Claude models today, Opus 5 down to Haiku 4.5), a
+dropdown the agentdesk draws at the top of its pane. Per workspace, deliberately: which model answers is a
 property of the conversation being had, and the selector is desk chrome, so
 an agent is told what it runs as and can never see or change the control. A
 change applies from the next turn. The API key is the machine's: entered on
@@ -572,8 +573,10 @@ start menu's prompt is a large box), `icon` and `tile` on a button draw
 an installed app's icon beside or above its label (the start menu's grid),
 and `glyph` on a button draws a named stroke shape instead of a label
 (`send` is the pane's paper plane, `stop` its square), because the shipped
-font cannot be trusted to carry either. None of them is part of the
-application catalogue and none reaches an agent.
+font cannot be trusted to carry either. `enter-submits` on an editor swaps
+Enter and Shift+Enter, so the pane's composer sends on Enter the way every
+messenger does while a plain editor keeps Enter as a line break. None of
+them is part of the application catalogue and none reaches an agent.
 
 ## Gotchas that cost real time
 

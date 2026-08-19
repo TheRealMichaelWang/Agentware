@@ -998,6 +998,11 @@ impl Client {
         }
         let id = node.id().unwrap_or_default().to_owned();
         let seed = node.attr("value").unwrap_or("").to_owned();
+        // A compositor-internal attribute for chat-shaped editors: Enter
+        // submits and Shift+Enter breaks the line, the convention every
+        // messenger keeps. Without it an editor keeps the catalogue's rule,
+        // Enter breaks the line, because a general editor has no submit.
+        let enter_submits = node.flag("enter-submits");
 
         let state = self.editing.entry(focus_key).or_insert(Editing {
             value: seed,
@@ -1028,9 +1033,17 @@ impl Client {
             }
             // Enter confirms a field and inserts a newline in an editor. That is
             // the whole reason the two elements are separate: an editor offers no
-            // `submit` because Enter already means something else in it.
-            Key::Enter => {
-                if tag == Tag::Editor {
+            // `submit` because Enter already means something else in it. An
+            // editor marked `enter-submits` swaps the two: Enter confirms and
+            // Shift+Enter breaks the line. In a field the shift is simply not
+            // load-bearing: there is no line to break, so both confirm.
+            Key::Enter | Key::ShiftEnter => {
+                let newline = match tag {
+                    Tag::Editor if enter_submits => key == Key::ShiftEnter,
+                    Tag::Editor => true,
+                    _ => false,
+                };
+                if newline {
                     state.value.insert(byte_at(&state.value, state.caret), '\n');
                     state.caret += 1;
                     changed = true;

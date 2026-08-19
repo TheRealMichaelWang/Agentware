@@ -59,7 +59,9 @@ pub fn decode(code: u16, shift: bool, caps: bool) -> Key {
         KEY_ESC => return Key::Escape,
         KEY_BACKSPACE => return Key::Backspace,
         KEY_TAB => return Key::Tab,
-        KEY_ENTER | KEY_KPENTER => return Key::Enter,
+        KEY_ENTER | KEY_KPENTER => {
+            return if shift { Key::ShiftEnter } else { Key::Enter };
+        }
         KEY_UP => return Key::Up,
         KEY_DOWN => return Key::Down,
         KEY_LEFT => return Key::Left,

@@ -1225,6 +1225,21 @@ pub fn paint_subtree(
     focus: &Focus,
 ) {
     paint_node(canvas, fonts, images, tree, layout, index, focus);
+
+    // The floating options of an open dropdown are painted by a popup pass
+    // after everything else, which for a whole document happens in the
+    // window's own arm. A region is a branch painted *without* its window,
+    // so that pass never runs for it, and the desk's dropdown was a control
+    // that opened invisibly: hit-testable, painted nowhere. The same pass
+    // runs here for any open select inside this branch; the root is left to
+    // the window arm, or every open list would paint twice.
+    if index != Tree::ROOT {
+        for select in tree.open_selects() {
+            if tree.within(select, index) {
+                paint_popup(canvas, fonts, images, tree, layout, select, focus);
+            }
+        }
+    }
 }
 
 /// A thin indicator beside content that overflows.
