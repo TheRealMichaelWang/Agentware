@@ -1149,12 +1149,17 @@ impl Screen {
                 }
 
                 if self.agent_running() {
-                    // Not an error and not silent. The human is being told the
-                    // workspace is being driven, not that their click was lost.
+                    // A click into the workspace while an agent drives it is
+                    // the human taking over, so it interrupts the turn: the
+                    // same `interrupt` to PID 1 the stop button sends, from
+                    // the same authority. The click itself goes nowhere; it
+                    // was a claim on the workspace, not a press on whatever
+                    // the agent happened to have under its cursor.
+                    let desk = self.workspaces[self.current].id;
                     self.notes.push(format!(
-                        "workspace {}: apps are frozen while an agent is running",
-                        self.workspaces[self.current].id
+                        "workspace {desk}: click while the agent runs; interrupting it"
                     ));
+                    self.requests.push(vec!["interrupt".into(), desk.to_string()]);
                     return true;
                 }
                 self.raise(self.current, fd);
@@ -1190,6 +1195,20 @@ impl Screen {
                     self.raise(self.current, fd);
                     self.focus = Surface::App(fd);
                     self.reframe(fonts);
+                    return true;
+                }
+
+                // The workspace floor, while an agent drives the workspace:
+                // the same takeover a click on a window is. Scoped to the
+                // area windows live in, so the pane stays a place to queue a
+                // message or scroll the transcript mid-turn, exactly as the
+                // input arbitration promises.
+                if self.agent_running() && self.window_area(self.current).contains(x, y) {
+                    let desk = self.workspaces[self.current].id;
+                    self.notes.push(format!(
+                        "workspace {desk}: click while the agent runs; interrupting it"
+                    ));
+                    self.requests.push(vec!["interrupt".into(), desk.to_string()]);
                     return true;
                 }
 

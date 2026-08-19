@@ -323,7 +323,13 @@ a line at a time, narration between tool calls as `result` lines, every act
 as an `action` line with its outcome, and the model's final message, the one
 with no tool calls, is the reply. While a turn runs the transcript ends with
 a working line, "Claude Opus 5 is working... (14s)", dots moving on the
-desk's own clock tick, so a model thinking quietly still visibly exists. `backends/claude.rs` speaks the Anthropic
+desk's own clock tick, so a model thinking quietly still visibly exists.
+Stopping a turn has three doors, all ending in the same `interrupt` to PID 1:
+the nav bar's Stop, a stop square beside the pane's send button while a turn
+runs, and a click anywhere in the workspace's apps region, which is the human
+taking the workspace back. The composer is an `editor`, multi-line: Enter
+starts a new line, the paper-plane button sends, and the send button stays
+through a turn because a message sent mid-turn queues. `backends/claude.rs` speaks the Anthropic
 Messages API: raw HTTPS over rustls with the ring provider and webpki's CA
 bundle compiled in (`http.rs` is the whole client: HTTP/1.1, chunked
 transfer, SSE), streaming, adaptive thinking with summarized display, the
@@ -562,9 +568,12 @@ is the list so it does not get relitigated.
 
 `width` and `height` attributes on a control are compositor-internal sizing
 hints in physical pixels (the tab rename field keeps its tab's width; the
-start menu's prompt is a large box), and `icon` and `tile` on a button draw
-an installed app's icon beside or above its label (the start menu's grid).
-None of them is part of the application catalogue and none reaches an agent.
+start menu's prompt is a large box), `icon` and `tile` on a button draw
+an installed app's icon beside or above its label (the start menu's grid),
+and `glyph` on a button draws a named stroke shape instead of a label
+(`send` is the pane's paper plane, `stop` its square), because the shipped
+font cannot be trusted to carry either. None of them is part of the
+application catalogue and none reaches an agent.
 
 ## Gotchas that cost real time
 

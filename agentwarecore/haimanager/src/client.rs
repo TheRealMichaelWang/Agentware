@@ -679,10 +679,15 @@ impl Client {
         self.focus = Some(key.clone());
 
         // A click on a text control places the caret and reports nothing: where
-        // the caret is inside a value is not the application's business.
+        // the caret is inside a value is not the application's business. The
+        // hit is mapped through the same shift the content was painted with,
+        // and by row for an editor, so the caret lands on the character the
+        // human aimed at rather than where it would be if nothing had
+        // scrolled and everything were one line.
         if matches!(tag, Tag::Field | Tag::Editor) {
             let style = ui::style_at(&doc.tree, index);
-            let caret = ui::caret_from_x(fonts, &value, &style, ui::text_origin(rect), x);
+            let current = self.editing.get(&key).map_or(0, |state| state.caret);
+            let caret = ui::caret_at_point(fonts, &value, &style, tag, rect, current, (x, y));
             let state = self.editing.entry(key).or_insert(Editing {
                 value,
                 caret: 0,

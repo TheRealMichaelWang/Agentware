@@ -544,7 +544,7 @@ impl Desk {
                 self.composing = event.value.clone();
                 self.status = "composing".into();
             }
-            ("message", display::ACTION_SUBMIT) | ("send-message", display::ACTION_CLICK) => {
+            ("send-message", display::ACTION_CLICK) => {
                 let text = self.composing.trim().to_owned();
                 if text.is_empty() {
                     self.status = "nothing to send".into();
@@ -552,6 +552,22 @@ impl Desk {
                 }
                 self.composing.clear();
                 self.submit(text);
+            }
+
+            // The pane's stop square. The same `interrupt` to PID 1 the nav
+            // bar's stop sends, so a wedged agent cannot keep it from
+            // working; the desk merely offers it where the conversation is.
+            ("stop-turn", display::ACTION_CLICK) => {
+                let Some(pid) = self.turn.as_ref().map(|running| running.pid) else {
+                    self.status = "no turn to stop".into();
+                    return true;
+                };
+                let desk = self.id;
+                self.status = match self.ask(|broker| broker.interrupt(desk)) {
+                    Ok(()) => format!("stopping agent pid {pid}"),
+                    Err(err) => format!("could not stop the agent: {err}"),
+                };
+                log(&format!("desk {desk}: {}", self.status));
             }
 
             // The backend selector. Chrome an agent cannot see, so an agent
@@ -705,22 +721,30 @@ impl Desk {
                 running.started.elapsed().as_secs(),
             );
         }
-        let busy = if self.turn.is_some() { " busy=\"true\"" } else { "" };
+        // The composer: a multi-line editor, because a message to an agent is
+        // as often a paragraph as a phrase; Enter starts a new line and the
+        // plane sends. Beside it, the send button always, because a message
+        // mid-turn queues rather than being refused; and while a turn runs, a
+        // stop square too, which ends the turn the way the nav bar's stop
+        // does: through PID 1, never through the agent being stopped.
         let _ = write!(
             out,
             r#"      </vstack>
     </scroll>
     <hstack gap="sm">
-      <field id="message" grow="true" placeholder="Message the agent" value="{message}"
-             description="Sends a message to the agent working in this workspace"/>
-      <button id="send-message" label="Send" emphasis="primary"{busy}
+      <editor id="message" grow="true" placeholder="Message the agent" value="{message}"
+             description="Composes a message to the agent working in this workspace. Enter starts a new line; the send button sends"/>
+      <button id="send-message" glyph="send" emphasis="primary"
               description="Sends the composed message, which starts an agent turn or queues for the running one"/>
-    </hstack>
-  </vstack>
-</window>
 "#,
             message = escape(&self.composing),
         );
+        if self.turn.is_some() {
+            out.push_str(
+                "      <button id=\"stop-turn\" glyph=\"stop\" emphasis=\"danger\"\n              description=\"Stops the running turn; the workspace and the conversation stay as they are\"/>\n",
+            );
+        }
+        out.push_str("    </hstack>\n  </vstack>\n</window>\n");
         out
     }
 }

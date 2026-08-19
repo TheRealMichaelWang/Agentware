@@ -126,9 +126,9 @@ Routing to the Supervisor costs nothing extra. The haimanager is already a regis
 
 ### Input arbitration
 
-While an agent is running a turn, the human cannot click into that workspace's `apps` region. Two processes driving the same cursor and the same DOM is the failure mode this prevents.
+While an agent is running a turn, a click into that workspace's `apps` region does not reach an application: it **interrupts the turn**. Two processes driving the same cursor and the same DOM is the failure mode this prevents, and the click is the human taking the workspace back, so it becomes the same `interrupt` to the Supervisor the stop button sends. The click itself goes nowhere, deliberately: it was a claim on the workspace, not a press on whatever the agent happened to have under its cursor.
 
-The freeze is scoped to that one region, and specifically **not** to the screen:
+The takeover is scoped to that one region, and specifically **not** to the screen:
 
 * The **navigation bar** stays live. An agent working in one workspace must not trap the human inside it; other workspaces are independent and switching between them has no bearing on the turn.
 * The **stop button** stays live, or the freeze is a trap rather than a safety measure.

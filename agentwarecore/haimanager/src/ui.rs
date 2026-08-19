@@ -1109,6 +1109,10 @@ fn natural_width(fonts: &Fonts, tree: &Tree, index: usize) -> i32 {
         Tag::Image => image_w(),
         Tag::Divider if node.attr("dir") == Some("vertical") => DIVIDER,
         Tag::Button => {
+            // A glyph button is a small square: the shape is the label.
+            if node.attr("glyph").is_some() {
+                return fonts.line_height(&style) + control_pad() * 2;
+            }
             let icon = if node.attr("icon").is_some() && !node.flag("tile") {
                 button_icon() + sc(6)
             } else {
@@ -1440,7 +1444,13 @@ fn paint_node(
             let icon = node
                 .attr("icon")
                 .and_then(|name| images.icons.get(name, if node.flag("tile") { tile_icon() } else { button_icon() }));
-            if node.flag("tile") {
+            // A named glyph the compositor draws, for chrome-shaped buttons
+            // whose meaning is a shape rather than a word: the pane's send
+            // and stop. Compositor-internal like `width`; never an agent's
+            // to see, because the description carries the meaning.
+            if let Some(glyph) = node.attr("glyph") {
+                draw_button_glyph(canvas, rect, glyph, ink);
+            } else if node.flag("tile") {
                 // Icon centred above the label. A missing icon leaves the
                 // label where it is, so the grid does not jump.
                 let top = rect.y + tile_pad();
@@ -1481,8 +1491,18 @@ fn paint_node(
             };
             let color = if empty { muted() } else { ink };
 
-            let x = rect.x + control_pad();
-            let top = if node.tag == Tag::Editor { rect.y + control_pad() } else { centred(rect.h) };
+            // The content slides to keep the caret in view. Only while
+            // focused: an unfocused control shows its start, and has no caret
+            // to follow anyway.
+            let (hshift, vshift) = if focused {
+                text_scroll(fonts, &value, &style, node.tag, focus.caret, rect)
+            } else {
+                (0, 0)
+            };
+            let x = rect.x + control_pad() - hshift;
+            let top =
+                (if node.tag == Tag::Editor { rect.y + control_pad() } else { centred(rect.h) })
+                    - vshift;
             let step = fonts.line_height(&style);
 
             canvas.clipped(rect.inset(1), |inner| {
@@ -1657,6 +1677,44 @@ fn paint_node(
     }
 }
 
+/// The shapes a button's `glyph` names, drawn as strokes and fills the way
+/// the window controls are, because the shipped font cannot be trusted to
+/// carry a paper plane. Cheap by construction: a handful of lines per press,
+/// nothing rasterized per frame.
+fn draw_button_glyph(canvas: &mut Canvas, rect: Rect, glyph: &str, color: Color) {
+    let size = sc(12);
+    let cx = rect.x + rect.w / 2;
+    let cy = rect.y + rect.h / 2;
+    match glyph {
+        // A paper plane: a dart pointing right, with a folded tail.
+        "send" => {
+            let l = (cx - size / 2) as f32;
+            let r = (cx + size / 2) as f32;
+            let t = (cy - size / 2) as f32;
+            let b = (cy + size / 2) as f32;
+            let mid = cy as f32;
+            let tail = l + size as f32 * 0.3;
+            let th = sc(2).max(2);
+            canvas.stroke_line(l, t, r, mid, th, color);
+            canvas.stroke_line(l, b, r, mid, th, color);
+            canvas.stroke_line(l, t, tail, mid, th, color);
+            canvas.stroke_line(l, b, tail, mid, th, color);
+        }
+        // The square that means stop, everywhere it means anything.
+        "stop" => {
+            let side = size - sc(2);
+            canvas.fill_round_rect(
+                Rect::new(cx - side / 2, cy - side / 2, side, side),
+                radius_small(),
+                color,
+            );
+        }
+        // A glyph nobody has drawn yet: a hollow box says so on screen
+        // rather than a silently blank button.
+        _ => canvas.stroke_rect(Rect::new(cx - size / 2, cy - size / 2, size, size), 1, color),
+    }
+}
+
 /// Turn a caret offset in characters into a line and a column.
 ///
 /// A field has one line by construction, so it is column-only. An editor may
@@ -1701,7 +1759,67 @@ pub fn caret_from_x(fonts: &Fonts, value: &str, style: &Style, left: i32, x: i32
     best
 }
 
-/// The left edge text starts at inside a text control.
-pub fn text_origin(rect: Rect) -> i32 {
-    rect.x + control_pad()
+/// How far a text control's content is shifted so its caret stays in view:
+/// left by the first number, up by the second.
+///
+/// A value longer than its box used to draw from the start regardless, so the
+/// caret walked off the right edge and vanished, and typing appended to text
+/// nobody could see. The content slides instead, exactly as far as the caret
+/// needs and no further, so a caret at the start shows the start and a caret
+/// past the edge drags the text along. Derived from the caret rather than
+/// stored, which is what keeps the painter and the click hit test agreeing:
+/// both call this, so where text is drawn and where a click lands cannot
+/// drift. The vertical half is the same idea for an editor's lines.
+pub fn text_scroll(
+    fonts: &Fonts,
+    value: &str,
+    style: &Style,
+    tag: Tag,
+    caret: usize,
+    rect: Rect,
+) -> (i32, i32) {
+    let (row, column) = caret_position(value, caret, tag);
+    let line = value.split('\n').nth(row).unwrap_or("");
+    let ahead = fonts.measure(prefix(line, column), style);
+    // A margin keeps the caret a step inside the edge, so the next character
+    // has somewhere visible to go.
+    let inner_w = (rect.w - control_pad() * 2).max(sc(20));
+    let hshift = (ahead - inner_w + sc(6)).max(0);
+
+    let vshift = if tag == Tag::Editor {
+        let step = fonts.line_height(style).max(1);
+        let inner_h = (rect.h - control_pad() * 2).max(step);
+        ((row as i32 + 1) * step - inner_h).max(0)
+    } else {
+        0
+    };
+    (hshift, vshift)
+}
+
+/// Which character of a text control's value a click landed on, row and all.
+///
+/// The shift is computed from the caret as it stands, because that is the
+/// shift the content was painted with: a click lands on what the human sees.
+pub fn caret_at_point(
+    fonts: &Fonts,
+    value: &str,
+    style: &Style,
+    tag: Tag,
+    rect: Rect,
+    caret_now: usize,
+    at: (i32, i32),
+) -> usize {
+    let (x, y) = at;
+    let (hshift, vshift) = text_scroll(fonts, value, style, tag, caret_now, rect);
+    let left = rect.x + control_pad() - hshift;
+    if tag != Tag::Editor {
+        return caret_from_x(fonts, value, style, left, x);
+    }
+
+    let step = fonts.line_height(style).max(1);
+    let top = rect.y + control_pad() - vshift;
+    let lines: Vec<&str> = value.split('\n').collect();
+    let row = (((y - top) / step).max(0) as usize).min(lines.len().saturating_sub(1));
+    let column = caret_from_x(fonts, lines[row], style, left, x);
+    lines[..row].iter().map(|line| line.chars().count() + 1).sum::<usize>() + column
 }
