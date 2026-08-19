@@ -12,7 +12,18 @@
 //!   view     <app> <awml>
 //!   done     <app> <target> <action>
 //!   rejected <app> <target> <reason>
+//!   changed  <app>                           haimanager -> agent, unsolicited
 //! ```
+//!
+//! `changed` is the one unsolicited message: an application in the agent's
+//! workspace re-rendered and its tree actually differed, so a view the agent
+//! read before that moment no longer describes the screen. It carries the
+//! name and nothing else, deliberately. The remedy is a fresh read, exactly
+//! as a human notices movement and then looks; sending the difference itself
+//! would reintroduce the failure the whole-tree protocol exists to avoid,
+//! where one missed patch leaves two ends disagreeing with no resync path.
+//! The [`Link`] collects these while waiting on replies, and hands them over
+//! through [`Link::take_changed`] between actions.
 //!
 //! ## Intents, not events
 //!
@@ -60,6 +71,9 @@ pub const MSG_APPS: &str = "apps";
 pub const MSG_VIEW: &str = "view";
 pub const MSG_DONE: &str = "done";
 pub const MSG_REJECTED: &str = "rejected";
+/// An application's tree changed since it was last read. Unsolicited, and
+/// carrying only the name: the answer to it is a fresh `query view`.
+pub const MSG_CHANGED: &str = "changed";
 
 /// No application of that name is open in this workspace.
 pub const REASON_NO_SUCH_APP: &str = "no-such-app";
@@ -96,6 +110,9 @@ pub enum Outcome {
 pub struct Link {
     stream: UnixStream,
     decoder: Decoder,
+    /// Applications the compositor said changed, in arrival order, collected
+    /// while waiting on replies and drained by [`Link::take_changed`].
+    changed: Vec<String>,
 }
 
 impl Link {
@@ -109,7 +126,69 @@ impl Link {
         // SAFETY: the supervisor created this descriptor before forking us and
         // named it in our environment. Nothing else in this process owns it.
         let stream = unsafe { UnixStream::from_raw_fd(raw) };
-        Ok(Link { stream, decoder: Decoder::with_limit(MAX_TREE) })
+        Ok(Link { stream, decoder: Decoder::with_limit(MAX_TREE), changed: Vec::new() })
+    }
+
+    /// The applications whose trees changed since the last drain, oldest
+    /// first, each named once.
+    ///
+    /// Notices arrive whenever the compositor sends them: some while a reply
+    /// was being awaited, already collected, and some sitting unread in the
+    /// socket because nothing was being awaited at all. Both are gathered
+    /// here, which is why this reads the socket without blocking first.
+    pub fn take_changed(&mut self) -> io::Result<Vec<String>> {
+        self.stream.set_nonblocking(true)?;
+        let mut result = Ok(());
+        loop {
+            let mut buf = [0u8; 8192];
+            match self.stream.read(&mut buf) {
+                Ok(0) => {
+                    result = Err(io::Error::other("the compositor closed the connection"));
+                    break;
+                }
+                Ok(n) => self.decoder.feed(&buf[..n]),
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err) => {
+                    result = Err(err);
+                    break;
+                }
+            }
+        }
+        self.stream.set_nonblocking(false)?;
+        result?;
+
+        while let Some(fields) = self
+            .decoder
+            .next_frame()
+            .map_err(|err| io::Error::other(err.to_string()))?
+        {
+            self.collect(&fields);
+            // Anything that is not a notice has no business arriving while no
+            // request is in flight; `collect` keeps the notices and the rest
+            // is dropped as the protocol violation it is.
+        }
+
+        let mut names: Vec<String> = Vec::new();
+        for name in std::mem::take(&mut self.changed) {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        Ok(names)
+    }
+
+    /// Keep a `changed` notice; say whether the frame was one.
+    fn collect(&mut self, fields: &[String]) -> bool {
+        if fields.first().map(String::as_str) != Some(MSG_CHANGED) {
+            return false;
+        }
+        if let Some(name) = fields.get(1)
+            && self.changed.last() != Some(name)
+        {
+            self.changed.push(name.clone());
+        }
+        true
     }
 
     /// What applications are open, as AWML.
@@ -150,6 +229,12 @@ impl Link {
                 .next_frame()
                 .map_err(|err| io::Error::other(err.to_string()))?
             {
+                // A change notice may arrive while a reply is awaited; it is
+                // collected rather than mistaken for the answer, and handed
+                // over by `take_changed` when the caller next asks.
+                if self.collect(&reply) {
+                    continue;
+                }
                 return Ok(reply);
             }
 

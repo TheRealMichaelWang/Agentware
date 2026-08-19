@@ -359,6 +359,13 @@ fn run(
                         dirty |= screen.requests(fonts, fd, progress.requests);
                     }
 
+                    // A tree that genuinely changed is worth a word to the
+                    // agent working in that workspace, so it re-reads instead
+                    // of acting on a view of how things used to be.
+                    if progress.updated {
+                        screen.notify_agent_of_change(fd);
+                    }
+
                     // A first tree is worth printing whole: the reduced schema
                     // can then be read against the document that produced it,
                     // which is the claim the design makes about them.

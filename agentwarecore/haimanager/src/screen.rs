@@ -798,6 +798,31 @@ impl Screen {
         self.clients.iter_mut().find(|client| client.fd() == fd)
     }
 
+    /// An application's tree changed: tell the agent working in its
+    /// workspace, if one is, so it re-reads rather than acting on a view of
+    /// how things used to be.
+    ///
+    /// The name and nothing else crosses. The agent's remedy is the same
+    /// `query view` it always had, which returns the whole present state;
+    /// pushing the difference itself would reintroduce the drift the
+    /// whole-tree protocol exists to prevent. Desk trees never arrive here,
+    /// because the caller notifies for app clients only: chrome stays
+    /// invisible to agents down to its updates.
+    pub fn notify_agent_of_change(&mut self, changed_fd: RawFd) {
+        let Some(changed) = self.client(changed_fd) else { return };
+        if changed.kind != Kind::App {
+            return;
+        }
+        let (desk, name) = (changed.desk, changed.name.clone());
+        if let Some(agent) = self
+            .clients
+            .iter_mut()
+            .find(|client| client.kind == Kind::Agent && client.desk == desk)
+        {
+            agent.send(&[agent::MSG_CHANGED, &name]);
+        }
+    }
+
     fn client(&self, fd: RawFd) -> Option<&Client> {
         self.clients.iter().find(|client| client.fd() == fd)
     }

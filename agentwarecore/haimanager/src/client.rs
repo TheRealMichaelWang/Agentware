@@ -161,6 +161,10 @@ pub struct Client {
 pub struct Progress {
     pub gone: bool,
     pub dirty: bool,
+    /// A tree was installed and actually differed from the held one. What the
+    /// workspace's agent is told about, as distinct from `dirty`, which a
+    /// rejected document also sets for the sake of the status strip.
+    pub updated: bool,
     /// A first tree was installed where there was none. The moment a window can
     /// be sized to its content, since before this there was nothing to measure.
     pub first: bool,
@@ -236,6 +240,7 @@ impl Client {
         let mut progress = Progress {
             gone: false,
             dirty: false,
+            updated: false,
             first: false,
             log: Vec::new(),
             requests: Vec::new(),
@@ -267,8 +272,14 @@ impl Client {
                         // installed, so the markup is copied out first.
                         let source = source.to_owned();
                         let had_doc = self.doc.is_some();
+                        let was_version = self.version();
                         let (dirty, line) = self.apply(fonts, &source, version);
                         progress.dirty |= dirty;
+                        // A tree counts as updated when it was installed and
+                        // repainted: the version moved and the screen did too.
+                        // An identical resend moves the version silently, and
+                        // a rejected document moves neither.
+                        progress.updated |= dirty && self.version() != was_version;
                         // Checked against the document rather than taken from
                         // `apply`, so a first tree that failed to parse does not
                         // count as having arrived.

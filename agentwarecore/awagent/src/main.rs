@@ -87,8 +87,12 @@ Rejections are answers, not failures:
 - needs-approval: the human must approve it; say what you wanted to do and stop.
 
 Working style:
-- Read before acting: list_apps, then read_app, then act, and read again after acting \
-rather than assuming a result. Open what the work needs with open_app.
+- Read before acting: list_apps, then read_app, then act. Open what the work needs with \
+open_app.
+- When an application's interface changes, after your actions or on its own, its fresh \
+view is attached to your tool results automatically, marked as re-read for you. You \
+therefore rarely need read_app to confirm a result; use it to look at an app you have \
+not just seen.
 - Plain text you write between tool calls is shown to the human as progress narration; \
 keep it to a line.
 - Your final message, with no tool call, ends the turn and joins the conversation as \
@@ -215,15 +219,77 @@ fn main() {
             agent.say(turn::KIND_RESULT, line.trim());
         }
 
+        let mut acted = false;
         let mut results = Vec::new();
         for (id, name, input) in calls {
+            acted |= matches!(name.as_str(), "act" | "open_app");
             let (content, is_error) = run_tool(&mut agent, &name, &input);
             results.push(Block::ToolResult { id, content, is_error });
+        }
+
+        // The automatic re-read. The compositor says which applications'
+        // trees genuinely changed while the tools ran; their present views
+        // ride back with the results, so the model sees the consequences of
+        // its actions without spending an exchange asking.
+        if let Some(refreshed) = refreshed_views(&mut agent, acted) {
+            results.push(Block::Text(refreshed));
         }
 
         messages.push(ModelMessage { role: Role::Assistant, content: assistant.content });
         messages.push(ModelMessage { role: Role::User, content: results });
     }
+}
+
+/// How long an application gets to re-render after an action before the
+/// changed set is drained. An app answers an event in milliseconds; this is
+/// generous for that and nothing against a model exchange.
+const SETTLE: Duration = Duration::from_millis(150);
+
+/// The present views of whatever changed while the tools ran, or `None` when
+/// nothing did.
+///
+/// This is the pull model kept honest rather than replaced: the compositor
+/// never pushes a tree, only the name of an app whose tree moved, and the
+/// harness answers with the same `read_app` the model would have had to
+/// spend a whole model exchange asking for. The model receives state, never
+/// a diff, so there is nothing to misapply.
+fn refreshed_views(agent: &mut Agent, acted: bool) -> Option<String> {
+    if acted {
+        // An action's consequences appear one app round trip later, which is
+        // moments after the intent resolved; without the pause the drain
+        // would race the very re-render it exists to catch.
+        std::thread::sleep(SETTLE);
+    }
+    let changed = match agent.link.take_changed() {
+        Ok(changed) => changed,
+        Err(err) => {
+            log(&format!("could not drain change notices: {err}"));
+            return None;
+        }
+    };
+    if changed.is_empty() {
+        return None;
+    }
+
+    let mut text = String::from(
+        "The workspace changed while you worked. The present state, re-read for you:\n",
+    );
+    for app in changed {
+        agent.say(turn::KIND_ACTION, &format!("re-reading {app} (it changed)"));
+        match agent.link.view(&app) {
+            Ok(markup) if !markup.is_empty() => {
+                text.push('\n');
+                text.push_str(&markup);
+                text.push('\n');
+            }
+            Ok(_) => {}
+            Err(err) => {
+                log(&format!("could not re-read {app}: {err}"));
+                return Some(text);
+            }
+        }
+    }
+    Some(text)
 }
 
 /// One model exchange, with the deltas streamed into the pane as they come:

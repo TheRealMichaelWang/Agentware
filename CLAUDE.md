@@ -318,7 +318,14 @@ surface: `list_apps`, `read_app`, `act` (the fourteen-verb vocabulary as an
 enum), and `open_app` (up the turn channel, then polling `apps()` until the
 app appears). A rejection (`blocked`, `disabled`, `not-visible`) goes back as
 a tool result for the model to reason about, which is rejections-as-answers
-carried one level up. Thinking streams into the pane as `thought` telemetry
+carried one level up. The agent wire also carries one unsolicited word,
+`changed <app>`, sent when an application's tree genuinely differed on a
+re-render; the harness answers it itself, re-reading each changed app after
+the tools run (a 150ms settle first, so the drain does not race the very
+re-render it exists to catch) and attaching the fresh views to the tool
+results, so the model sees the consequences of its actions without spending
+an exchange asking. The name crosses, never the diff: the remedy is a whole
+fresh view, for the same reason apps send whole trees. Thinking streams into the pane as `thought` telemetry
 a line at a time, narration between tool calls as `result` lines, every act
 as an `action` line with its outcome, and the model's final message, the one
 with no tool calls, is the reply. While a turn runs the transcript ends with

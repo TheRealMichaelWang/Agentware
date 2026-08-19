@@ -66,6 +66,10 @@ An agent has exactly two channels, and neither one is the Supervisor.
 
 Both answers are **scoped to the agent's own agentdesk**. An agent cannot see or address an app in another workspace, and this is not enforced by checking a workspace id the agent supplies. The haimanager knows which workspace a connection belongs to because the Supervisor told it so when it handed the descriptor over. The agent is never asked and cannot lie.
 
+**haimanager → agent: one unsolicited word, `changed <app>`.**
+
+When an application in the agent's workspace re-renders and its tree actually differs, the haimanager tells the agent so, by name and nothing more. Deliberately not the difference itself: the remedy is a fresh read of the whole present state, exactly as a human notices movement and then looks, and a pushed diff would reintroduce the failure the whole-tree protocol exists to avoid, where one missed patch leaves two ends silently disagreeing. The agent's harness answers these notices itself, re-reading each changed application between actions and handing the model the fresh view alongside its tool results, so the model sees the consequences of what it did without spending an exchange asking. Desk trees never produce a notice, because chrome is invisible to agents down to its updates.
+
 **Agent → haimanager: intents, not events.**
 
 This is the distinction the whole input model rests on.
