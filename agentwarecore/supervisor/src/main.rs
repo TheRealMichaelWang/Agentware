@@ -17,7 +17,6 @@
 //!   6. shutdown     stop everything, flush, unmount, power off
 
 mod cgroup;
-mod demo;
 mod desk;
 mod early;
 mod ipc;
@@ -54,10 +53,8 @@ const TOKEN_SIGNALS: u64 = 1;
 /// One entry. The compositor asks the broker for the first workspace itself
 /// when it comes up, and every workspace after that is created from the
 /// navigation bar's plus or a workspace's own taskbar, so there is no start
-/// menu process to list. What is still missing is an agent with a model behind
-/// it: `Programs::system` names `/bin/agent`, and the service table's habit of
-/// logging and skipping what is not installed extends to the broker refusing
-/// `start-agent` with a clear error rather than crash looping.
+/// menu process to list. The agent is not here either: it is per-turn, forked
+/// on an agentdesk's request, never a service.
 fn system_services() -> Vec<Service> {
     vec![Service::new(ROLE_HAIMANAGER, "/bin/haimanager", &[], RestartPolicy::Always)]
 }
@@ -108,6 +105,10 @@ fn main() {
     // because it needs /dev, and before any service, because the first thing
     // to ask for a setting writes the defaults if there are none.
     early::mount_state();
+    // The resolver's one file, so the agent can turn a hostname into an
+    // address. The interface itself is the kernel's, from the ip= boot
+    // argument; the supervisor only says whether one exists.
+    early::configure_network();
 
     // Stage 3. This has to happen before the first child is spawned: the signal
     // mask survives fork and exec, so anything started beforehand would inherit
@@ -121,7 +122,6 @@ fn main() {
     };
 
     let selftest = selftest::requested();
-    let demo = !selftest && demo::requested();
 
     // Stage 4a. Both of these come up before any service does, so nothing can
     // start, try to reach the broker, and lose a race it did not know it was in.
@@ -137,18 +137,11 @@ fn main() {
         }
     };
 
-    let desks = Desks::new(match (selftest, demo) {
-        (true, _) => selftest::programs(),
-        (_, true) => demo::programs(),
-        _ => Programs::system(),
-    });
+    let desks = Desks::new(if selftest { selftest::programs() } else { Programs::system() });
 
     // Stage 4b.
-    let mut services = Services::new(match (selftest, demo) {
-        (true, _) => selftest::services(),
-        (_, true) => demo::services(),
-        _ => system_services(),
-    });
+    let mut services =
+        Services::new(if selftest { selftest::services() } else { system_services() });
     services.start_all();
 
     kinfo!("supervisor ready");

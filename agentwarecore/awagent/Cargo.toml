@@ -3,9 +3,18 @@ name = "awagent"
 version = "0.1.0"
 edition = "2024"
 
-# A stand-in for the per-turn worker. It owns nothing durable, exits when its
-# turn is finished, and is never restarted. There is no model behind it: what it
-# does is a fixed script, because the point is to exercise the compositor's
-# agent surface rather than to be intelligent.
+# The per-turn worker: one prompt, one agentic loop against a model, then gone.
+# It owns nothing durable, exits when its turn is finished, and is never
+# restarted.
+#
+# This is the one crate in the system that talks to the outside world, so it is
+# the one crate that carries the machinery for it: rustls with the ring
+# provider (builds cleanly for musl), the webpki CA bundle compiled in (the
+# image has no /etc/ssl), and serde_json for the request bodies and streamed
+# events an LLM API speaks. PID 1 and awproto stay dependency-free; nothing
+# here is reachable from any other process.
 [dependencies]
 awproto = { path = "../awproto" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+serde_json = "1"

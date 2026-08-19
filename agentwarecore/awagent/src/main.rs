@@ -1,68 +1,125 @@
-//! A stand-in agent: one turn, scripted, then gone.
+//! The agent: one turn of real work, with a model behind it, then gone.
 //!
-//! The per-turn worker is the shortest-lived thing in Agentware and owns nothing
-//! durable. Interrupting it is a signal to a process with no state, crashing it
-//! takes nothing with it, and it is never restarted, because restarting one
-//! would silently re-run side effects it had already performed.
+//! The per-turn worker is the shortest-lived thing in Agentware and owns
+//! nothing durable. Interrupting it is a signal to a process with no state,
+//! crashing it takes nothing with it, and it is never restarted, because
+//! restarting one would silently re-run side effects it had already
+//! performed.
 //!
-//! There is no model here. Two scripts, and the prompt picks: one that mentions
-//! a file walks the file browser and its open dialog, anything else adds two
-//! numbers on the calculator. Both are chosen to walk every branch of the
-//! compositor's intent resolution: the ones that succeed, and each way one can
-//! be refused. A rejection is an answer, and an agent that cannot be told no
-//! acts blind and retries forever, so the refusals matter at least as much as
-//! the successes.
+//! This file is the harness: it owns the agentic loop and both wires. The
+//! context comes down the private channel from the agentdesk, naming which
+//! backend configuration to run; the conversation goes to the model through
+//! a [`backend::Backend`]; and everything the model wants done on screen is
+//! executed here, over the compositor link, as intents. What the model says
+//! while it works goes back up the channel as telemetry, so the human
+//! watches the turn in the pane, and the model's final message is the reply
+//! that joins the conversation.
 //!
-//! Notice what this file cannot do. It never produces an event, only intents. It
-//! never names a workspace, because it has no way to name one and is never asked
-//! which it is in. It cannot see the agentdesk that started it, so it cannot read
-//! the transcript of its own streamed thoughts. It cannot open an application
-//! itself: it asks the agentdesk, which asks PID 1, and it finds out whether
-//! that worked the way it finds out everything, by asking the compositor.
-//!
-//! What it says to the agentdesk is the other half of the turn. The context
-//! comes down the private channel first, and everything the agent does goes back
-//! up it as telemetry, so the human watches the turn in the pane rather than in
-//! the kernel log. The reply at the end is what joins the conversation.
+//! Notice what this file still cannot do, model or no model. It never
+//! produces an event, only intents, so a rejection (`disabled`, `blocked`,
+//! `not-visible`) is an answer handed back to the model as a tool result to
+//! reason about, not an error. It never names a workspace, cannot see the
+//! agentdesk that started it, and cannot read the transcript of its own
+//! streamed thoughts. It cannot open an application itself: it asks the
+//! agentdesk, which asks PID 1, and it finds out whether that worked the way
+//! it finds out everything, by asking the compositor.
 //!
 //! Usage: awagent <desk-id>
+
+mod backend;
+mod backends;
+mod http;
 
 use std::io::Write as _;
 use std::time::{Duration, Instant};
 
 use awproto::agent::{Link, Outcome};
 use awproto::turn::{self, Turn};
+use serde_json::{Value, json};
 
-/// A pause between intents, standing in for the time a real agent spends
-/// deciding what to do next.
-///
-/// Not cosmetic. An agent that fires intents as fast as the socket allows is
-/// asking for actions against a screen it has not seen the result of, and it
-/// makes the fake cursor a blur rather than something a human can follow.
-const THINKING: Duration = Duration::from_millis(300);
+use backend::{Assistant, Backend, Block, Delta, ModelMessage, Role, Stop, ToolDef};
 
-/// How long to wait for the calculator to appear after asking for it. An
+/// How long to wait for an application to appear after asking for it. An
 /// application is forked by PID 1 and attaches when its first tree arrives,
 /// which is quick, but not instant.
 const OPENING: Duration = Duration::from_secs(5);
 
+/// How often to look while waiting for one.
+const OPENING_POLL: Duration = Duration::from_millis(300);
+
+/// The most model exchanges one turn may make. A ceiling rather than a
+/// budget: a turn that runs this long has almost certainly lost the plot,
+/// and every exchange spends the human's money. The turn ends honestly,
+/// saying how far it got.
+const MAX_EXCHANGES: usize = 40;
+
+/// What the model is told about the machine it is driving. Everything here
+/// restates a contract that holds elsewhere in the system; the model is the
+/// one part that cannot read the source.
+const SYSTEM: &str = "\
+You are the agent of an Agentware agentdesk: an AI-native operating system where you and \
+the human share one workspace and use the same applications through the same interface. \
+You act for the human, visibly: everything you do is performed on their screen with a \
+cursor they can watch.
+
+How the interface reads:
+- read_app returns an application's interface as reduced semantic markup. Every control \
+carries an id, a description of what it does, its state, and an actions attribute listing \
+what it accepts right now. Layout is stripped; what you see is what exists.
+- The actions attribute is the authority. A disabled control lists none. A control marked \
+blocked is behind an open dialog.
+- Dialogs appear as controls nested in <dialog>. While one is up, everything outside it \
+answers blocked, for you and the human alike; answer the dialog and the rest comes back.
+
+How acting works:
+- act names an application, a control id, and one action from a closed vocabulary: focus, \
+click, type-text, clear, submit, check, uncheck, toggle, select, deselect, set-value, \
+open, close, scroll-into-view.
+- The compositor stages every action itself: the target's window comes to the front and \
+its siblings are put away before your action lands. You cannot move, resize or arrange \
+windows, and never need to.
+- type-text replaces a field's contents with the given value, typed on screen one \
+keystroke at a time. submit is the Enter key. check and uncheck are unconditional; prefer \
+them over toggle so the outcome does not depend on stale state.
+- scroll-into-view makes a node visible when it is scrolled away; name the node you want \
+seen, never a container.
+
+Rejections are answers, not failures:
+- disabled: the application has disabled it; something in the app must change first.
+- blocked: a dialog is in front; read the view and answer the dialog.
+- not-visible: scrolled out of view; scroll-into-view is the remedy.
+- no-such-node, no-such-app: nothing by that name; read again before retrying.
+- unsupported-action: that element does not take that action.
+- needs-approval: the human must approve it; say what you wanted to do and stop.
+
+Working style:
+- Read before acting: list_apps, then read_app, then act, and read again after acting \
+rather than assuming a result. Open what the work needs with open_app.
+- Plain text you write between tool calls is shown to the human as progress narration; \
+keep it to a line.
+- Your final message, with no tool call, ends the turn and joins the conversation as \
+your reply. Lead with the outcome.";
+
 /// The agent's two channels, and the words that go up the second.
 struct Agent {
     link: Link,
-    /// The agentdesk that started this turn. Absent only when something other
-    /// than an agentdesk did, which is what the self-test does; the turn then
-    /// runs with nobody to tell.
-    desk: Option<Turn>,
+    desk: Turn,
 }
 
 impl Agent {
+    /// Tell the human, in the pane and in the log.
     fn say(&mut self, kind: &str, text: &str) {
         log(text);
-        if let Some(desk) = &mut self.desk
-            && let Err(err) = desk.telemetry(kind, text)
-        {
+        if let Err(err) = self.desk.telemetry(kind, text) {
             log(&format!("could not reach the agentdesk: {err}"));
-            self.desk = None;
+        }
+    }
+
+    /// The reply ends the turn; the agentdesk sees the hangup when this
+    /// process exits.
+    fn finish(&mut self, reply: &str) {
+        if let Err(err) = self.desk.reply(reply) {
+            log(&format!("could not deliver the reply: {err}"));
         }
     }
 }
@@ -75,323 +132,356 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let desk = match Turn::inherited() {
-        Ok(turn) => Some(turn),
+    let mut desk = match Turn::inherited() {
+        Ok(turn) => turn,
         Err(err) => {
-            log(&format!("no agentdesk channel ({err}); the turn runs untold"));
-            None
+            // Without the channel there is no prompt and nobody to answer.
+            log(&format!("no agentdesk channel: {err}"));
+            std::process::exit(1);
+        }
+    };
+
+    let context = match desk.context() {
+        Ok(context) => context,
+        Err(err) => {
+            log(&format!("could not read the context: {err}"));
+            std::process::exit(1);
         }
     };
     let mut agent = Agent { link, desk };
+    log(&format!(
+        "turn starting: {} earlier message(s), backend {}",
+        context.history.len(),
+        context.backend
+    ));
 
-    // The context. A real agent would think about it; this one reports what
-    // it was given so the channel can be seen working end to end, and reads
-    // one word of it to pick which of its two scripts to run.
-    let mut prompt = String::new();
-    if let Some(desk) = &mut agent.desk {
-        match desk.context() {
-            Ok((history, text)) => {
-                let earlier = history.len();
-                agent.say(
-                    turn::KIND_THOUGHT,
-                    &format!("read {earlier} earlier message(s); the prompt is {text:?}"),
-                );
-                prompt = text;
+    let settings = awproto::settings::Settings::load();
+    let mut model = match backends::from_config(&context.backend, &settings) {
+        Ok(backend) => backend,
+        Err(why) => {
+            agent.say(turn::KIND_ERROR, &why);
+            agent.finish(&format!("I could not start: {why}."));
+            return;
+        }
+    };
+
+    // The conversation as the model sees it: what was said, in order, and
+    // the prompt as the newest message. Telemetry never appears here; the
+    // model's own working notes from earlier turns ended when those turns
+    // did, exactly as the architecture intends.
+    let mut messages: Vec<ModelMessage> = context
+        .history
+        .iter()
+        .filter(|message| !message.text.trim().is_empty())
+        .map(|message| {
+            if message.role == turn::ROLE_AGENT {
+                ModelMessage::assistant_text(&message.text)
+            } else {
+                ModelMessage::user_text(&message.text)
             }
-            Err(err) => {
-                log(&format!("could not read the context: {err}"));
-                agent.desk = None;
-            }
-        }
-    }
-
-    if prompt.to_lowercase().contains("file") {
-        files_turn(&mut agent);
-        return;
-    }
-    calculator_turn(&mut agent);
-}
-
-/// Make sure an application is open, asking the workspace for it if not, and
-/// waiting until the compositor says it is there. `false` if it never came.
-fn ensure_open(agent: &mut Agent, app: &str, label: &str) -> bool {
-    let apps = match agent.link.apps() {
-        Ok(markup) => markup,
-        Err(err) => {
-            log(&format!("could not read the workspace: {err}"));
-            std::process::exit(1);
-        }
-    };
-    report("apps", &apps);
-    if apps.contains(app) {
-        return true;
-    }
-
-    agent.say(turn::KIND_ACTION, &format!("opening the {label}"));
-    if let Some(desk) = &mut agent.desk
-        && let Err(err) = desk.open_app(app)
-    {
-        log(&format!("could not ask for the {label}: {err}"));
-    }
-    let waited = Instant::now();
-    loop {
-        std::thread::sleep(THINKING);
-        match agent.link.apps() {
-            Ok(markup) if markup.contains(app) => break,
-            Ok(_) if waited.elapsed() < OPENING => continue,
-            Ok(_) => {
-                agent.say(turn::KIND_ERROR, &format!("the {label} did not open"));
-                return false;
-            }
-            Err(err) => {
-                log(&format!("could not read the workspace: {err}"));
-                std::process::exit(1);
-            }
-        }
-    }
-    agent.say(turn::KIND_RESULT, &format!("the {label} is open"));
-    true
-}
-
-/// One intent, told to the human, with the outcome as a string.
-fn act(agent: &mut Agent, app: &str, action: &str, target: &str, value: &str) -> String {
-    std::thread::sleep(THINKING);
-    let outcome = match agent.link.act(app, action, target, value) {
-        Ok(outcome) => outcome,
-        Err(err) => {
-            log(&format!("connection failed: {err}"));
-            std::process::exit(1);
-        }
-    };
-    let got = match &outcome {
-        Outcome::Done => "done".to_owned(),
-        Outcome::Rejected(reason) => reason.clone(),
-    };
-    let what = if value.is_empty() {
-        format!("{action} {target} in {app}")
-    } else {
-        format!("{action} {value:?} into {target} in {app}")
-    };
-    agent.say(turn::KIND_ACTION, &format!("{what}: {got}"));
-    got
-}
-
-/// The file script: open the explorer, mark a file, copy it into a folder
-/// chosen through the dialog.
-///
-/// This is the dialog contract seen from the agent's side. The dialog is
-/// controls nested in `<dialog>` in the explorer's own view, so choosing a
-/// folder is reading the view and clicking what it lists; and while the
-/// dialog is up, the explorer's own controls answer `blocked`, which is the
-/// compositor keeping the agent to the same rule the human is under.
-fn files_turn(agent: &mut Agent) {
-    if !ensure_open(agent, "awfiles", "file explorer") {
-        finish(agent, "I could not open the file explorer.");
-        return;
-    }
-
-    let view = |agent: &mut Agent, why: &str| -> String {
-        match agent.link.view("awfiles") {
-            Ok(markup) => {
-                report(why, &markup);
-                markup
-            }
-            Err(err) => {
-                log(&format!("could not read awfiles: {err}"));
-                String::new()
-            }
-        }
-    };
-
-    // Mark welcome.txt. A checkbox, so `check`: unconditional, and the
-    // compositor turns it into a toggle only if the box is not already checked.
-    let markup = view(agent, "view awfiles");
-    let Some(mark) = find_control(&markup, |d| d.starts_with("Marks the file welcome.txt")) else {
-        finish(agent, "I could not find welcome.txt to mark.");
-        return;
-    };
-    agent.say(turn::KIND_THOUGHT, "marking welcome.txt, then copying it into notes");
-    act(agent, "awfiles", "check", &mark, "");
-    act(agent, "awfiles", "click", "copy-to", "");
-
-    let markup = view(agent, "view awfiles with the dialog open");
-    let dialog_seen = markup.contains("<dialog");
-    agent.say(
-        turn::KIND_RESULT,
-        if dialog_seen { "the view shows a <dialog> asking for a folder" } else { "no dialog in the view" },
-    );
-
-    // The explorer's own Up is behind the dialog now. Told `blocked`, not
-    // `disabled`: the control is fine, something is in front of it.
-    let blocked = act(agent, "awfiles", "click", "up", "");
-    if blocked != "blocked" {
-        agent.say(turn::KIND_ERROR, &format!("expected blocked for a control behind the dialog, got {blocked}"));
-    }
-
-    // Into notes, then choose it.
-    if let Some(folder) = find_control(&markup, |d| d == "Enters the folder notes") {
-        act(agent, "awfiles", "click", &folder, "");
-    }
-    act(agent, "awfiles", "click", "file-dialog-confirm", "");
-
-    let after = view(agent, "view awfiles after the dialog");
-    let dialog_gone = !after.contains("<dialog");
-    let copied = after.contains("copied 1 item(s) to /home/notes");
-    agent.say(
-        turn::KIND_RESULT,
-        if dialog_gone { "the dialog is gone and the explorer answers again" } else { "the dialog is still up" },
-    );
-
-    let reply = match (dialog_gone, copied) {
-        (true, true) => "Copied welcome.txt into notes through the folder dialog.".to_owned(),
-        (true, false) => "The dialog closed, but the explorer does not say the copy happened.".to_owned(),
-        (false, _) => "The dialog did not close.".to_owned(),
-    };
-    finish(agent, &reply);
-}
-
-/// The id of the first control in a view whose description satisfies `wanted`
-/// and that can currently be acted on. The action list is the authority: a
-/// control that is disabled, or behind a dialog, has an empty one, and an
-/// agent that reads it never sends an intent that will be refused.
-fn find_control(view: &str, wanted: impl Fn(&str) -> bool) -> Option<String> {
-    view.lines().find_map(|line| {
-        let description = attribute(line, "description")?;
-        let actions = attribute(line, "actions")?;
-        (wanted(&description) && !actions.is_empty())
-            .then(|| attribute(line, "id"))
-            .flatten()
-    })
-}
-
-/// One attribute's value out of a line of markup. Enough of a parser for a
-/// view the compositor wrote; a real agent would have a real one.
-fn attribute(line: &str, name: &str) -> Option<String> {
-    let start = line.find(&format!(" {name}=\""))? + name.len() + 3;
-    let end = line[start..].find('"')? + start;
-    Some(unescape(&line[start..end]))
-}
-
-fn unescape(text: &str) -> String {
-    text.replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
-}
-
-/// The calculator script: 12 + 34, one press at a time.
-fn calculator_turn(agent: &mut Agent) {
-    if !ensure_open(agent, "awcalc", "calculator") {
-        finish(agent, "I could not open the calculator, so I could not add the numbers.");
-        return;
-    }
-
-    match agent.link.view("awcalc") {
-        Ok(markup) => report("view awcalc", &markup),
-        Err(err) => log(&format!("could not read awcalc: {err}")),
-    }
-
-    // The turn: work out 12 + 34 on the calculator, one press at a time, the
-    // way a human would. Each line is an intent and the outcome it is expected
-    // to have, so a run that behaves differently is visible in the log rather
-    // than needing to be reasoned about.
-    let script: &[(&str, &str, &str, &str, &str)] = &[
-        // Nothing has been entered, so the calculator has disabled its equals
-        // button. A disabled control offers no actions and this is refused: the
-        // agent can see that `=` exists and that pressing it now would mean
-        // nothing.
-        ("awcalc", "click", "equals", "", "disabled"),
-        ("awcalc", "click", "digit-1", "", "done"),
-        ("awcalc", "click", "digit-2", "", "done"),
-        ("awcalc", "click", "add", "", "done"),
-        ("awcalc", "click", "digit-3", "", "done"),
-        ("awcalc", "click", "digit-4", "", "done"),
-        // The whole calculator fits on screen, so there is nothing to move and
-        // this succeeds by already being true. The point is the contract: the
-        // agent names the node it wants visible and never a scroll container,
-        // and the compositor works out whether anything has to happen.
-        ("awcalc", "scroll-into-view", "equals", "", "done"),
-        // 12 + 34. The display should read 46 in the view read back below.
-        ("awcalc", "click", "equals", "", "done"),
-        // Nothing in that window answers to this name.
-        ("awcalc", "click", "no-such-thing", "", "no-such-node"),
-        // The agentdesk's own chrome. Not missing: forbidden, and told apart
-        // from missing so the agent does not go looking for it.
-        ("workspace", "click", "send-message", "", "not-addressable"),
-        // A button offers focus and click, and nothing else. The action list is
-        // derived from the element and its state, so this cannot be talked into
-        // existing.
-        ("awcalc", "type-text", "digit-7", "hello", "unsupported-action"),
-    ];
-
-    agent.say(turn::KIND_THOUGHT, "working out 12 + 34 on the calculator, one press at a time");
-
-    let mut surprises = 0;
-    for &(app, action, target, value, expected) in script {
-        let got = act(agent, app, action, target, value);
-        if got != expected {
-            surprises += 1;
-            agent.say(turn::KIND_ERROR, &format!("{action} {target}: expected {expected}, got {got}"));
-        }
-    }
-
-    // The last thing it does is read the screen again, because an agent that
-    // acts without checking the result is the thing this whole design exists to
-    // make unnecessary. The display should read 46.
-    let display = match agent.link.view("awcalc") {
-        Ok(markup) => {
-            report("view awcalc after the turn", &markup);
-            display_of(&markup)
-        }
-        Err(_) => None,
-    };
-    if let Some(shown) = &display {
-        agent.say(turn::KIND_RESULT, &format!("the calculator's display reads {shown}"));
-    }
-
-    let reply = match (surprises, display) {
-        (0, Some(shown)) => format!("12 + 34 = {shown}. Every step went as expected."),
-        (0, None) => "Done, every step went as expected, but I could not read the result back.".to_owned(),
-        (n, Some(shown)) => format!("The display reads {shown}, but {n} step(s) did not go as expected."),
-        (n, None) => format!("{n} step(s) did not go as expected and I could not read the result back."),
-    };
-    log(if surprises == 0 {
-        "turn complete, every intent resolved as expected"
-    } else {
-        "turn complete with surprises"
-    });
-    finish(agent, &reply);
-}
-
-/// The reply ends the turn. The agentdesk sees the hangup when this process
-/// exits, which is what tells it the turn is over.
-fn finish(agent: &mut Agent, reply: &str) {
-    if let Some(desk) = &mut agent.desk
-        && let Err(err) = desk.reply(reply)
-    {
-        log(&format!("could not deliver the reply: {err}"));
-    }
-}
-
-/// The number the calculator is showing, read out of the agent's view: the
-/// first text that parses as one. The pending line above it is text too, but
-/// reads "12 +" rather than a number, so this finds the display.
-fn display_of(view: &str) -> Option<String> {
-    view.lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            let inner = line.strip_prefix("<text>")?.strip_suffix("</text>")?;
-            inner.parse::<f64>().ok().map(|_| inner.to_owned())
         })
-        .next()
+        .collect();
+    messages.push(ModelMessage::user_text(&context.prompt));
+
+    let tools = tool_definitions();
+
+    // The agentic loop: ask the model, do what it asks, hand back what
+    // happened, until it answers with no tool calls. Every iteration resends
+    // the whole conversation; the API's prompt cache makes the resend cheap.
+    for _ in 0..MAX_EXCHANGES {
+        let assistant = match exchange(&mut agent, model.as_mut(), &messages, &tools) {
+            Ok(assistant) => assistant,
+            Err(err) => {
+                agent.say(turn::KIND_ERROR, &err.message);
+                agent.finish(&format!("The turn failed: {}.", err.message));
+                return;
+            }
+        };
+
+        let calls: Vec<(String, String, Value)> = assistant
+            .tool_uses()
+            .map(|(id, name, input)| (id.to_owned(), name.to_owned(), input.clone()))
+            .collect();
+
+        if calls.is_empty() {
+            finish_turn(&mut agent, &assistant);
+            return;
+        }
+
+        // The narration between tool calls, now that it is known to be
+        // narration rather than the reply.
+        let narration = assistant.text();
+        for line in narration.lines().filter(|line| !line.trim().is_empty()) {
+            agent.say(turn::KIND_RESULT, line.trim());
+        }
+
+        let mut results = Vec::new();
+        for (id, name, input) in calls {
+            let (content, is_error) = run_tool(&mut agent, &name, &input);
+            results.push(Block::ToolResult { id, content, is_error });
+        }
+
+        messages.push(ModelMessage { role: Role::Assistant, content: assistant.content });
+        messages.push(ModelMessage { role: Role::User, content: results });
+    }
+
+    agent.say(turn::KIND_ERROR, &format!("stopping after {MAX_EXCHANGES} exchanges"));
+    agent.finish(&format!(
+        "I stopped after {MAX_EXCHANGES} rounds of work without reaching an answer. \
+         The workspace is as my last action left it."
+    ));
 }
 
-fn report(what: &str, markup: &str) {
-    log(&format!("--- {what} ---"));
-    for line in markup.lines() {
-        log(&format!("| {line}"));
+/// One model exchange, with the deltas streamed into the pane as they come:
+/// thinking line by line as it arrives, and a note when a tool call starts
+/// composing.
+fn exchange(
+    agent: &mut Agent,
+    model: &mut dyn Backend,
+    messages: &[ModelMessage],
+    tools: &[ToolDef],
+) -> Result<Assistant, backend::BackendError> {
+    // Thinking is spoken a line at a time: a delta is a fragment, and a pane
+    // line per fragment would be confetti.
+    let mut thinking = String::new();
+    let mut pending: Vec<(&'static str, String)> = Vec::new();
+    {
+        let mut on = |delta: Delta| match delta {
+            Delta::Thinking(piece) => {
+                thinking.push_str(&piece);
+                while let Some(at) = thinking.find('\n') {
+                    let line: String = thinking.drain(..=at).collect();
+                    let line = line.trim();
+                    if !line.is_empty() {
+                        pending.push((turn::KIND_THOUGHT, line.to_owned()));
+                    }
+                }
+            }
+            // Text is not spoken as it streams: whether it is narration or
+            // the reply is only known once the exchange is complete, and the
+            // pane should not show the reply twice.
+            Delta::Text(_) => {}
+            Delta::ToolCallStarted(_) => {
+                let rest = thinking.trim();
+                if !rest.is_empty() {
+                    pending.push((turn::KIND_THOUGHT, rest.to_owned()));
+                }
+                thinking.clear();
+            }
+        };
+        // The deltas are collected rather than spoken inside the callback,
+        // because speaking needs the desk channel and the callback runs
+        // inside the backend. Flushed the moment the exchange returns; a
+        // turn's pacing comes from the model's own streaming.
+        let result = model.respond(SYSTEM, messages, tools, &mut on);
+        let rest = thinking.trim();
+        if !rest.is_empty() {
+            pending.push((turn::KIND_THOUGHT, rest.to_owned()));
+        }
+        for (kind, line) in pending {
+            agent.say(kind, &line);
+        }
+        result
     }
+}
+
+/// End the turn on a completed assistant answer, honestly for each way the
+/// model can have stopped.
+fn finish_turn(agent: &mut Agent, assistant: &Assistant) {
+    let text = assistant.text();
+    let reply = match &assistant.stop {
+        Stop::EndTurn if text.is_empty() => "I finished, but the model returned no text.".to_owned(),
+        Stop::EndTurn => text,
+        Stop::MaxTokens => {
+            agent.say(turn::KIND_ERROR, "the model ran out of room mid-answer");
+            if text.is_empty() {
+                "The model ran out of room before it could answer.".to_owned()
+            } else {
+                format!("{text}\n\n(I ran out of room there.)")
+            }
+        }
+        Stop::Refusal => {
+            agent.say(turn::KIND_ERROR, "the model declined this request");
+            "The model declined this request.".to_owned()
+        }
+        Stop::ToolUse => {
+            // Cannot happen: a turn with tool calls loops instead. If it
+            // does, say so rather than inventing an answer.
+            "The model stopped mid-work.".to_owned()
+        }
+        Stop::Other(reason) => {
+            agent.say(turn::KIND_ERROR, &format!("the model stopped for a reason this agent does not know: {reason}"));
+            if text.is_empty() { format!("The turn ended ({reason}).") } else { text }
+        }
+    };
+    log("turn complete");
+    agent.finish(&reply);
+}
+
+// ---- the tools -------------------------------------------------------------------
+
+/// What the model may do, which is exactly what the agent surface offers: read
+/// the workspace, act on it by intent, and ask the workspace to open an
+/// application. The closed action vocabulary becomes a closed schema, which is
+/// the payoff of the whole design: the model cannot ask for anything the
+/// compositor would not police.
+fn tool_definitions() -> Vec<ToolDef> {
+    vec![
+        ToolDef {
+            name: "list_apps",
+            description: "List the applications open in this workspace, as markup naming \
+                          each app. Call this first, and again after open_app.",
+            schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
+        },
+        ToolDef {
+            name: "read_app",
+            description: "Read one open application's interface as reduced semantic \
+                          markup: every control's id, description, state, and the actions \
+                          it currently accepts. Read again after acting rather than \
+                          assuming a result.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "app": {"type": "string", "description": "The application's name as list_apps gave it"}
+                },
+                "required": ["app"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "act",
+            description: "Perform one action on one control, by id. The compositor brings \
+                          the app's window to the front itself, moves the visible cursor \
+                          to the control, and performs the action as a human would. The \
+                          result is done, or a rejection naming why.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "app": {"type": "string", "description": "The application's name"},
+                    "action": {
+                        "type": "string",
+                        "enum": ["focus", "click", "type-text", "clear", "submit", "check",
+                                 "uncheck", "toggle", "select", "deselect", "set-value",
+                                 "open", "close", "scroll-into-view"],
+                        "description": "What to do"
+                    },
+                    "target": {"type": "string", "description": "The control's id"},
+                    "value": {"type": "string", "description": "The text for type-text, or the number for set-value"}
+                },
+                "required": ["app", "action", "target"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "open_app",
+            description: "Ask the workspace to open an installed application, then wait \
+                          for it to appear. The result lists what is open afterwards.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "The application to open, e.g. awcalc, awfiles, awsettings"}
+                },
+                "required": ["name"],
+                "additionalProperties": false
+            }),
+        },
+    ]
+}
+
+/// Execute one tool call: the model's request becomes a query or an intent,
+/// and whatever comes back becomes the tool result, rejections included.
+fn run_tool(agent: &mut Agent, name: &str, input: &Value) -> (String, bool) {
+    let field = |key: &str| -> String {
+        match &input[key] {
+            Value::String(text) => text.clone(),
+            Value::Number(number) => number.to_string(),
+            _ => String::new(),
+        }
+    };
+
+    match name {
+        "list_apps" => {
+            agent.say(turn::KIND_ACTION, "reading what is open");
+            match agent.link.apps() {
+                Ok(markup) => (markup, false),
+                Err(err) => connection_lost(&err),
+            }
+        }
+        "read_app" => {
+            let app = field("app");
+            agent.say(turn::KIND_ACTION, &format!("reading {app}"));
+            match agent.link.view(&app) {
+                Ok(markup) if markup.is_empty() => {
+                    (format!("no view came back for {app:?}; is it open?"), true)
+                }
+                Ok(markup) => (markup, false),
+                Err(err) => connection_lost(&err),
+            }
+        }
+        "act" => {
+            let (app, action, target, value) = (field("app"), field("action"), field("target"), field("value"));
+            let outcome = match agent.link.act(&app, &action, &target, &value) {
+                Ok(outcome) => outcome,
+                Err(err) => return connection_lost(&err),
+            };
+            let told = if value.is_empty() {
+                format!("{action} {target} in {app}")
+            } else {
+                format!("{action} {value:?} into {target} in {app}")
+            };
+            match outcome {
+                Outcome::Done => {
+                    agent.say(turn::KIND_ACTION, &format!("{told}: done"));
+                    ("done".to_owned(), false)
+                }
+                Outcome::Rejected(reason) => {
+                    agent.say(turn::KIND_ACTION, &format!("{told}: {reason}"));
+                    // A rejection is an answer the model reasons about, not
+                    // an error: `blocked` says to look for the dialog,
+                    // `not-visible` says to scroll. is_error stays false.
+                    (format!("rejected: {reason}"), false)
+                }
+            }
+        }
+        "open_app" => {
+            let name = field("name");
+            agent.say(turn::KIND_ACTION, &format!("opening {name}"));
+            if let Err(err) = agent.desk.open_app(&name) {
+                return (format!("could not ask the workspace to open {name:?}: {err}"), true);
+            }
+            let waited = Instant::now();
+            loop {
+                std::thread::sleep(OPENING_POLL);
+                match agent.link.apps() {
+                    Ok(markup) if markup.contains(&name) => {
+                        agent.say(turn::KIND_RESULT, &format!("{name} is open"));
+                        return (format!("{name} is open. Open applications:\n{markup}"), false);
+                    }
+                    Ok(markup) if waited.elapsed() >= OPENING => {
+                        agent.say(turn::KIND_ERROR, &format!("{name} did not open"));
+                        return (
+                            format!(
+                                "{name} did not appear within {}s. Open applications:\n{markup}",
+                                OPENING.as_secs()
+                            ),
+                            true,
+                        );
+                    }
+                    Ok(_) => continue,
+                    Err(err) => return connection_lost(&err),
+                }
+            }
+        }
+        other => (format!("there is no tool named {other:?}"), true),
+    }
+}
+
+/// The compositor hung up. There is no screen left to act on, so the turn
+/// cannot mean anything more; exit rather than have the model reason about a
+/// workspace that is gone.
+fn connection_lost(err: &std::io::Error) -> (String, bool) {
+    log(&format!("the compositor connection failed: {err}"));
+    std::process::exit(1);
 }
 
 /// Log to the kernel ring buffer.

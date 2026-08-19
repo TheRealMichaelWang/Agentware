@@ -1,0 +1,163 @@
+//! The contract between the harness and a model backend.
+//!
+//! The boundary is deliberately one model exchange. The harness owns the
+//! agentic loop and both wires (the compositor link and the turn channel); a
+//! backend is only ever asked: given the conversation so far and the tool
+//! definitions, what does the model say next, streamed as it arrives. That
+//! keeps every backend from reimplementing the loop, and keeps everything
+//! Agentware-shaped (telemetry, intents, rejections) out of the code that
+//! speaks an API.
+//!
+//! A local backend later is one more implementation of [`Backend`] behind
+//! `backends::from_settings`, and the harness will not know the difference.
+
+use std::fmt;
+
+/// Who said a message. The two roles a Messages-shaped API accepts; the
+/// system prompt travels separately.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    User,
+    Assistant,
+}
+
+/// One piece of a message's content.
+///
+/// A conversation with tools is not plain text: an assistant turn may carry
+/// the model's reasoning and the calls it wants made, and the user turn that
+/// answers it carries the results. Thinking blocks are kept and sent back
+/// verbatim on later exchanges, signature included, because the API requires
+/// them unmodified within a turn's loop.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Block {
+    Text(String),
+    Thinking { text: String, signature: String },
+    /// Reasoning the API returns only in encrypted form. Carried back as-is.
+    RedactedThinking { data: String },
+    ToolUse { id: String, name: String, input: serde_json::Value },
+    ToolResult { id: String, content: String, is_error: bool },
+}
+
+/// One message of the conversation as a backend sees it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelMessage {
+    pub role: Role,
+    pub content: Vec<Block>,
+}
+
+impl ModelMessage {
+    pub fn user_text(text: &str) -> ModelMessage {
+        ModelMessage { role: Role::User, content: vec![Block::Text(text.to_owned())] }
+    }
+
+    pub fn assistant_text(text: &str) -> ModelMessage {
+        ModelMessage { role: Role::Assistant, content: vec![Block::Text(text.to_owned())] }
+    }
+}
+
+/// One tool the harness offers the model. The schema is JSON Schema, passed
+/// through to the API untouched.
+pub struct ToolDef {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub schema: serde_json::Value,
+}
+
+/// A piece of the response, delivered as it streams. The harness turns these
+/// into telemetry so the human watches the model work rather than a spinner.
+pub enum Delta {
+    /// A piece of the model's (summarized) reasoning.
+    Thinking(String),
+    /// A piece of the model's text. The harness deliberately does not speak
+    /// these as they stream, because whether the text is narration or the
+    /// reply is only known once the exchange completes; the payload is part
+    /// of the contract for a harness that decides otherwise.
+    Text(#[allow(dead_code)] String),
+    /// The model started composing a tool call, named. Its input follows in
+    /// the completed [`Assistant`]; this exists so a harness can say so
+    /// early, while the input is still streaming. This one flushes the
+    /// thinking buffer and leaves the name for the execution line that
+    /// follows moments later.
+    ToolCallStarted(#[allow(dead_code)] String),
+}
+
+/// Why the model stopped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Stop {
+    /// Finished answering. The text is the reply.
+    EndTurn,
+    /// Wants its tool calls executed and the results back.
+    ToolUse,
+    /// Ran out of output room mid-answer.
+    MaxTokens,
+    /// Declined to answer.
+    Refusal,
+    /// A stop this code does not know. Treated like an end of turn, reported
+    /// as what it was.
+    Other(String),
+}
+
+/// The completed assistant turn: everything the model said, and why it
+/// stopped saying it.
+#[derive(Debug)]
+pub struct Assistant {
+    pub content: Vec<Block>,
+    pub stop: Stop,
+}
+
+impl Assistant {
+    /// The turn's tool calls, in order.
+    pub fn tool_uses(&self) -> impl Iterator<Item = (&str, &str, &serde_json::Value)> {
+        self.content.iter().filter_map(|block| match block {
+            Block::ToolUse { id, name, input } => Some((id.as_str(), name.as_str(), input)),
+            _ => None,
+        })
+    }
+
+    /// The turn's text, joined. For a final turn this is the reply.
+    pub fn text(&self) -> String {
+        let mut out = String::new();
+        for block in &self.content {
+            if let Block::Text(text) = block {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(text);
+            }
+        }
+        out
+    }
+}
+
+/// What went wrong, in words meant for the pane: the human reads this, so
+/// "no API key is set: enter one in Settings, on the Agent page" beats an
+/// errno.
+#[derive(Debug)]
+pub struct BackendError {
+    pub message: String,
+}
+
+impl BackendError {
+    pub fn new(message: impl Into<String>) -> BackendError {
+        BackendError { message: message.into() }
+    }
+}
+
+impl fmt::Display for BackendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// One streamed model exchange. The whole of what a backend is.
+pub trait Backend {
+    /// Ask the model what comes next. Deltas stream through `on` as they
+    /// arrive; the returned [`Assistant`] is the completed turn.
+    fn respond(
+        &mut self,
+        system: &str,
+        messages: &[ModelMessage],
+        tools: &[ToolDef],
+        on: &mut dyn FnMut(Delta),
+    ) -> Result<Assistant, BackendError>;
+}

@@ -276,6 +276,35 @@ pub fn mount_state() {
     }
 }
 
+/// Point the resolver at a nameserver, and say whether there is a network.
+///
+/// The kernel configures the interface itself from the `ip=` boot argument
+/// (CONFIG_IP_PNP), so the supervisor holds no networking code; what the
+/// kernel cannot provide is `/etc/resolv.conf`, which is a userspace
+/// convention musl's resolver reads. Under QEMU's slirp the DNS proxy is
+/// always 10.0.2.3. The file lives on the initramfs root, deliberately: name
+/// resolution must not depend on the disk any more than PID 1 does.
+///
+/// The agent is the only process that talks to the outside; everything else
+/// on the machine still speaks only the sockets it was handed at spawn.
+pub fn configure_network() {
+    match count_matching("/sys/class/net", "eth") {
+        Some(n) if n > 0 => kinfo!("net: {n} interface(s); kernel autoconfiguration applies"),
+        _ => {
+            kwarn!("net: no interface; the agent will not reach a model");
+            return;
+        }
+    }
+    if let Err(err) = fs::create_dir_all("/etc") {
+        kwarn!("net: could not create /etc: {err}");
+        return;
+    }
+    match fs::write("/etc/resolv.conf", "nameserver 10.0.2.3\n") {
+        Ok(()) => kinfo!("net: wrote /etc/resolv.conf (nameserver 10.0.2.3)"),
+        Err(err) => kwarn!("net: could not write /etc/resolv.conf: {err}"),
+    }
+}
+
 /// One `key=value` from the kernel command line.
 fn kernel_arg(key: &str) -> Option<String> {
     let cmdline = fs::read_to_string("/proc/cmdline").ok()?;

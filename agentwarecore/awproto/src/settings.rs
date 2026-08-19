@@ -19,8 +19,26 @@
 //!   <time>
 //!     <utc-offset>+00:00</utc-offset>
 //!   </time>
+//!   <agent>
+//!     <anthropic-key>sk-ant-...</anthropic-key>
+//!   </agent>
 //! </settings>
 //! ```
+//!
+//! ## The agent
+//!
+//! The per-turn agent has a model behind it, and a model needs a key. The key
+//! is entered once, on the Settings app's Agent page, and read by every agent
+//! the broker forks from then on; like every other setting it crosses between
+//! processes as this file and nothing else. Which model answers is not here:
+//! that is chosen per agentdesk, in the pane, because it is a property of the
+//! conversation being had rather than of the machine having it. It is a secret, and the file is
+//! plain text on the state volume: that is the machine's own disk, the same
+//! place a browser keeps its cookies, and nothing here pretends otherwise.
+//! What the system does promise is that an agent never sees it back through
+//! the screen: a password field's value is masked in the agent's view by the
+//! compositor, so the one process that could echo the key to a model reads
+//! dots.
 //!
 //! ## Time
 //!
@@ -88,6 +106,11 @@ pub struct Settings {
     /// otherwise, which is the one honest default for a machine that cannot
     /// know where it is.
     pub utc_offset: i32,
+    /// The Anthropic API key the agent authenticates with. Empty until the
+    /// human enters one on the Agent settings page, and an agent asked to
+    /// work without one answers with where to set it rather than failing
+    /// mutely.
+    pub anthropic_key: String,
 }
 
 impl Default for Settings {
@@ -96,6 +119,7 @@ impl Default for Settings {
             wallpaper: Some(DEFAULT_WALLPAPER.to_owned()),
             theme: crate::theme::DEFAULT_THEME.to_owned(),
             utc_offset: 0,
+            anthropic_key: String::new(),
         }
     }
 }
@@ -147,10 +171,11 @@ impl Settings {
     pub fn to_xml(&self) -> String {
         let wallpaper = self.wallpaper.as_deref().unwrap_or(WALLPAPER_NONE);
         format!(
-            "<settings>\n  <desktop>\n    <wallpaper>{}</wallpaper>\n    <theme>{}</theme>\n  </desktop>\n  <time>\n    <utc-offset>{}</utc-offset>\n  </time>\n</settings>\n",
+            "<settings>\n  <desktop>\n    <wallpaper>{}</wallpaper>\n    <theme>{}</theme>\n  </desktop>\n  <time>\n    <utc-offset>{}</utc-offset>\n  </time>\n  <agent>\n    <anthropic-key>{}</anthropic-key>\n  </agent>\n</settings>\n",
             escape(wallpaper),
             escape(&self.theme),
             format_offset(self.utc_offset),
+            escape(&self.anthropic_key),
         )
     }
 }
@@ -282,7 +307,13 @@ fn parse(text: &str) -> Option<Settings> {
         .get("settings/time/utc-offset")
         .and_then(|text| parse_offset(text))
         .unwrap_or(0);
-    Some(Settings { wallpaper, theme, utc_offset })
+    // A file from before the agent had settings has no element: no key, which
+    // is what such a machine had anyway.
+    let anthropic_key = values
+        .get("settings/agent/anthropic-key")
+        .cloned()
+        .unwrap_or_default();
+    Some(Settings { wallpaper, theme, utc_offset, anthropic_key })
 }
 
 /// Every element's text, keyed by its path from the root, `a/b/c`. Elements
@@ -375,10 +406,18 @@ mod tests {
             wallpaper: Some("/pictures/a & b.png".into()),
             theme: "/themes/mine & yours.xml".into(),
             utc_offset: -300,
+            anthropic_key: "sk-ant-a&b<c>\"d\"".into(),
         };
         assert_eq!(parse(&settings.to_xml()), Some(settings));
         let none = Settings { wallpaper: None, utc_offset: 345, ..Settings::default() };
         assert_eq!(parse(&none.to_xml()), Some(none));
+    }
+
+    #[test]
+    fn key_defaults_empty() {
+        // A file from before the agent had settings simply has no key.
+        let old = "<settings><desktop><wallpaper>/x.svg</wallpaper></desktop></settings>";
+        assert_eq!(parse(old).unwrap().anthropic_key, "");
     }
 
     #[test]

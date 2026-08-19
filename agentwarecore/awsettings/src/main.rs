@@ -29,7 +29,8 @@ use awproto::settings::{self, Settings as Stored};
 use awproto::theme;
 
 /// The categories down the rail.
-const CATEGORIES: &[(&str, &str)] = &[("desktop", "Desktop"), ("time", "Time")];
+const CATEGORIES: &[(&str, &str)] =
+    &[("desktop", "Desktop"), ("time", "Time"), ("agent", "Agent")];
 
 /// The dropdown's option for opening the file dialog.
 const CHOOSE: &str = "choose";
@@ -47,6 +48,12 @@ struct Settings {
     theme: String,
     /// The time zone, as minutes east of UTC.
     utc_offset: i32,
+    /// The Anthropic API key as saved, so the page can say whether one is set.
+    key: String,
+    /// The key as typed but not yet saved. A password is committed on Enter
+    /// or the Save button, not per keystroke: half a pasted key is not a key,
+    /// and every save is a synced write to the state volume.
+    key_edit: String,
     /// When the settings file was last read, so a change made elsewhere is
     /// picked up before the next render rather than overwritten.
     seen: Option<SystemTime>,
@@ -76,6 +83,8 @@ fn main() {
         themes: theme::themes(),
         theme: stored.theme,
         utc_offset: stored.utc_offset,
+        key: stored.anthropic_key.clone(),
+        key_edit: stored.anthropic_key,
         seen: settings::modified(),
         open: false,
         theme_open: false,
@@ -127,6 +136,12 @@ impl Settings {
             self.current = stored.wallpaper;
             self.theme = stored.theme;
             self.utc_offset = stored.utc_offset;
+            // A half-typed key survives an external change to the file; a
+            // box that was showing the saved key follows it.
+            if self.key_edit == self.key {
+                self.key_edit = stored.anthropic_key.clone();
+            }
+            self.key = stored.anthropic_key;
         }
 
         // The dialog first: it owns its ids and ignores the rest.
@@ -210,6 +225,13 @@ impl Settings {
                 log(&self.status);
             }
 
+            // The key is typed (or pasted through the compositor's caret) and
+            // committed as one save, Enter or the button alike.
+            ("api-key", display::ACTION_TYPE_TEXT) => self.key_edit = event.value.clone(),
+            ("api-key", display::ACTION_SUBMIT) | ("api-key-save", display::ACTION_CLICK) => {
+                self.save_key()
+            }
+
             (target, display::ACTION_CLICK) if target.starts_with("category-") => {
                 let name = &target["category-".len()..];
                 if let Some((id, _)) = CATEGORIES.iter().find(|(id, _)| *id == name) {
@@ -263,6 +285,31 @@ impl Settings {
         log(&self.status);
     }
 
+    /// Save the key as typed. An emptied box clears it, which is how a key is
+    /// revoked from the machine's side.
+    fn save_key(&mut self) {
+        let key = self.key_edit.trim().to_owned();
+        let mut stored = Stored::load();
+        stored.anthropic_key = key.clone();
+        match stored.save() {
+            Ok(()) => {
+                self.status = if key.is_empty() {
+                    "API key cleared".to_owned()
+                } else {
+                    format!("API key saved ({} characters)", key.chars().count())
+                };
+                if !settings::persistent() {
+                    self.status.push_str(" (no state volume: kept until power off)");
+                }
+                self.key = key.clone();
+                self.key_edit = key;
+                self.seen = settings::modified();
+            }
+            Err(err) => self.status = format!("could not save the setting: {err}"),
+        }
+        log(&self.status);
+    }
+
     /// Whether the current theme is one of the shipped ones.
     fn theme_is_default(&self) -> bool {
         self.themes.iter().any(|(_, path)| *path == self.theme)
@@ -284,6 +331,7 @@ impl Settings {
         match self.category {
             "desktop" => self.render_desktop(&mut out),
             "time" => self.render_time(&mut out),
+            "agent" => self.render_agent(&mut out),
             _ => out.push_str("        <text color=\"muted\">Nothing here yet.</text>\n"),
         }
         out.push_str("      </vstack>\n    </scroll>\n");
@@ -441,6 +489,45 @@ impl Settings {
             );
         }
         out.push_str("              </list>\n            </scroll>\n          </vstack>\n        </group>\n");
+        if !self.status.is_empty() {
+            let _ = writeln!(out, r#"        <text role="caption" color="muted">{}</text>"#, escape(&self.status));
+        }
+    }
+
+    /// The Agent page: the key the agent authenticates with. Which model
+    /// answers is not a machine setting: it is chosen per agentdesk, in the
+    /// pane, beside the conversation it applies to.
+    ///
+    /// The key is a password field, so the compositor masks it on screen and
+    /// in every agent's view alike; this window only ever learns what was
+    /// typed, and says whether a key is set rather than what it is. Committed
+    /// on Enter or the Save button rather than per keystroke, because every
+    /// save is a synced write to the state volume and half a pasted key is
+    /// not a key.
+    fn render_agent(&self, out: &mut String) {
+        out.push_str("        <text role=\"heading\">Agent</text>\n");
+
+        out.push_str("        <group label=\"Anthropic API key\">\n          <vstack gap=\"sm\">\n");
+        let _ = writeln!(
+            out,
+            r#"            <hstack gap="sm">
+              <field id="api-key" kind="password" value="{value}" placeholder="sk-ant-..." description="The Anthropic API key the agent authenticates with. Typed here, saved with the Save button or Enter"/>
+              <button id="api-key-save" label="Save" emphasis="primary" description="Saves the API key as typed; an emptied box clears it"/>
+            </hstack>"#,
+            value = escape(&self.key_edit),
+        );
+        let standing = if self.key.is_empty() {
+            "No key is set: the agent will answer that it cannot reach a model.".to_owned()
+        } else {
+            format!("A key is set ({} characters).", self.key.chars().count())
+        };
+        let _ = writeln!(out, r#"            <text role="caption" color="muted">{}</text>"#, escape(&standing));
+        let _ = writeln!(
+            out,
+            r#"            <text role="caption" color="muted">Which model answers is chosen in each agentdesk's pane.</text>"#
+        );
+        out.push_str("          </vstack>\n        </group>\n");
+
         if !self.status.is_empty() {
             let _ = writeln!(out, r#"        <text role="caption" color="muted">{}</text>"#, escape(&self.status));
         }

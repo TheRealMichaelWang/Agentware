@@ -1,0 +1,12 @@
+# The one C compiler the workspace needs, and why.
+#
+# Everything here is Rust except ring's crypto primitives, which awagent pulls
+# in through rustls to speak TLS to a model API. ring compiles a handful of
+# self-contained C and assembly files, and cc-rs looks for a musl cross
+# compiler (`x86_64-linux-musl-gcc`) that most hosts do not have. The host
+# gcc compiles those files correctly for this target: they are freestanding
+# apart from memcpy-and-friends, which musl provides at link time. Overridden
+# by setting the same variable in the environment, if a machine has a real
+# cross toolchain.
+[env]
+CC_x86_64_unknown_linux_musl = "gcc"

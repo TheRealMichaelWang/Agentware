@@ -51,11 +51,21 @@ DISPLAY_H ?= 1440
 # The selftest adds the flag itself, because there QEMU exiting is the point.
 # The system image is the first drive, so it is /dev/vda; the state volume,
 # where a target attaches it, is the second and therefore /dev/vdb.
+# The NIC is slirp user networking: unprivileged, outbound only, with QEMU
+# itself as the gateway at 10.0.2.2 and its DNS proxy at 10.0.2.3. The agent
+# is the one thing on the machine that talks to the outside; the kernel
+# configures the interface itself from the ip= boot argument below, so no
+# process in the userland holds any networking code.
 QEMU := qemu-system-x86_64 -enable-kvm -m 4G -cpu host \
 	-kernel $(KERNEL) -initrd $(INITRAMFS) \
 	-drive file=$(SYSTEM_IMG),if=virtio,format=raw \
 	-device virtio-vga,xres=$(DISPLAY_W),yres=$(DISPLAY_H) \
-	-device virtio-tablet-pci
+	-device virtio-tablet-pci \
+	-netdev user,id=net0 -device virtio-net-pci,netdev=net0
+
+# The kernel's own IP autoconfiguration (CONFIG_IP_PNP), with slirp's fixed
+# addresses. Static rather than DHCP, so boot does not wait on a lease.
+NET_ARGS := ip=10.0.2.15::10.0.2.2:255.255.255.0:agentware:eth0:off
 
 # The state volume: the one thing that outlives a boot. A small ext4 image the
 # supervisor mounts at /state, where settings.xml lives. Made once, kept across
@@ -144,8 +154,8 @@ pack: build
 	# image cannot boot it.
 	rm -f $(FS_DIR)/bin/awapp
 	cp $(BIN_DIR)/agentdesk $(FS_DIR)/bin/agentdesk
-	# The per-turn worker, forked on the agentdesk's request. A scripted
-	# stand-in until an agent with a model behind it exists.
+	# The per-turn worker, forked on the agentdesk's request: the agent,
+	# with a model behind it, authenticated by the key in Settings.
 	cp $(BIN_DIR)/awagent $(FS_DIR)/bin/awagent
 
 	# 3b. Applications. An app is a folder, not a binary: /apps/<name>/ holds
@@ -216,15 +226,10 @@ $(STATE_IMG):
 	mkfs.ext4 -q -F -L agentware-state $(STATE_IMG)
 
 # Boot QEMU (depends on 'pack' being finished)
-#
-# agentware.demo is on the command line because no agent with a model behind
-# it exists yet: it substitutes a scripted one, so a message sent from a
-# workspace runs a turn on the calculator. Without it the same message is
-# answered with an error. Either way the machine boots to one blank agentdesk.
 run: pack $(STATE_IMG)
 	@echo "==> Booting Agentware fullscreen: guest $(DISPLAY_W)x$(DISPLAY_H), host desktop $(if $(HOST_PX),$(HOST_PX),unknown). Ctrl+Alt+F to un-fullscreen."
 	$(QEMU) $(STATE_DRIVE) -display gtk,zoom-to-fit=on,full-screen=on,show-cursor=off -serial stdio \
-		-append "console=tty0 console=ttyS0,115200 agentware.demo"
+		-append "console=tty0 console=ttyS0,115200 $(NET_ARGS)"
 
 # Headless boot that exercises the supervisor end to end and powers itself off.
 #

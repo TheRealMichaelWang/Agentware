@@ -113,6 +113,14 @@ struct Desk {
     history: Vec<Message>,
     /// The message being composed.
     composing: String,
+    /// Which of the backend configurations this desk's turns run with. Chosen
+    /// in the pane, per workspace, because which model answers is a property
+    /// of the conversation; the key that authenticates it is the machine's
+    /// and lives in settings. Read when a turn starts, so changing it
+    /// mid-turn applies to the next one.
+    backend: &'static turn::BackendConfig,
+    /// Whether the backend dropdown is showing its options.
+    backend_open: bool,
     /// Messages sent while a turn was running. They start the next one.
     queued: Vec<String>,
     turn: Option<Running>,
@@ -242,6 +250,9 @@ impl Desk {
             lines: Vec::new(),
             history: Vec::new(),
             composing: String::new(),
+            backend: turn::backend_config(turn::DEFAULT_BACKEND)
+                .unwrap_or(&turn::BACKENDS[0]),
+            backend_open: false,
             queued: Vec::new(),
             turn: None,
             status: "ready".into(),
@@ -337,7 +348,7 @@ impl Desk {
         match self.ask(|broker| broker.start_agent(desk)) {
             Ok((pid, stream)) => match Channel::new(stream) {
                 Ok(mut channel) => {
-                    if let Err(err) = channel.send_context(&self.history, &prompt) {
+                    if let Err(err) = channel.send_context(&self.history, &prompt, self.backend.id) {
                         self.status = format!("could not brief the agent: {err}");
                         self.note(self.status.clone());
                         log(&self.status);
@@ -526,6 +537,26 @@ impl Desk {
                 self.submit(text);
             }
 
+            // The backend selector. Chrome an agent cannot see, so an agent
+            // is told what it runs as and can never change it. A choice made
+            // while a turn runs applies from the next turn; the selector
+            // stays live for the same reason the chat input does.
+            ("backend", display::ACTION_OPEN) => self.backend_open = true,
+            ("backend", display::ACTION_CLOSE) => self.backend_open = false,
+            (target, display::ACTION_SELECT) if target.starts_with("backend-") => {
+                self.backend_open = false;
+                if let Some(config) = target["backend-".len()..]
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|index| turn::BACKENDS.get(index))
+                    && config.id != self.backend.id
+                {
+                    self.backend = config;
+                    self.status = format!("next turn runs {}", config.label);
+                    log(&format!("desk {}: {}", self.id, self.status));
+                }
+            }
+
             _ => return false,
         }
         true
@@ -568,16 +599,38 @@ impl Desk {
             date = escape(&date_text(self.utc_offset)),
         );
 
-        // The pane. The transcript, and the field that adds to it.
+        // The pane. The transcript, the field that adds to it, and the
+        // backend selector: which model answers is chosen here, beside the
+        // conversation it applies to, and an agent never sees the control
+        // because the pane is chrome.
         let _ = write!(
             out,
             r#"  <vstack region="pane" gap="sm">
     <text role="subheading">Conversation</text>
     <text role="caption" color="muted">{status}</text>
+    <select id="backend" value="{value}"{open} description="Chooses the model that answers in this agentdesk. A change applies from the next turn">
+"#,
+            status = escape(&self.status),
+            value = turn::BACKENDS
+                .iter()
+                .position(|config| config.id == self.backend.id)
+                .unwrap_or(0),
+            open = if self.backend_open { r#" open="true""# } else { "" },
+        );
+        for (index, config) in turn::BACKENDS.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                r#"      <option id="backend-{index}" label="{label}" value="{index}"{selected} description="Runs this agentdesk's turns as {label}"/>"#,
+                label = config.label,
+                selected = if config.id == self.backend.id { r#" selected="true""# } else { "" },
+            );
+        }
+        let _ = write!(
+            out,
+            r#"    </select>
     <scroll grow="true" anchor="end">
       <vstack gap="sm">
 "#,
-            status = escape(&self.status),
         );
         if self.lines.is_empty() {
             out.push_str(

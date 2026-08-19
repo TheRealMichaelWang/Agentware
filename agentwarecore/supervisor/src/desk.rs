@@ -60,7 +60,7 @@ impl Programs {
     pub fn system() -> Self {
         Self {
             desk: ("/bin/agentdesk".into(), vec![]),
-            agent: ("/bin/agent".into(), vec![]),
+            agent: ("/bin/awagent".into(), vec![]),
             app_dir: "/apps".into(),
         }
     }

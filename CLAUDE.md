@@ -32,7 +32,10 @@ agentwarecore/          cargo workspace
     assets/             the Agentware mark, compiled in
   agentdesk/            the workspace process: conversation, turns, taskbar clock
   awsettings/           the settings app (a first-party app that edits system state)
-  awagent/              stand-in per-turn worker: scripted, speaks both channels
+  awagent/              the per-turn agent: the harness owning the agentic
+                        loop and both channels, a Backend trait that is one
+                        streamed model exchange, and backends/claude.rs
+                        speaking the Anthropic API over rustls
 agentwareapps/          cargo workspace: first-party applications
   awcalc/               a calculator, the first real application
   awfiles/              a file explorer, and where the shared dialogs are seen
@@ -136,7 +139,7 @@ reports paint/blit cost while frames are produced):
   paint fell from 14ms avg / 34ms worst to 7.1ms avg / 14ms worst.
 
 **Nothing is left of the original plan.** What is missing now is not
-compositor work: a real `agent` with a model behind it, and more applications.
+compositor work: more applications, and more backends behind the agent.
 
 **Milestone 10: the real agentdesk.** `agentdesk/` is the workspace process
 ARCHITECTURE.md always described, and `awapp` is gone. It owns the
@@ -148,11 +151,10 @@ drop it on the floor), streaming history and the prompt down it, and reading
 telemetry back up. The turn ends when the channel hangs up, whether the agent
 finished, died or was stopped, so every ending is one code path. A message
 sent mid-turn is queued and starts the next turn the moment this one ends.
-The wire is `awproto::turn`: `history`/`prompt` down; `telemetry`, `open-app`
-and `reply` up. `open-app` is how an agent opens an application: it asks the
-workspace, which asks PID 1, and finds out whether it worked by asking the
-compositor what is open. `awagent` speaks it now, so the demo turn is watched
-in the pane rather than in the kernel log.
+The wire is `awproto::turn`: `backend`/`history`/`prompt` down; `telemetry`,
+`open-app` and `reply` up. `open-app` is how an agent opens an application:
+it asks the workspace, which asks PID 1, and finds out whether it worked by
+asking the compositor what is open.
 
 The start menu is a panel, not a process (`haimanager/src/startmenu.rs`).
 The Agentware mark at the left end of the taskbar opens it, centred over the
@@ -305,12 +307,51 @@ tiny-skia scratch version measurably doubled paint time on a maximized window
 full of buttons. Measured after: drag paint 3-6.5ms avg at 2560x1440, agent
 turn repaints 5-6.8ms avg at 1600x1000.
 
-No `agent` exists yet. `Programs::system` names `/bin/agent`; without
-`agentware.demo` a message sent from a desk gets "could not start an agent"
-in the pane and the log, and everything else works. With it, `awagent` stands
-in and answers any message by adding 12 and 34 on the calculator. Either way
-the machine boots to one blank agentdesk, no prompt, and closing the last
-agentdesk opens a blank one, so there is never a display with nothing on it.
+**The agent is real.** `awagent` is the per-turn worker with a model behind
+it; the scripted stand-in and the `agentware.demo` flag it needed are gone,
+and `Programs::system` names `/bin/awagent`. The harness in `main.rs` owns
+the agentic loop and both wires: context down the turn channel, the
+conversation to the model through a `Backend` trait whose whole contract is
+one streamed exchange, and every tool call executed over the compositor link
+as intents. The model gets four tools that map one to one onto the agent
+surface: `list_apps`, `read_app`, `act` (the fourteen-verb vocabulary as an
+enum), and `open_app` (up the turn channel, then polling `apps()` until the
+app appears). A rejection (`blocked`, `disabled`, `not-visible`) goes back as
+a tool result for the model to reason about, which is rejections-as-answers
+carried one level up. Thinking streams into the pane as `thought` telemetry
+a line at a time, narration between tool calls as `result` lines, every act
+as an `action` line with its outcome, and the model's final message, the one
+with no tool calls, is the reply. `backends/claude.rs` speaks the Anthropic
+Messages API: raw HTTPS over rustls with the ring provider and webpki's CA
+bundle compiled in (`http.rs` is the whole client: HTTP/1.1, chunked
+transfer, SSE), streaming, adaptive thinking with summarized display, the
+system prompt as a cached prefix, and bounded retries for what retrying can
+fix. The awagent crate carries the only network dependencies in the system;
+PID 1 and awproto stay dependency-free.
+
+**Which model answers is chosen in the pane.** The turn wire's `backend`
+message names one of the configurations in `awproto::turn::BACKENDS` (label,
+backend, model: three Claude models today), a dropdown the agentdesk draws at
+the top of its pane. Per workspace, deliberately: which model answers is a
+property of the conversation being had, and the selector is desk chrome, so
+an agent is told what it runs as and can never see or change the control. A
+change applies from the next turn. The API key is the machine's: entered on
+the Settings app's Agent page (a `kind="password"` field, committed on Enter
+or Save), stored as `<agent><anthropic-key>` in `settings.xml`, and read by
+the agent at each turn. The compositor masks a password field's `value` in
+the agent view exactly as it does on screen, so the one process that could
+echo the key to a model reads asterisks; a turn without a key answers with
+where to set one.
+
+**The guest has a network, for the agent alone.** QEMU adds a slirp NIC
+(`-netdev user`), the kernel configures it itself from the `ip=` boot
+argument (CONFIG_IP_PNP and CONFIG_VIRTIO_NET were already in the config),
+and the supervisor's one contribution is `/etc/resolv.conf` naming slirp's
+DNS at 10.0.2.3, written at boot onto the initramfs root and reported
+boot_report style. No process in the userland holds networking code except
+the agent. Either way the machine boots to one blank agentdesk, no prompt,
+and closing the last agentdesk opens a blank one, so there is never a
+display with nothing on it.
 
 ## Building and running
 
@@ -388,14 +429,18 @@ guest, optionally injects input through the QEMU monitor, captures the
 framebuffer and writes a PNG, which can then be viewed directly.
 
 ```
-tools/screenshot.py out.png --seconds 8 --append "console=ttyS0,115200 agentware.demo" \
+tools/screenshot.py out.png --seconds 8 --append "console=ttyS0,115200" \
   --do "mouse_move 150 -120" --do "mouse_button 1" --do "mouse_button 0" \
   --do "sendkey h" --do "sendkey shift-l" --do "mouse_move 0 0 -1"
 ```
 
-The `--append` matters: without `agentware.demo` there is no agent to answer a
-message, so a turn cannot be photographed; the desk itself is there either way. The pointer starts in the middle of the screen and every move is a
-delta from where it is now.
+The tool adds the slirp NIC and the `ip=` boot argument itself, so a capture
+has the same network `make run` has. Photographing a real agent turn needs an
+API key in the state image's `settings.xml` (write one into a copy with
+`debugfs -w` rather than typing it through the monitor); without one, a
+message is answered with where to set the key, which photographs fine. The
+pointer starts in the middle of the screen and every move is a delta from
+where it is now.
 
 Use it. Every rendering bug so far was found this way and none would have been
 found any other way: a black screen where every ioctl reported success, four
@@ -502,6 +547,12 @@ is the list so it does not get relitigated.
 * **The agent opens applications through its agentdesk**, never itself. It has
   no broker connection; `open-app` up the turn channel is a request, and the
   agent learns the outcome by asking the compositor what is open.
+* **The key is the machine's; the model is the conversation's.** The API key
+  lives in `settings.xml`, entered once on the Settings app's Agent page.
+  Which backend configuration answers is chosen per agentdesk in the pane,
+  from the one table in `awproto::turn`, and travels to the agent as the
+  `backend` message on the turn channel. The selector is desk chrome, so an
+  agent is told what it runs as and can never see or change the control.
 * **A dialog belongs to the application's tree**, never to a separate process
   or to chrome, so the agent sees it in the app's view as controls nested in
   `<dialog>`. The compositor makes it modal for human and agent alike; there

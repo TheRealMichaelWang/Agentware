@@ -8,6 +8,7 @@
 //! own mount namespace later without losing its conversation.
 //!
 //! ```text
+//!   backend   <id>               agentdesk -> agent, which configuration to run
 //!   history   <role> <text>      agentdesk -> agent, once per earlier message
 //!   prompt    <text>             agentdesk -> agent, the message that starts the turn
 //!
@@ -17,7 +18,15 @@
 //! ```
 //!
 //! The context goes down first, in order, and `prompt` closes it: an agent reads
-//! until it has the prompt and only then acts. Telemetry is anything the human
+//! until it has the prompt and only then acts.
+//!
+//! `backend` names which of the configurations in [`BACKENDS`] the turn runs
+//! with. The choice is the human's, made in the agentdesk's own pane, which is
+//! chrome an agent cannot see or act on: an agent is told what it runs as and
+//! cannot change it, the same way it is never asked which workspace it is in.
+//! Per turn rather than per machine, because which model answers is a property
+//! of the conversation being had, not of the machine having it; the key that
+//! authenticates it is the machine's and lives in settings. Telemetry is anything the human
 //! should see while the turn runs, in the words the agent chooses: a thought, an
 //! action it is about to take, the result of one, an error. The reply is the
 //! turn's message back to the human. After sending it the agent exits, and the
@@ -40,11 +49,62 @@ use std::os::unix::net::UnixStream;
 
 use crate::{DESK_FD_ENV, Decoder, encode};
 
+pub const MSG_BACKEND: &str = "backend";
 pub const MSG_HISTORY: &str = "history";
 pub const MSG_PROMPT: &str = "prompt";
 pub const MSG_TELEMETRY: &str = "telemetry";
 pub const MSG_OPEN_APP: &str = "open-app";
 pub const MSG_REPLY: &str = "reply";
+
+/// One way the agent can be run: a backend, and the model it asks that
+/// backend for. What the agentdesk's selector lists and what a turn names.
+///
+/// Several configurations share one backend: the three Claude models are one
+/// implementation asked for three different things. The table lives here
+/// because it is part of the turn contract: the agentdesk offers exactly
+/// these, and the agent resolves the id it is handed against the same list,
+/// so the two cannot drift.
+pub struct BackendConfig {
+    /// What travels on the wire and names the choice.
+    pub id: &'static str,
+    /// What the human sees in the selector.
+    pub label: &'static str,
+    /// Which implementation runs it. `claude` is the only one so far; a local
+    /// model is a new name here and a new match arm in the agent.
+    pub backend: &'static str,
+    /// The model that backend is asked for.
+    pub model: &'static str,
+}
+
+/// Every configuration an agentdesk offers, in the order shown.
+pub const BACKENDS: &[BackendConfig] = &[
+    BackendConfig {
+        id: "claude-opus-5",
+        label: "Claude Opus 5",
+        backend: "claude",
+        model: "claude-opus-5",
+    },
+    BackendConfig {
+        id: "claude-sonnet-5",
+        label: "Claude Sonnet 5",
+        backend: "claude",
+        model: "claude-sonnet-5",
+    },
+    BackendConfig {
+        id: "claude-haiku-4-5",
+        label: "Claude Haiku 4.5",
+        backend: "claude",
+        model: "claude-haiku-4-5",
+    },
+];
+
+/// What a fresh agentdesk runs until told otherwise.
+pub const DEFAULT_BACKEND: &str = "claude-opus-5";
+
+/// The configuration an id names, if it is one from the table.
+pub fn backend_config(id: &str) -> Option<&'static BackendConfig> {
+    BACKENDS.iter().find(|config| config.id == id)
+}
 
 /// Who said a line of the conversation.
 pub const ROLE_HUMAN: &str = "human";
@@ -68,6 +128,17 @@ pub const MAX_FRAME: usize = 256 * 1024;
 pub struct Message {
     pub role: String,
     pub text: String,
+}
+
+/// Everything a turn starts with, as read off the channel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Context {
+    pub history: Vec<Message>,
+    /// The message that starts the turn.
+    pub prompt: String,
+    /// The id of the configuration to run with; [`DEFAULT_BACKEND`] if the
+    /// agentdesk did not say.
+    pub backend: String,
 }
 
 /// Something the agent sent up while working.
@@ -113,19 +184,29 @@ impl Turn {
         Ok(Turn { stream, decoder: Decoder::with_limit(MAX_FRAME) })
     }
 
-    /// Block until the whole context has arrived: every earlier message, then
-    /// the prompt that starts this turn.
-    pub fn context(&mut self) -> io::Result<(Vec<Message>, String)> {
+    /// Block until the whole context has arrived: the configuration to run
+    /// with, every earlier message, then the prompt that starts this turn.
+    pub fn context(&mut self) -> io::Result<Context> {
         let mut history = Vec::new();
+        let mut backend = DEFAULT_BACKEND.to_owned();
         loop {
             let fields = self.next_frame()?;
             match fields.first().map(String::as_str) {
+                Some(MSG_BACKEND) => {
+                    if let Some(id) = fields.get(1) {
+                        backend = id.clone();
+                    }
+                }
                 Some(MSG_HISTORY) => history.push(Message {
                     role: fields.get(1).cloned().unwrap_or_default(),
                     text: fields.get(2).cloned().unwrap_or_default(),
                 }),
                 Some(MSG_PROMPT) => {
-                    return Ok((history, fields.get(1).cloned().unwrap_or_default()));
+                    return Ok(Context {
+                        history,
+                        prompt: fields.get(1).cloned().unwrap_or_default(),
+                        backend,
+                    });
                 }
                 // Something a future agentdesk says that this agent does not
                 // know. Skipped rather than fatal, for the usual reason.
@@ -186,14 +267,16 @@ impl Channel {
         Ok(Channel { stream, decoder: Decoder::with_limit(MAX_FRAME) })
     }
 
-    /// Send the whole context: every earlier message, then the prompt.
+    /// Send the whole context: the configuration to run with, every earlier
+    /// message, then the prompt.
     ///
     /// Written in one go. The frames are small next to a socket buffer, and an
     /// agent that has not read its context yet is one that has not started
     /// doing anything, so a full buffer here would mean an agent that never
     /// started at all, which the write error reports.
-    pub fn send_context(&mut self, history: &[Message], prompt: &str) -> io::Result<()> {
+    pub fn send_context(&mut self, history: &[Message], prompt: &str, backend: &str) -> io::Result<()> {
         let mut bytes = Vec::new();
+        bytes.extend(encode(&[MSG_BACKEND, backend]));
         for message in history {
             bytes.extend(encode(&[MSG_HISTORY, &message.role, &message.text]));
         }

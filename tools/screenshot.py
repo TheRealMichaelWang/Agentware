@@ -48,6 +48,9 @@ def qemu(monitor_path, qmp_path, serial_path, append, width, height, state, keep
             # The same absolute pointing device the interactive window has, so
             # what the tool exercises is what the human uses.
             "-device", "virtio-tablet-pci",
+            # The same slirp NIC `make run` has, so an agent turn can reach a
+            # model from inside a capture too.
+            "-netdev", "user,id=net0", "-device", "virtio-net-pci,netdev=net0",
             "-no-reboot",
             "-display", "none",
             "-serial", "file:" + serial_path,
@@ -212,7 +215,10 @@ def main():
     ppm_path = os.path.join(workdir, "screen.ppm")
     serial_path = args.serial or os.path.join(workdir, "serial.log")
 
-    guest = qemu(monitor_path, qmp_path, serial_path, args.append, args.width, args.height,
+    # The kernel configures the slirp NIC itself, exactly as `make run` has it.
+    append = args.append + " ip=10.0.2.15::10.0.2.2:255.255.255.0:agentware:eth0:off"
+
+    guest = qemu(monitor_path, qmp_path, serial_path, append, args.width, args.height,
                  args.state, args.keep_state)
     try:
         time.sleep(args.seconds)

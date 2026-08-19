@@ -605,9 +605,19 @@ fn emit(tree: &Tree, index: usize, depth: usize, out: &mut String) {
     if let Some(alt) = node.attr("alt") {
         attrs.push_str(&format!(" alt=\"{alt}\""));
     }
+    // A password's value is masked here exactly as it is on screen: the agent
+    // reads the same dots the human sees, never the contents. Without this the
+    // API key entered in Settings would be readable by the very agent it
+    // authenticates, through the view of any app that renders it.
+    let password = node.attr("kind") == Some("password");
     for state in ["value", "checked", "selected", "open", "invalid", "busy"] {
         if let Some(value) = node.attr(state) {
-            attrs.push_str(&format!(" {state}=\"{value}\""));
+            if password && state == "value" {
+                let masked = "*".repeat(value.chars().count());
+                attrs.push_str(&format!(" value=\"{masked}\""));
+            } else {
+                attrs.push_str(&format!(" {state}=\"{value}\""));
+            }
         }
     }
     if node.disabled() {
@@ -638,4 +648,28 @@ fn emit(tree: &Tree, index: usize, depth: usize, out: &mut String) {
         emit(tree, child, depth + 1, out);
     }
     out.push_str(&format!("{pad}</{name}>\n"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// docs/UIElements.md: a password field reports its value as a masked
+    /// placeholder in the agent's view, never the contents. The same rule the
+    /// paint path applies, kept here because the API key entered in Settings
+    /// travels through exactly this view.
+    #[test]
+    fn passwords_are_masked_in_the_agent_view() {
+        let tree = parse(
+            r#"<window title="Settings">
+                 <field id="api-key" kind="password" value="sk-ant-secret" description="The key"/>
+                 <field id="name" value="plain" description="A name"/>
+               </window>"#,
+        )
+        .unwrap();
+        let view = agent_view(&tree, "awsettings", 1);
+        assert!(!view.contains("sk-ant-secret"), "the secret leaked: {view}");
+        assert!(view.contains("value=\"*************\""), "no mask: {view}");
+        assert!(view.contains("value=\"plain\""), "a plain field kept its value: {view}");
+    }
 }
