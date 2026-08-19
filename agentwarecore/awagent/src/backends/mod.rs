@@ -24,15 +24,15 @@ pub fn from_config(id: &str, settings: &Settings) -> Result<Box<dyn Backend>, St
     };
     match config.backend {
         "claude" => {
-            let key = settings.anthropic_key.trim();
-            if key.is_empty() {
+            // The type carries the guarantee: a `Some` key is never empty.
+            let Some(key) = &settings.anthropic_key else {
                 return Err(
                     "no Anthropic API key is set. Open Settings, choose the Agent page, \
                      enter a key, and send the message again"
                         .to_owned(),
                 );
-            }
-            Ok(Box::new(claude::Claude::new(key.to_owned(), config.model.to_owned())))
+            };
+            Ok(Box::new(claude::Claude::new(key.clone(), config.model.to_owned())))
         }
         other => Err(format!("the {other} backend is not built yet")),
     }

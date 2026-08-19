@@ -106,11 +106,13 @@ pub struct Settings {
     /// otherwise, which is the one honest default for a machine that cannot
     /// know where it is.
     pub utc_offset: i32,
-    /// The Anthropic API key the agent authenticates with. Empty until the
-    /// human enters one on the Agent settings page, and an agent asked to
-    /// work without one answers with where to set it rather than failing
+    /// The Anthropic API key the agent authenticates with, or `None` until
+    /// the human enters one on the Agent settings page. `None` rather than an
+    /// empty string, so "is there a key" is a question the type answers and
+    /// no caller can forget to ask; a `Some` is never empty. An agent asked
+    /// to work without one answers with where to set it rather than failing
     /// mutely.
-    pub anthropic_key: String,
+    pub anthropic_key: Option<String>,
 }
 
 impl Default for Settings {
@@ -119,7 +121,7 @@ impl Default for Settings {
             wallpaper: Some(DEFAULT_WALLPAPER.to_owned()),
             theme: crate::theme::DEFAULT_THEME.to_owned(),
             utc_offset: 0,
-            anthropic_key: String::new(),
+            anthropic_key: None,
         }
     }
 }
@@ -175,7 +177,7 @@ impl Settings {
             escape(wallpaper),
             escape(&self.theme),
             format_offset(self.utc_offset),
-            escape(&self.anthropic_key),
+            escape(self.anthropic_key.as_deref().unwrap_or("")),
         )
     }
 }
@@ -307,12 +309,15 @@ fn parse(text: &str) -> Option<Settings> {
         .get("settings/time/utc-offset")
         .and_then(|text| parse_offset(text))
         .unwrap_or(0);
-    // A file from before the agent had settings has no element: no key, which
-    // is what such a machine had anyway.
+    // A file from before the agent had settings has no element, and a cleared
+    // key writes an empty one; both read back as no key at all. Whitespace is
+    // not a key either, so a hand edit that leaves a stray space cannot make
+    // `Some` mean nothing.
     let anthropic_key = values
         .get("settings/agent/anthropic-key")
-        .cloned()
-        .unwrap_or_default();
+        .map(|text| text.trim())
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned);
     Some(Settings { wallpaper, theme, utc_offset, anthropic_key })
 }
 
@@ -406,7 +411,7 @@ mod tests {
             wallpaper: Some("/pictures/a & b.png".into()),
             theme: "/themes/mine & yours.xml".into(),
             utc_offset: -300,
-            anthropic_key: "sk-ant-a&b<c>\"d\"".into(),
+            anthropic_key: Some("sk-ant-a&b<c>\"d\"".into()),
         };
         assert_eq!(parse(&settings.to_xml()), Some(settings));
         let none = Settings { wallpaper: None, utc_offset: 345, ..Settings::default() };
@@ -414,10 +419,14 @@ mod tests {
     }
 
     #[test]
-    fn key_defaults_empty() {
-        // A file from before the agent had settings simply has no key.
+    fn no_key_is_none() {
+        // A file from before the agent had settings simply has no element.
         let old = "<settings><desktop><wallpaper>/x.svg</wallpaper></desktop></settings>";
-        assert_eq!(parse(old).unwrap().anthropic_key, "");
+        assert_eq!(parse(old).unwrap().anthropic_key, None);
+        // A cleared key writes an empty element, and whitespace is not a key:
+        // `Some` is never empty, which is what lets callers trust it.
+        let cleared = "<settings><agent><anthropic-key>  </anthropic-key></agent></settings>";
+        assert_eq!(parse(cleared).unwrap().anthropic_key, None);
     }
 
     #[test]

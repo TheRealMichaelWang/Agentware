@@ -47,12 +47,6 @@ const OPENING: Duration = Duration::from_secs(5);
 /// How often to look while waiting for one.
 const OPENING_POLL: Duration = Duration::from_millis(300);
 
-/// The most model exchanges one turn may make. A ceiling rather than a
-/// budget: a turn that runs this long has almost certainly lost the plot,
-/// and every exchange spends the human's money. The turn ends honestly,
-/// saying how far it got.
-const MAX_EXCHANGES: usize = 40;
-
 /// What the model is told about the machine it is driving. Everything here
 /// restates a contract that holds elsewhere in the system; the model is the
 /// one part that cannot read the source.
@@ -188,7 +182,13 @@ fn main() {
     // The agentic loop: ask the model, do what it asks, hand back what
     // happened, until it answers with no tool calls. Every iteration resends
     // the whole conversation; the API's prompt cache makes the resend cheap.
-    for _ in 0..MAX_EXCHANGES {
+    //
+    // No exchange ceiling, deliberately: a long-running turn is the point of
+    // an agent, and how long is worth spending is the human's call, made
+    // with the working line in front of them and the stop button beside it.
+    // Every ending this loop can reach is honest: the model finishes, the
+    // backend errors, or the human interrupts.
+    loop {
         let assistant = match exchange(&mut agent, model.as_mut(), &messages, &tools) {
             Ok(assistant) => assistant,
             Err(err) => {
@@ -224,12 +224,6 @@ fn main() {
         messages.push(ModelMessage { role: Role::Assistant, content: assistant.content });
         messages.push(ModelMessage { role: Role::User, content: results });
     }
-
-    agent.say(turn::KIND_ERROR, &format!("stopping after {MAX_EXCHANGES} exchanges"));
-    agent.finish(&format!(
-        "I stopped after {MAX_EXCHANGES} rounds of work without reaching an answer. \
-         The workspace is as my last action left it."
-    ));
 }
 
 /// One model exchange, with the deltas streamed into the pane as they come:
@@ -391,11 +385,15 @@ fn tool_definitions() -> Vec<ToolDef> {
 /// Execute one tool call: the model's request becomes a query or an intent,
 /// and whatever comes back becomes the tool result, rejections included.
 fn run_tool(agent: &mut Agent, name: &str, input: &Value) -> (String, bool) {
-    let field = |key: &str| -> String {
+    // Absent is `None`, not an empty string: the schema marks what is
+    // required, but a schema is a request, and a model that omits a field
+    // anyway is told which one rather than having "" forwarded to the
+    // compositor as if it were a name.
+    let field = |key: &str| -> Option<String> {
         match &input[key] {
-            Value::String(text) => text.clone(),
-            Value::Number(number) => number.to_string(),
-            _ => String::new(),
+            Value::String(text) => Some(text.clone()),
+            Value::Number(number) => Some(number.to_string()),
+            _ => None,
         }
     };
 
@@ -408,7 +406,9 @@ fn run_tool(agent: &mut Agent, name: &str, input: &Value) -> (String, bool) {
             }
         }
         "read_app" => {
-            let app = field("app");
+            let Some(app) = field("app") else {
+                return ("read_app needs an app name".to_owned(), true);
+            };
             agent.say(turn::KIND_ACTION, &format!("reading {app}"));
             match agent.link.view(&app) {
                 Ok(markup) if markup.is_empty() => {
@@ -419,7 +419,14 @@ fn run_tool(agent: &mut Agent, name: &str, input: &Value) -> (String, bool) {
             }
         }
         "act" => {
-            let (app, action, target, value) = (field("app"), field("action"), field("target"), field("value"));
+            let (Some(app), Some(action), Some(target)) =
+                (field("app"), field("action"), field("target"))
+            else {
+                return ("act needs an app, an action and a target".to_owned(), true);
+            };
+            // The one genuinely optional field: most actions carry no payload,
+            // and an absent one is the wire's empty value.
+            let value = field("value").unwrap_or_default();
             let outcome = match agent.link.act(&app, &action, &target, &value) {
                 Ok(outcome) => outcome,
                 Err(err) => return connection_lost(&err),
@@ -444,7 +451,9 @@ fn run_tool(agent: &mut Agent, name: &str, input: &Value) -> (String, bool) {
             }
         }
         "open_app" => {
-            let name = field("name");
+            let Some(name) = field("name") else {
+                return ("open_app needs an application name".to_owned(), true);
+            };
             agent.say(turn::KIND_ACTION, &format!("opening {name}"));
             if let Err(err) = agent.desk.open_app(&name) {
                 return (format!("could not ask the workspace to open {name:?}: {err}"), true);

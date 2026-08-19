@@ -48,11 +48,14 @@ struct Settings {
     theme: String,
     /// The time zone, as minutes east of UTC.
     utc_offset: i32,
-    /// The Anthropic API key as saved, so the page can say whether one is set.
-    key: String,
-    /// The key as typed but not yet saved. A password is committed on Enter
-    /// or the Save button, not per keystroke: half a pasted key is not a key,
-    /// and every save is a synced write to the state volume.
+    /// The Anthropic API key as saved, or `None` when the machine has none,
+    /// so the page can say whether one is set.
+    key: Option<String>,
+    /// The key as typed but not yet saved: the field's contents, which may
+    /// legitimately be empty mid-edit, so a plain string. A password is
+    /// committed on Enter or the Save button, not per keystroke: half a
+    /// pasted key is not a key, and every save is a synced write to the
+    /// state volume.
     key_edit: String,
     /// When the settings file was last read, so a change made elsewhere is
     /// picked up before the next render rather than overwritten.
@@ -63,7 +66,9 @@ struct Settings {
     theme_open: bool,
     /// The file dialog, while one is up.
     choosing: Option<FileDialog>,
-    status: String,
+    /// The last thing that happened, shown under the page, or `None` when
+    /// nothing has happened yet: absence is a state, not an empty string.
+    status: Option<String>,
 }
 
 fn main() {
@@ -84,12 +89,12 @@ fn main() {
         theme: stored.theme,
         utc_offset: stored.utc_offset,
         key: stored.anthropic_key.clone(),
-        key_edit: stored.anthropic_key,
+        key_edit: stored.anthropic_key.unwrap_or_default(),
         seen: settings::modified(),
         open: false,
         theme_open: false,
         choosing: None,
-        status: String::new(),
+        status: None,
     };
 
     if let Err(err) = surface.render(&app.render()) {
@@ -138,8 +143,10 @@ impl Settings {
             self.utc_offset = stored.utc_offset;
             // A half-typed key survives an external change to the file; a
             // box that was showing the saved key follows it.
-            if self.key_edit == self.key {
-                self.key_edit = stored.anthropic_key.clone();
+            if Some(self.key_edit.as_str()) == self.key.as_deref()
+                || (self.key.is_none() && self.key_edit.is_empty())
+            {
+                self.key_edit = stored.anthropic_key.clone().unwrap_or_default();
             }
             self.key = stored.anthropic_key;
         }
@@ -151,7 +158,7 @@ impl Settings {
                 Answer::Changed => return true,
                 Answer::Cancelled => {
                     self.choosing = None;
-                    self.status = "kept the wallpaper as it was".into();
+                    self.status = Some("kept the wallpaper as it was".into());
                     return true;
                 }
                 Answer::Chosen(path) => {
@@ -194,7 +201,7 @@ impl Settings {
                         self.choosing = Some(
                             FileDialog::open(settings::WALLPAPER_DIR).only(&["svg", "png"]),
                         );
-                        self.status = "choose a picture".into();
+                        self.status = Some("choose a picture".into());
                     }
                     "current" => {}
                     index => {
@@ -214,15 +221,16 @@ impl Settings {
                 };
                 let mut stored = Stored::load();
                 stored.utc_offset = minutes;
-                match stored.save() {
+                let status = match stored.save() {
                     Ok(()) => {
                         self.utc_offset = minutes;
                         self.seen = settings::modified();
-                        self.status = format!("time zone set to UTC{}", settings::format_offset(minutes));
+                        format!("time zone set to UTC{}", settings::format_offset(minutes))
                     }
-                    Err(err) => self.status = format!("could not save the setting: {err}"),
-                }
-                log(&self.status);
+                    Err(err) => format!("could not save the setting: {err}"),
+                };
+                log(&status);
+                self.status = Some(status);
             }
 
             // The key is typed (or pasted through the compositor's caret) and
@@ -248,21 +256,23 @@ impl Settings {
     fn choose(&mut self, choice: Option<String>) {
         let mut stored = Stored::load();
         stored.wallpaper = choice.clone();
-        match stored.save() {
+        let status = match stored.save() {
             Ok(()) => {
-                self.status = match &choice {
+                let mut status = match &choice {
                     Some(path) => format!("wallpaper set to {path}"),
                     None => "wallpaper cleared".to_owned(),
                 };
                 if !settings::persistent() {
-                    self.status.push_str(" (no state volume: kept until power off)");
+                    status.push_str(" (no state volume: kept until power off)");
                 }
                 self.current = choice;
                 self.seen = settings::modified();
+                status
             }
-            Err(err) => self.status = format!("could not save the setting: {err}"),
-        }
-        log(&self.status);
+            Err(err) => format!("could not save the setting: {err}"),
+        };
+        log(&status);
+        self.status = Some(status);
     }
 
     /// Record a theme and say so. The compositor notices the file's clock
@@ -271,43 +281,47 @@ impl Settings {
     fn choose_theme(&mut self, path: String) {
         let mut stored = Stored::load();
         stored.theme = path.clone();
-        match stored.save() {
+        let status = match stored.save() {
             Ok(()) => {
-                self.status = format!("theme set to {path}");
+                let mut status = format!("theme set to {path}");
                 if !settings::persistent() {
-                    self.status.push_str(" (no state volume: kept until power off)");
+                    status.push_str(" (no state volume: kept until power off)");
                 }
                 self.theme = path;
                 self.seen = settings::modified();
+                status
             }
-            Err(err) => self.status = format!("could not save the setting: {err}"),
-        }
-        log(&self.status);
+            Err(err) => format!("could not save the setting: {err}"),
+        };
+        log(&status);
+        self.status = Some(status);
     }
 
     /// Save the key as typed. An emptied box clears it, which is how a key is
     /// revoked from the machine's side.
     fn save_key(&mut self) {
-        let key = self.key_edit.trim().to_owned();
+        let typed = self.key_edit.trim();
+        let key: Option<String> = (!typed.is_empty()).then(|| typed.to_owned());
         let mut stored = Stored::load();
         stored.anthropic_key = key.clone();
-        match stored.save() {
+        let status = match stored.save() {
             Ok(()) => {
-                self.status = if key.is_empty() {
-                    "API key cleared".to_owned()
-                } else {
-                    format!("API key saved ({} characters)", key.chars().count())
+                let mut status = match &key {
+                    None => "API key cleared".to_owned(),
+                    Some(key) => format!("API key saved ({} characters)", key.chars().count()),
                 };
                 if !settings::persistent() {
-                    self.status.push_str(" (no state volume: kept until power off)");
+                    status.push_str(" (no state volume: kept until power off)");
                 }
-                self.key = key.clone();
-                self.key_edit = key;
+                self.key_edit = key.clone().unwrap_or_default();
+                self.key = key;
                 self.seen = settings::modified();
+                status
             }
-            Err(err) => self.status = format!("could not save the setting: {err}"),
-        }
-        log(&self.status);
+            Err(err) => format!("could not save the setting: {err}"),
+        };
+        log(&status);
+        self.status = Some(status);
     }
 
     /// Whether the current theme is one of the shipped ones.
@@ -453,8 +467,8 @@ impl Settings {
         );
         out.push_str("          </vstack>\n        </group>\n");
 
-        if !self.status.is_empty() {
-            let _ = writeln!(out, r#"        <text role="caption" color="muted">{}</text>"#, escape(&self.status));
+        if let Some(status) = &self.status {
+            let _ = writeln!(out, r#"        <text role="caption" color="muted">{}</text>"#, escape(status));
         }
     }
 }
@@ -489,8 +503,8 @@ impl Settings {
             );
         }
         out.push_str("              </list>\n            </scroll>\n          </vstack>\n        </group>\n");
-        if !self.status.is_empty() {
-            let _ = writeln!(out, r#"        <text role="caption" color="muted">{}</text>"#, escape(&self.status));
+        if let Some(status) = &self.status {
+            let _ = writeln!(out, r#"        <text role="caption" color="muted">{}</text>"#, escape(status));
         }
     }
 
@@ -516,10 +530,9 @@ impl Settings {
             </hstack>"#,
             value = escape(&self.key_edit),
         );
-        let standing = if self.key.is_empty() {
-            "No key is set: the agent will answer that it cannot reach a model.".to_owned()
-        } else {
-            format!("A key is set ({} characters).", self.key.chars().count())
+        let standing = match &self.key {
+            None => "No key is set: the agent will answer that it cannot reach a model.".to_owned(),
+            Some(key) => format!("A key is set ({} characters).", key.chars().count()),
         };
         let _ = writeln!(out, r#"            <text role="caption" color="muted">{}</text>"#, escape(&standing));
         let _ = writeln!(
@@ -528,8 +541,8 @@ impl Settings {
         );
         out.push_str("          </vstack>\n        </group>\n");
 
-        if !self.status.is_empty() {
-            let _ = writeln!(out, r#"        <text role="caption" color="muted">{}</text>"#, escape(&self.status));
+        if let Some(status) = &self.status {
+            let _ = writeln!(out, r#"        <text role="caption" color="muted">{}</text>"#, escape(status));
         }
     }
 }

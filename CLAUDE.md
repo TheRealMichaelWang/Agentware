@@ -321,7 +321,9 @@ a tool result for the model to reason about, which is rejections-as-answers
 carried one level up. Thinking streams into the pane as `thought` telemetry
 a line at a time, narration between tool calls as `result` lines, every act
 as an `action` line with its outcome, and the model's final message, the one
-with no tool calls, is the reply. `backends/claude.rs` speaks the Anthropic
+with no tool calls, is the reply. While a turn runs the transcript ends with
+a working line, "Claude Opus 5 is working... (14s)", dots moving on the
+desk's own clock tick, so a model thinking quietly still visibly exists. `backends/claude.rs` speaks the Anthropic
 Messages API: raw HTTPS over rustls with the ring provider and webpki's CA
 bundle compiled in (`http.rs` is the whole client: HTTP/1.1, chunked
 transfer, SSE), streaming, adaptive thinking with summarized display, the

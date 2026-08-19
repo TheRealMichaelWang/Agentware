@@ -101,6 +101,10 @@ struct Running {
     /// ended some other way, and the human is told so.
     replied: bool,
     started: Instant,
+    /// What the turn runs as, for the working line under the transcript. Held
+    /// here rather than read from the selector, which may already say what
+    /// the *next* turn will run.
+    label: &'static str,
 }
 
 struct Desk {
@@ -354,7 +358,13 @@ impl Desk {
                         log(&self.status);
                     }
                     self.history.push(Message { role: turn::ROLE_HUMAN.into(), text: prompt });
-                    self.turn = Some(Running { pid, channel, replied: false, started: Instant::now() });
+                    self.turn = Some(Running {
+                        pid,
+                        channel,
+                        replied: false,
+                        started: Instant::now(),
+                        label: self.backend.label,
+                    });
                     self.status = format!("agent running as pid {pid}");
                     log(&format!("desk {desk}: {}", self.status));
                 }
@@ -464,6 +474,13 @@ impl Desk {
         let clock = clock_text(self.utc_offset);
         if clock != self.clock {
             self.clock = clock;
+            dirty = true;
+        }
+        // While a turn runs, the working line under the transcript animates
+        // on this same tick, so a model that is quietly thinking still looks
+        // alive. The clock alone moves once a minute; this is once a second,
+        // and only while there is something to show for it.
+        if self.turn.is_some() {
             dirty = true;
         }
         // The settings file, re-read only when its clock says it changed: a
@@ -674,6 +691,19 @@ impl Desk {
                     );
                 }
             }
+        }
+        // The working line: while a turn runs, the transcript ends with what
+        // is running and for how long, dots moving on the clock tick, so a
+        // model that is thinking without telemetry still visibly exists. The
+        // scroll's anchor keeps it in view, and it vanishes with the turn.
+        if let Some(running) = &self.turn {
+            let dots = ".".repeat(1 + (now_secs().rem_euclid(3)) as usize);
+            let _ = writeln!(
+                out,
+                "        <text role=\"caption\" color=\"accent\" italic=\"true\">{} is working{dots} ({}s)</text>",
+                escape(running.label),
+                running.started.elapsed().as_secs(),
+            );
         }
         let busy = if self.turn.is_some() { " busy=\"true\"" } else { "" };
         let _ = write!(
