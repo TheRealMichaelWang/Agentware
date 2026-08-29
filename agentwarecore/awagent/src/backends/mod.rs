@@ -32,7 +32,14 @@ pub fn from_config(id: &str, settings: &Settings) -> Result<Box<dyn Backend>, St
                         .to_owned(),
                 );
             };
-            Ok(Box::new(claude::Claude::new(key.clone(), config.model.to_owned())))
+            // The workspace goes with the key, not with the model: it says
+            // where an identity-linked key acts, and is `None` for an
+            // ordinary one, which already says so itself.
+            Ok(Box::new(claude::Claude::new(
+                key.clone(),
+                config.model.to_owned(),
+                settings.anthropic_workspace.clone(),
+            )))
         }
         other => Err(format!("the {other} backend is not built yet")),
     }

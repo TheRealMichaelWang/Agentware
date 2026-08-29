@@ -452,9 +452,10 @@ tools/screenshot.py out.png --seconds 8 --append "console=ttyS0,115200" \
 
 The tool adds the slirp NIC and the `ip=` boot argument itself, so a capture
 has the same network `make run` has. Photographing a real agent turn needs an
-API key in the state image's `settings.xml` (write one into a copy with
-`debugfs -w` rather than typing it through the monitor); without one, a
-message is answered with where to set the key, which photographs fine. The
+API key in the state image's `settings.xml`, which `make
+configure_anthropic_key` writes with `debugfs -w` rather than making anyone
+type a secret through the monitor; without one, a message is answered with
+where to set the key, which photographs fine. The
 pointer starts in the middle of the screen and every move is a delta from
 where it is now.
 
