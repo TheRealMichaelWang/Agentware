@@ -17,7 +17,7 @@ TARGET := x86_64-unknown-linux-musl
 BIN_DIR := $(AW_CORE_DIR)/target/$(TARGET)/release
 APPS_BIN_DIR := $(AW_APPS_DIR)/target/$(TARGET)/release
 
-.PHONY: all build buildcore buildapps pack run selftest clean cleanstate kernel kernelconfig
+.PHONY: all build buildcore buildapps pack run selftest clean cleanstate kernel kernelconfig configure_anthropic_key
 
 # Guest display size. virtio-vga defaults to 1280x800 and the compositor takes
 # the driver's preferred mode, so these two numbers are the whole of it.
@@ -224,6 +224,32 @@ $(STATE_IMG):
 	@echo "==> Creating the state volume $(STATE_IMG) (first run)..."
 	qemu-img create -f raw $(STATE_IMG) 64M
 	mkfs.ext4 -q -F -L agentware-state $(STATE_IMG)
+
+# Put the agent's API key on the state volume, without booting the machine.
+#
+# The key is a setting like any other and belongs on the Settings app's Agent
+# page, which is where a human at the machine should set it. This is for the
+# cases where nobody is: a capture driven by tools/screenshot.py, or a fresh
+# `make cleanstate` that has to come up already able to answer. debugfs writes
+# into the ext4 image as an ordinary user, the way mkfs.ext4 -d populates it,
+# so this needs no sudo and no boot. The state volume is created first if
+# there is none, which is what makes this work on a first run.
+#
+# The machine must not be running: QEMU has the image open.
+#
+#   make configure_anthropic_key KEY=sk-ant-...
+#   ANTHROPIC_API_KEY=sk-ant-... make configure_anthropic_key
+#   make configure_anthropic_key          # prompts, without echoing
+#
+# The last two are better: a key in KEY= is a key in the shell's history and
+# in `ps` for as long as make runs. Nothing here ever prints the key back.
+#
+# The key reaches the script through the environment rather than through its
+# arguments, so a key with a quote in it is a key rather than a syntax error,
+# and nothing that reads a command line sees it.
+configure_anthropic_key: export ANTHROPIC_API_KEY := $(or $(KEY),$(ANTHROPIC_API_KEY))
+configure_anthropic_key: $(STATE_IMG)
+	@tools/setkey.py $(STATE_IMG)
 
 # Boot QEMU (depends on 'pack' being finished)
 run: pack $(STATE_IMG)

@@ -39,11 +39,20 @@ const BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
 pub struct Claude {
     key: String,
     model: String,
+    /// The workspace the key acts in, for a key linked to an identity.
+    ///
+    /// An ordinary workspace-scoped key names its own workspace, so this is
+    /// `None` and no header goes out. A key linked to an identity does not,
+    /// and the API refuses it with `400 anthropic-workspace-id required when
+    /// authenticated with api key linked to identity` until the request says
+    /// which workspace. Absent rather than empty, so the header is either
+    /// right or not sent: an empty one is a 400 of its own.
+    workspace: Option<String>,
 }
 
 impl Claude {
-    pub fn new(key: String, model: String) -> Claude {
-        Claude { key, model }
+    pub fn new(key: String, model: String, workspace: Option<String>) -> Claude {
+        Claude { key, model, workspace }
     }
 }
 
@@ -56,12 +65,15 @@ impl Backend for Claude {
         on: &mut dyn FnMut(Delta),
     ) -> Result<Assistant, BackendError> {
         let body = request_body(&self.model, system, messages, tools).to_string();
-        let headers = [
+        let mut headers = vec![
             ("x-api-key", self.key.as_str()),
             ("anthropic-version", API_VERSION),
             ("content-type", "application/json"),
             ("accept", "text/event-stream"),
         ];
+        if let Some(workspace) = &self.workspace {
+            headers.push(("anthropic-workspace-id", workspace.as_str()));
+        }
 
         let mut delay = BACKOFF;
         for attempt in 1..=ATTEMPTS {
@@ -79,6 +91,14 @@ impl Backend for Claude {
                             "the API rejected the key ({message}). Check it in Settings, on the Agent page"
                         ))),
                         429 | 500..=599 => Ok(format!("the API answered {status}: {message}")),
+                        // A key linked to an identity is refused until the
+                        // request names a workspace. The API's own words say
+                        // which header is missing but not where a person sets
+                        // it, and the answer to that is one page away.
+                        400 if message.contains("workspace") => Err(BackendError::new(format!(
+                            "the API refused the request (400): {message}. \
+                             Set the workspace in Settings, on the Agent page"
+                        ))),
                         _ => Err(BackendError::new(format!("the API refused the request ({status}): {message}"))),
                     }
                 }

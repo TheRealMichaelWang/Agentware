@@ -57,6 +57,13 @@ struct Settings {
     /// pasted key is not a key, and every save is a synced write to the
     /// state volume.
     key_edit: String,
+    /// The workspace the key acts in, as saved, or `None` when the machine
+    /// has none. Only a key linked to an identity needs one; an ordinary
+    /// workspace-scoped key names its own workspace and this stays empty.
+    workspace: Option<String>,
+    /// The workspace as typed but not yet saved, on the same terms as the
+    /// key: committed on Enter or Save, never per keystroke.
+    workspace_edit: String,
     /// When the settings file was last read, so a change made elsewhere is
     /// picked up before the next render rather than overwritten.
     seen: Option<SystemTime>,
@@ -90,6 +97,8 @@ fn main() {
         utc_offset: stored.utc_offset,
         key: stored.anthropic_key.clone(),
         key_edit: stored.anthropic_key.unwrap_or_default(),
+        workspace: stored.anthropic_workspace.clone(),
+        workspace_edit: stored.anthropic_workspace.unwrap_or_default(),
         seen: settings::modified(),
         open: false,
         theme_open: false,
@@ -149,6 +158,12 @@ impl Settings {
                 self.key_edit = stored.anthropic_key.clone().unwrap_or_default();
             }
             self.key = stored.anthropic_key;
+            if Some(self.workspace_edit.as_str()) == self.workspace.as_deref()
+                || (self.workspace.is_none() && self.workspace_edit.is_empty())
+            {
+                self.workspace_edit = stored.anthropic_workspace.clone().unwrap_or_default();
+            }
+            self.workspace = stored.anthropic_workspace;
         }
 
         // The dialog first: it owns its ids and ignores the rest.
@@ -239,6 +254,11 @@ impl Settings {
             ("api-key", display::ACTION_SUBMIT) | ("api-key-save", display::ACTION_CLICK) => {
                 self.save_key()
             }
+            ("workspace-id", display::ACTION_TYPE_TEXT) => {
+                self.workspace_edit = event.value.clone()
+            }
+            ("workspace-id", display::ACTION_SUBMIT)
+            | ("workspace-id-save", display::ACTION_CLICK) => self.save_workspace(),
 
             (target, display::ACTION_CLICK) if target.starts_with("category-") => {
                 let name = &target["category-".len()..];
@@ -508,6 +528,34 @@ impl Settings {
         }
     }
 
+    /// Save the workspace as typed. An emptied box clears it, which is what
+    /// an ordinary workspace-scoped key wants: the header is then not sent
+    /// at all, rather than sent empty.
+    fn save_workspace(&mut self) {
+        let typed = self.workspace_edit.trim();
+        let workspace: Option<String> = (!typed.is_empty()).then(|| typed.to_owned());
+        let mut stored = Stored::load();
+        stored.anthropic_workspace = workspace.clone();
+        let status = match stored.save() {
+            Ok(()) => {
+                let mut status = match &workspace {
+                    None => "workspace cleared".to_owned(),
+                    Some(id) => format!("workspace saved ({id})"),
+                };
+                if !settings::persistent() {
+                    status.push_str(" (no state volume: kept until power off)");
+                }
+                self.workspace_edit = workspace.clone().unwrap_or_default();
+                self.workspace = workspace;
+                self.seen = settings::modified();
+                status
+            }
+            Err(err) => format!("could not save the setting: {err}"),
+        };
+        log(&status);
+        self.status = Some(status);
+    }
+
     /// The Agent page: the key the agent authenticates with. Which model
     /// answers is not a machine setting: it is chosen per agentdesk, in the
     /// pane, beside the conversation it applies to.
@@ -525,8 +573,8 @@ impl Settings {
         let _ = writeln!(
             out,
             r#"            <hstack gap="sm">
-              <field id="api-key" kind="password" value="{value}" placeholder="sk-ant-..." description="The Anthropic API key the agent authenticates with. Typed here, saved with the Save button or Enter"/>
-              <button id="api-key-save" label="Save" emphasis="primary" description="Saves the API key as typed; an emptied box clears it"/>
+              <field id="api-key" kind="password" value="{value}" placeholder="sk-ant-..." description="The Anthropic API key the agent authenticates with"/>
+              <button id="api-key-save" label="Save" emphasis="primary" description="Saves the API key as typed"/>
             </hstack>"#,
             value = escape(&self.key_edit),
         );
@@ -535,6 +583,27 @@ impl Settings {
             Some(key) => format!("A key is set ({} characters).", key.chars().count()),
         };
         let _ = writeln!(out, r#"            <text role="caption" color="muted">{}</text>"#, escape(&standing));
+
+        // The workspace under the key it qualifies, in the same group: it is
+        // part of authenticating, not a setting of its own. Plain text rather
+        // than a password, because it is not a secret and a wrong one is only
+        // spottable if it can be read.
+        let _ = writeln!(
+            out,
+            r#"            <hstack gap="sm">
+              <field id="workspace-id" value="{value}" placeholder="wrkspc_... (only if the key is not scoped to one)" description="The Anthropic workspace the key acts in"/>
+              <button id="workspace-id-save" label="Save" description="Saves the workspace as typed"/>
+            </hstack>"#,
+            value = escape(&self.workspace_edit),
+        );
+        if let Some(id) = &self.workspace {
+            let _ = writeln!(
+                out,
+                r#"            <text role="caption" color="muted">Workspace {}.</text>"#,
+                escape(id)
+            );
+        }
+
         let _ = writeln!(
             out,
             r#"            <text role="caption" color="muted">Which model answers is chosen in each agentdesk's pane.</text>"#

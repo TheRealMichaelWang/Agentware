@@ -21,6 +21,7 @@
 //!   </time>
 //!   <agent>
 //!     <anthropic-key>sk-ant-...</anthropic-key>
+//!     <workspace-id>wrkspc_...</workspace-id>
 //!   </agent>
 //! </settings>
 //! ```
@@ -39,6 +40,14 @@
 //! the screen: a password field's value is masked in the agent's view by the
 //! compositor, so the one process that could echo the key to a model reads
 //! dots.
+//!
+//! The workspace id beside it is not a second secret. A key linked to an
+//! identity belongs to an organisation rather than to one workspace, and the
+//! API refuses such a key with `400 anthropic-workspace-id required when
+//! authenticated with api key linked to identity` until the request says
+//! which workspace to bill and scope to. An ordinary workspace-scoped key
+//! carries that in itself and needs nothing here, so this is `None` until a
+//! human sets it and the header is sent only when it is `Some`.
 //!
 //! ## Time
 //!
@@ -113,6 +122,10 @@ pub struct Settings {
     /// to work without one answers with where to set it rather than failing
     /// mutely.
     pub anthropic_key: Option<String>,
+    /// The workspace the key acts in, for a key linked to an identity, which
+    /// the API will not accept without one. `None` for an ordinary
+    /// workspace-scoped key, which already says which workspace it is.
+    pub anthropic_workspace: Option<String>,
 }
 
 impl Default for Settings {
@@ -122,6 +135,7 @@ impl Default for Settings {
             theme: crate::theme::DEFAULT_THEME.to_owned(),
             utc_offset: 0,
             anthropic_key: None,
+            anthropic_workspace: None,
         }
     }
 }
@@ -173,11 +187,12 @@ impl Settings {
     pub fn to_xml(&self) -> String {
         let wallpaper = self.wallpaper.as_deref().unwrap_or(WALLPAPER_NONE);
         format!(
-            "<settings>\n  <desktop>\n    <wallpaper>{}</wallpaper>\n    <theme>{}</theme>\n  </desktop>\n  <time>\n    <utc-offset>{}</utc-offset>\n  </time>\n  <agent>\n    <anthropic-key>{}</anthropic-key>\n  </agent>\n</settings>\n",
+            "<settings>\n  <desktop>\n    <wallpaper>{}</wallpaper>\n    <theme>{}</theme>\n  </desktop>\n  <time>\n    <utc-offset>{}</utc-offset>\n  </time>\n  <agent>\n    <anthropic-key>{}</anthropic-key>\n    <workspace-id>{}</workspace-id>\n  </agent>\n</settings>\n",
             escape(wallpaper),
             escape(&self.theme),
             format_offset(self.utc_offset),
             escape(self.anthropic_key.as_deref().unwrap_or("")),
+            escape(self.anthropic_workspace.as_deref().unwrap_or("")),
         )
     }
 }
@@ -318,7 +333,12 @@ fn parse(text: &str) -> Option<Settings> {
         .map(|text| text.trim())
         .filter(|text| !text.is_empty())
         .map(str::to_owned);
-    Some(Settings { wallpaper, theme, utc_offset, anthropic_key })
+    let anthropic_workspace = values
+        .get("settings/agent/workspace-id")
+        .map(|text| text.trim())
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned);
+    Some(Settings { wallpaper, theme, utc_offset, anthropic_key, anthropic_workspace })
 }
 
 /// Every element's text, keyed by its path from the root, `a/b/c`. Elements
@@ -412,6 +432,7 @@ mod tests {
             theme: "/themes/mine & yours.xml".into(),
             utc_offset: -300,
             anthropic_key: Some("sk-ant-a&b<c>\"d\"".into()),
+            anthropic_workspace: Some("wrkspc_&<>".into()),
         };
         assert_eq!(parse(&settings.to_xml()), Some(settings));
         let none = Settings { wallpaper: None, utc_offset: 345, ..Settings::default() };
@@ -427,6 +448,21 @@ mod tests {
         // `Some` is never empty, which is what lets callers trust it.
         let cleared = "<settings><agent><anthropic-key>  </anthropic-key></agent></settings>";
         assert_eq!(parse(cleared).unwrap().anthropic_key, None);
+    }
+
+    #[test]
+    fn workspace_is_optional_and_independent_of_the_key() {
+        // The ordinary case: a workspace-scoped key, no workspace element.
+        let keyed = "<settings><agent><anthropic-key>sk-ant-x</anthropic-key></agent></settings>";
+        let settings = parse(keyed).unwrap();
+        assert_eq!(settings.anthropic_key.as_deref(), Some("sk-ant-x"));
+        assert_eq!(settings.anthropic_workspace, None);
+        // An identity-linked key, which the API refuses without this.
+        let both = "<settings><agent><anthropic-key>sk-ant-x</anthropic-key><workspace-id> wrkspc_1 </workspace-id></agent></settings>";
+        assert_eq!(parse(both).unwrap().anthropic_workspace.as_deref(), Some("wrkspc_1"));
+        // Cleared reads as absent, so the header is not sent empty.
+        let cleared = "<settings><agent><workspace-id></workspace-id></agent></settings>";
+        assert_eq!(parse(cleared).unwrap().anthropic_workspace, None);
     }
 
     #[test]
