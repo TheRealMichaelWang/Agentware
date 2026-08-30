@@ -618,6 +618,94 @@ a fresh value the way every spreadsheet does. Each move reports `select` on
 the cell it lands on, which is what lets the application keep its window on
 the cursor when the compositor is the one moving it.
 
+**A grid is more than cells.** `menu` and `menuitem` are a dropdown by
+another name and share its machinery: items float while open, fold to
+nothing when closed, painted last and hit first. `tabs` and `tab` are a
+strip of things you choose, holding no panels, because which content belongs
+to a tab is the application's business. **The navigation bar is built from `tabs` and `tab`**, which is the only
+reason an application's tab strip looks like it: there is one implementation
+and the bar is its first user. `nav_markup` writes the same markup an
+application writes, and the element paints the band, the tabs, their crosses
+and the hairline for both. What is left in `screen.rs` is the bar's own
+behaviour: switching workspaces and renaming in place. Renaming is not
+shared because an agentdesk's name is chrome the compositor keeps and never
+tells the workspace, so there is nothing in the protocol for it; an
+application that wants an editable name renders a `field` and owns it.
+
+**Dragging a tab to reorder is shared, up to the point where the two differ.**
+`ui::tab_slot` answers "which slot is the pointer in" for both, from the
+tabs' rectangles and nothing else, so a burst of motions between two
+repaints all agree. What it cannot share is what happens next: the bar's
+order is the compositor's and it rearranges itself, while an application's
+order is the application's, so a `movable` tab's drag sends `move` naming
+the slot and the application answers with a new tree, the way it answers a
+table's `scroll`. An agent has `move` too: where a sheet sits in a workbook
+is the document's business, unlike a window, which it may never arrange.
+A positional tab id does not survive this, which is why `awsheet` numbers
+its sheets: the tab a name refers to would change under the hand carrying
+it.
+
+The bar did not change when it moved onto the element: **zero differing
+pixels at 2560x1440 and at 1600x1000**, against a capture of the old
+implementation taken by stashing the work. That is the only acceptable
+result when what is being shared is how something already looks.
+
+Getting there meant reproducing four accidents of the old code, none of them
+guessable and each found by diffing captures. The bar is `raised` with the
+desk's colour punched into the middle, so a margin stays raised at each end.
+Its inset is *derived* from the bar's height, so it lands differently at
+every interface scale, and the `+ 12` and the `10` inside that arithmetic
+are unscaled. Its tabs are not clamped to that inset: they stand their
+natural height and are **clipped** by it, which is why they have no bottom
+edge and why their lighting runs the length of a taller shape than is
+visible. And the room for the cross is four literal spaces measured as part
+of the label, not a width added to it, because a proportional font's
+advances do not accumulate the same way.
+
+Every one of those was first written as a scaled constant, which agreed with
+the bar at 1.0 and nowhere else.
+
+Two things the bar could not have shown, because the bar is the whole width
+of the screen and a window is not. The strip's tabs are measured off the
+**band** it paints rather than off its own box, so an application's first
+tab starts the same distance in as the bar's; measured off the box they sat
+a window's padding further in, a margin the bar does not have. And a box
+with a border all the way round is clamped to what is visible as well as to
+the row: a tab has no bottom edge on purpose, and the rename field, sharing
+the row with tabs, was losing its bottom edge to the same clip. That one was
+in the old bar too, so it is a fix rather than a regression.
+Neither a tab nor a menu renders a press, and a tab draws no focus ring:
+becoming the chosen one, or opening, is the feedback, a flash on top of it
+is a button being clicked, and the ring is what made switching quickly
+flicker, since a pressed tab outlines itself an instant before the
+application answers and fills it. That rule is in the paint rather than in either click path, since
+the bar's tabs are clicked through the compositor's handler and an
+application's through `Client::act`, and matching conditions in two places
+drift. A tab is then a button through
+`paint_control_face` with `emphasis="primary"` on the chosen one, and a
+`closable` tab carries the same cross the bar's do, from the same
+`ui::draw_tab_close`. The strip holds whatever else belongs in the bar: the
+plus that adds a sheet is an ordinary `button`, which unlike the
+compositor's own plus is a control in the tree and so is addressable by an
+agent. `column` became a control so a
+header can be chosen, which is how a whole column is; a row already was.
+
+`select-range` names two corners, one as the target and one as the value,
+and is refused unless both are cells of the same table. One action because a
+drag across a grid is one gesture, and because an agent saying "A1 through
+C5" is legible where fifteen selects are not. The human's drag sends the
+same event again each time the run reaches another cell, on the same
+principle as one event per keystroke.
+
+**Right-click belongs to the application.** The other button sends a
+`context` event naming what was under it and nothing else; an application
+answers by opening one of its menus, and the compositor hangs that menu's
+items from where the press landed, which is the whole of what makes a
+context menu appear under the hand. Nothing in the tree says so, because the
+compositor is what saw the press; a press with the ordinary button, or any
+agent action, clears it. An agent has no right-click and needs none: it
+opens a menu by naming it and reaches the same commands without a pointer.
+
 **Selection and the clipboard are the human's, and never reach an
 application.** A press anchors, a drag extends, the run paints behind the
 words; Ctrl+A/C/X/V are resolved against the compositor's own copy of a
@@ -705,6 +793,35 @@ them is part of the application catalogue and none reaches an agent.
 * **`/dev/input` is not fully populated at startup.** QEMU's PS/2 mouse appears
   about 300ms after the directory first has entries, so devices must be
   rescanned rather than enumerated once.
+* **Verify at the resolution the machine actually runs.** `make run` is
+  2560x1440, which is interface scale 1.5; captures default to smaller. The
+  navigation bar was diffed to zero at 1600x1000 and was still wrong by
+  33,192 pixels at 1440, because every constant written as `sc(n)` agreed
+  with the old derived arithmetic only at 1.0. A check at one scale is not a
+  check.
+* **When collapsing two implementations into one, diff the pixels before
+  and after.** Rebuilding the navigation bar on the `tabs` element changed
+  3159 of its pixels on the first attempt and 33,192 at the real resolution,
+  in ways nobody would report precisely: raised margins turned dark, tabs
+  grew six pixels, the hairline moved a row, gradients shifted a step. Six
+  rounds of diff-and-fix took it to zero at both scales. The diff is the
+  oracle; a screenshot and an opinion are not.
+* **Two implementations of the same look will not stay the same.** A row of
+  tabs existed twice, in the navigation bar and as the `tabs` element, and
+  every attempt to make the second look like the first was a guess that had
+  to be checked a pixel at a time; three of them were wrong. The fix was not
+  a better guess, it was deleting one of the implementations: the bar is
+  built from the element now. If something must look like something else,
+  make it be that thing.
+* **Appearance questions are answered by reading pixels, not by looking.**
+  Making an application's tab strip match the navigation bar took three
+  wrong attempts, each of which looked plausible in a screenshot: the tabs
+  were already pixel-identical, and the difference was entirely in what they
+  stood on. Dumping a column of RGB values down each bar found it in one
+  pass, and dumping a 2D map found the rest: the bar's tabs stand on
+  `background` with thin `raised` edges above and below, not on a `raised`
+  band. `tools/screenshot.py` plus a few lines that print colours by name is
+  the tool; a crop viewed by eye is not.
 * **A per-repaint scratch rasterization is a per-frame cost.** Gradient buttons
   drawn through tiny-skia scratch pixmaps doubled paint time the moment a
   maximized window was full of them; the frames log caught it. Anything drawn

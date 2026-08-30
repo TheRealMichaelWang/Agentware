@@ -53,6 +53,15 @@ pub enum Tag {
     Column,
     Row,
     Cell,
+    /// A menu and its items. The items float while it is open, on the same
+    /// machinery a dropdown's options and a dialog use.
+    Menu,
+    MenuItem,
+    /// A strip of tabs. It holds the tabs and nothing else: which content
+    /// belongs to the chosen one is the application's business, and it
+    /// renders that itself.
+    Tabs,
+    Tab,
 }
 
 impl Tag {
@@ -80,6 +89,10 @@ impl Tag {
             "column" => Tag::Column,
             "row" => Tag::Row,
             "cell" => Tag::Cell,
+            "menu" => Tag::Menu,
+            "menuitem" => Tag::MenuItem,
+            "tabs" => Tag::Tabs,
+            "tab" => Tag::Tab,
             _ => return None,
         })
     }
@@ -108,6 +121,10 @@ impl Tag {
             Tag::Column => "column",
             Tag::Row => "row",
             Tag::Cell => "cell",
+            Tag::Menu => "menu",
+            Tag::MenuItem => "menuitem",
+            Tag::Tabs => "tabs",
+            Tag::Tab => "tab",
         }
     }
 
@@ -129,6 +146,10 @@ impl Tag {
                 | Tag::Option
                 | Tag::Row
                 | Tag::Cell
+                | Tag::Column
+                | Tag::Menu
+                | Tag::MenuItem
+                | Tag::Tab
         )
     }
 
@@ -148,17 +169,7 @@ impl Tag {
     /// their own action lists they could omit `focus`, invent something
     /// nothing implements, or advertise `click` on a disabled control, and the
     /// action space would stop being closed.
-    pub fn actions(self, disabled: bool) -> &'static [&'static str] {
-        self.actions_for(disabled, false)
-    }
-
-    /// The action list, given the element's state.
-    ///
-    /// `editable` is a cell's own state and nothing else's. It is a separate
-    /// argument rather than a lookup because `Tag` does not carry a node, and
-    /// passing the one piece of state that changes the answer keeps the list
-    /// derived from type and state as it must be.
-    pub fn actions_for(self, disabled: bool, editable: bool) -> &'static [&'static str] {
+    fn actions_for(self, disabled: bool, editable: bool) -> &'static [&'static str] {
         if disabled {
             return &[];
         }
@@ -167,9 +178,9 @@ impl Tag {
             // an editable one takes text. There is no `click`: pressing a cell
             // means choosing it, and the event a person produces is `select`.
             return if editable {
-                &["focus", "select", "type-text", "clear", "submit"]
+                &["focus", "select", "select-range", "type-text", "clear", "submit"]
             } else {
-                &["focus", "select"]
+                &["focus", "select", "select-range"]
             };
         }
         match self {
@@ -183,9 +194,41 @@ impl Tag {
             // be true, and one that is already true is a no-op, not an error.
             Tag::Select => &["focus", "open", "close"],
             Tag::Option => &["select"],
-            Tag::Row => &["focus", "select"],
+            Tag::Row | Tag::Column => &["focus", "select"],
+            // A tab never arrives here: `actions_of` answers for every one of
+            // them, because closable and movable are state and a `Tag` alone
+            // cannot see state.
+            // Both verbs whatever the state, like a dropdown: an intent says
+            // what should be true and one that already is does nothing.
+            Tag::Menu => &["focus", "open", "close"],
+            Tag::MenuItem => &["focus", "click"],
             _ => &[],
         }
+    }
+}
+
+/// What an element accepts right now, from its type and its state.
+///
+/// Asked of the tree rather than of the tag, because more than one element
+/// has state that changes the answer and a `Tag` alone cannot see it: a cell
+/// takes text only when it is editable, a tab offers `close` only when it is
+/// closable. The tag-only form used to answer for a cell that was not
+/// editable whatever the application said, which told agents they could not
+/// type into a perfectly ordinary cell while the view said they could. One
+/// function, so the view, the check before an action and the action itself
+/// cannot disagree again.
+pub fn actions_of(tree: &Tree, index: usize) -> &'static [&'static str] {
+    let node = tree.node(index);
+    let inert = tree.inert(index);
+    match node.tag {
+        Tag::Tab if !inert => match (node.flag("movable"), node.flag("closable")) {
+            (true, true) => &["focus", "select", "move", "close"],
+            (true, false) => &["focus", "select", "move"],
+            (false, true) => &["focus", "select", "close"],
+            (false, false) => &["focus", "select"],
+        },
+        Tag::Cell => node.tag.actions_for(inert, node.flag("editable")),
+        tag => tag.actions_for(inert, false),
     }
 }
 
@@ -267,21 +310,27 @@ impl Tree {
             .find(|&index| self.nodes[index].tag == Tag::Dialog)
     }
 
-    /// Every dropdown showing its options, in document order.
+    /// Every dropdown or menu showing its children, in document order.
     ///
-    /// Their options float over whatever follows them, so layout, painting and
-    /// hit testing each want the list.
-    pub fn open_selects(&self) -> Vec<usize> {
+    /// The two are the same thing to everything below the tag: children that
+    /// float over whatever follows, painted last and hit first. Layout,
+    /// painting and hit testing each want the list, and asking one question
+    /// rather than two is what keeps a menu from acquiring its own subtly
+    /// different overlay.
+    pub fn open_overlays(&self) -> Vec<usize> {
         (0..self.nodes.len())
-            .filter(|&index| self.nodes[index].tag == Tag::Select && self.nodes[index].flag("open"))
+            .filter(|&index| {
+                matches!(self.nodes[index].tag, Tag::Select | Tag::Menu)
+                    && self.nodes[index].flag("open")
+            })
             .collect()
     }
 
-    /// Whether a node is an option of a dropdown that is not showing them.
-    /// Such a node has no place on screen and answers to nothing.
+    /// Whether a node is a child of a dropdown or menu that is not showing
+    /// them. Such a node has no place on screen and answers to nothing.
     pub fn folded(&self, index: usize) -> bool {
         let node = &self.nodes[index];
-        if node.tag != Tag::Option {
+        if !matches!(node.tag, Tag::Option | Tag::MenuItem) {
             return false;
         }
         node.parent.is_none_or(|parent| !self.nodes[parent].flag("open"))
@@ -318,6 +367,12 @@ impl Tree {
     /// A table's `column` children, in order. These are its header.
     pub fn columns(&self, table: usize) -> Vec<usize> {
         self.children_of(table, Tag::Column)
+    }
+
+    /// A strip's `tab` children, in order, which is the order a `move` names
+    /// a slot in.
+    pub fn tabs(&self, strip: usize) -> Vec<usize> {
+        self.children_of(strip, Tag::Tab)
     }
 
     /// A table's `row` children, in order: exactly the window the application
@@ -775,11 +830,7 @@ fn emit(tree: &Tree, index: usize, depth: usize, out: &mut String) {
         attrs.push_str(&format!(" description=\"{description}\""));
     }
     if node.tag.is_control() {
-        let actions = node
-            .tag
-            .actions_for(tree.inert(index), node.flag("editable"))
-            .join(" ");
-        attrs.push_str(&format!(" actions=\"{actions}\""));
+        attrs.push_str(&format!(" actions=\"{}\"", actions_of(tree, index).join(" ")));
     }
 
     let name = node.tag.name();
@@ -856,8 +907,64 @@ mod tests {
         // pressing a cell means choosing it.
         let editable = view.lines().find(|line| line.contains("id=\"A1\"")).unwrap();
         let plain = view.lines().find(|line| line.contains("id=\"B1\"")).unwrap();
-        assert!(editable.contains("actions=\"focus select type-text clear submit\""), "{editable}");
-        assert!(plain.contains("actions=\"focus select\""), "{plain}");
+        assert!(
+            editable.contains("actions=\"focus select select-range type-text clear submit\""),
+            "{editable}"
+        );
+        assert!(plain.contains("actions=\"focus select select-range\""), "{plain}");
+    }
+
+    /// A menu, its items, the tabs and the headers, as an agent reads them.
+    ///
+    /// The point of the check is that none of them needs a new idea: a menu
+    /// is a dropdown by another name, its items fold away exactly as options
+    /// do, and a header and a tab are things you choose. An agent that has
+    /// learned one has learned all of them.
+    #[test]
+    fn menus_tabs_and_headers_reach_the_agent_as_ordinary_controls() {
+        let closed = parse(
+            r#"<window title="Sheet">
+                 <tabs>
+                   <tab id="tab-0" label="Sheet 1" selected="true" description="Shows sheet 1"/>
+                   <tab id="tab-1" label="Sheet 2" description="Shows sheet 2"/>
+                 </tabs>
+                 <menu id="edit" label="Edit" description="Commands for the chosen cells">
+                   <menuitem id="menu-clear" label="Clear" description="Empties every chosen cell"/>
+                 </menu>
+                 <table id="sheet" rows="9" first-row="0" description="The grid">
+                   <column id="col-A" label="A" description="Column A"/>
+                   <row id="row-1" label="1"><cell id="A1" value="x"/></row>
+                 </table>
+               </window>"#,
+        )
+        .unwrap();
+        let view = agent_view(&closed, "awsheet", 1);
+
+        // A menu offers both verbs whatever its state, like a dropdown.
+        let menu = view.lines().find(|line| line.contains("id=\"edit\"")).unwrap();
+        assert!(menu.contains("actions=\"focus open close\""), "{menu}");
+        // Its items are folded away: listed, so their existence is known, and
+        // offering nothing, so an agent reads before it reaches for one.
+        let item = view.lines().find(|line| line.contains("id=\"menu-clear\"")).unwrap();
+        assert!(item.contains("actions=\"\""), "a folded item offered something: {item}");
+        // A tab, a column header and a row are all things you choose.
+        for id in ["tab-0", "col-A", "row-1"] {
+            let line = view.lines().find(|line| line.contains(&format!("id=\"{id}\""))).unwrap();
+            assert!(line.contains("actions=\"focus select\""), "{line}");
+        }
+
+        // Opened, the items answer.
+        let open = parse(
+            r#"<window title="Sheet">
+                 <menu id="edit" label="Edit" open="true" description="Commands">
+                   <menuitem id="menu-clear" label="Clear" description="Empties every chosen cell"/>
+                 </menu>
+               </window>"#,
+        )
+        .unwrap();
+        let view = agent_view(&open, "awsheet", 1);
+        let item = view.lines().find(|line| line.contains("id=\"menu-clear\"")).unwrap();
+        assert!(item.contains("actions=\"focus click\""), "an open item offered nothing: {item}");
     }
 
     /// A cell the application scrolled past is not in the tree at all, so an

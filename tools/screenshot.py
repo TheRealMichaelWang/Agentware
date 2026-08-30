@@ -91,8 +91,11 @@ def monitor_command(path, command, deadline=20.0):
             return ""
 
 
-def qmp_tablet(path, fx, fy, click):
-    """Move the absolute tablet to a screen fraction, optionally clicking.
+def qmp_tablet(path, fx, fy, click=""):
+    """Move the absolute tablet to a screen fraction, optionally pressing.
+
+    `click` is "click", "down", "up" or nothing: a whole press, either half
+    of one, or a bare move.
 
     The human monitor only speaks relative `mouse_move`, which drives the PS/2
     mouse. The tablet is driven over QMP with input-send-event, which is the
@@ -120,12 +123,15 @@ def qmp_tablet(path, fx, fy, click):
             {"type": "abs", "data": {"axis": "y", "value": int(fy * 32767)}},
         ]
         execute("input-send-event", {"events": events})
-        if click:
+        # "click" is a press and a release; "down" and "up" are the halves of
+        # it, which is the only way to drive a drag: the tablet is the one
+        # pointer with an absolute position, and a gesture that presses here
+        # and lets go there cannot be expressed as a click.
+        for down in {"click": (True, False), "down": (True,), "up": (False,)}.get(click, ()):
             time.sleep(0.2)
-            for down in (True, False):
-                execute("input-send-event", {"events": [
-                    {"type": "btn", "data": {"down": down, "button": "left"}}]})
-                time.sleep(0.1)
+            execute("input-send-event", {"events": [
+                {"type": "btn", "data": {"down": down, "button": "left"}}]})
+            time.sleep(0.1)
 
 
 def read_ppm(path):
@@ -228,7 +234,9 @@ def main():
         # Injected input goes through the same monitor connection, so it is
         # ordered against the capture rather than racing it. Commands starting
         # with "abs" drive the tablet instead: "abs 0.5 0.9" points at a screen
-        # fraction, "abs 0.5 0.9 click" also clicks there.
+        # fraction, "abs 0.5 0.9 click" also clicks there, and "down" and "up"
+        # in place of "click" are the halves of one, which is how a drag is
+        # driven: press at one place, move, let go at another.
         for command in args.do:
             # "sleep N" waits between injected inputs, for gestures that need
             # the guest to catch up: an agent turn, an app being forked.
@@ -238,7 +246,7 @@ def main():
             if command.startswith("abs "):
                 parts = command.split()
                 qmp_tablet(qmp_path, float(parts[1]), float(parts[2]),
-                           len(parts) > 3 and parts[3] == "click")
+                           parts[3] if len(parts) > 3 else "")
                 time.sleep(0.3)
             else:
                 monitor_command(monitor_path, command)

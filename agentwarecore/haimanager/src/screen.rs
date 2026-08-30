@@ -149,8 +149,6 @@ struct TabDrag {
 }
 
 /// The width of the close glyph zone at a tab's right end.
-fn tab_close_w() -> i32 { ui::sc(20) }
-
 /// How close to an edge a press counts as taking hold of it.
 fn resize_band() -> i32 { ui::sc(7) }
 /// Smaller than this and a window is all chrome.
@@ -324,6 +322,10 @@ pub struct Screen {
     text_drag: Option<RawFd>,
     /// The client whose column edge is being dragged.
     column_drag: Option<RawFd>,
+    /// The client a run of cells is being dragged out of.
+    cell_drag: Option<RawFd>,
+    /// The client whose tab is being carried along its strip.
+    tabs_drag: Option<RawFd>,
     /// What the human last copied. One per machine, held here because the
     /// compositor is the only process that sees both ends of a copy: it owns
     /// the keyboard the chord arrives on and the text being edited.
@@ -396,6 +398,8 @@ impl Screen {
             scroll_drag: None,
             text_drag: None,
             column_drag: None,
+            cell_drag: None,
+            tabs_drag: None,
             clipboard: Clipboard::default(),
             tab_drag: None,
             renaming: None,
@@ -992,6 +996,16 @@ impl Screen {
                 {
                     scene |= client.drag_column(fonts, x);
                 }
+                if let Some(fd) = self.cell_drag
+                    && let Some(client) = self.client_mut(fd)
+                {
+                    scene |= client.drag_cells(x, y);
+                }
+                if let Some(fd) = self.tabs_drag
+                    && let Some(client) = self.client_mut(fd)
+                {
+                    scene |= client.drag_tabs(fonts, x);
+                }
 
                 // Hover feedback lives in the scene, so crossing on or off a
                 // lit control is a scene change; sweeping across inert pixels
@@ -1022,12 +1036,37 @@ impl Screen {
                 {
                     client.end_column_drag();
                 }
+                if let Some(fd) = self.cell_drag.take()
+                    && let Some(client) = self.client_mut(fd)
+                {
+                    client.end_cell_drag();
+                }
+                if let Some(fd) = self.tabs_drag.take()
+                    && let Some(client) = self.client_mut(fd)
+                {
+                    client.end_tab_drag();
+                }
                 self.nav_release(fonts)
             }
 
             Event::ButtonPressed { button: Button::Left, x, y } => {
                 self.blink_epoch = Instant::now();
                 self.click(fonts, x, y)
+            }
+
+            // The other button. It reaches an application and nothing else:
+            // there is no chrome that answers to it, and a workspace an agent
+            // is driving stays frozen to it exactly as it is to the first.
+            Event::ButtonPressed { button: Button::Right, x, y } => {
+                match self.surface_at(x, y) {
+                    Some(Surface::App(fd)) if !self.agent_running() => {
+                        self.raise(self.current, fd);
+                        self.focus = Surface::App(fd);
+                        self.route_to(fd, fonts, event)
+                    }
+                    Some(Surface::Desk) => self.route_desk(fonts, event),
+                    _ => false,
+                }
             }
 
             Event::Scrolled { delta, x, y } => match self.surface_at(x, y) {
@@ -1472,10 +1511,15 @@ impl Screen {
     fn note_drags(&mut self, fd: RawFd) {
         // Asked and answered before anything is written, so the borrow on the
         // client ends before the fields it would conflict with are set.
-        let Some((scrolling, selecting, sizing)) = self
-            .client(fd)
-            .map(|client| (client.scroll_dragging(), client.selecting(), client.sizing_column()))
-        else {
+        let Some((scrolling, selecting, sizing, cells, tab)) = self.client(fd).map(|client| {
+            (
+                client.scroll_dragging(),
+                client.selecting(),
+                client.sizing_column(),
+                client.selecting_cells(),
+                client.moving_tab(),
+            )
+        }) else {
             return;
         };
         if scrolling {
@@ -1486,6 +1530,12 @@ impl Screen {
         }
         if sizing {
             self.column_drag = Some(fd);
+        }
+        if cells {
+            self.cell_drag = Some(fd);
+        }
+        if tab {
+            self.tabs_drag = Some(fd);
         }
     }
 
@@ -2115,9 +2165,20 @@ impl Screen {
 
     /// The bar as AWML, so it goes through the same layout and painting as
     /// everything else rather than being a second rendering path.
+    /// The bar as AWML, using the same `tabs` and `tab` elements an
+    /// application uses.
+    ///
+    /// There used to be two implementations of a row of tabs: this one, built
+    /// from buttons with trailing spaces reserving room for a close glyph
+    /// painted over the top, and the element. Keeping the two looking alike
+    /// meant matching them by hand and checking the result a pixel at a time,
+    /// which is exactly as reliable as it sounds. There is one now. The bar
+    /// is the element's first user, so whatever it does an application gets,
+    /// and neither can drift from the other because there is nothing to
+    /// drift from.
     fn nav_markup(&self) -> String {
         let mut out = String::from(
-            "<window font=\"sans\" pad=\"none\" size=\"sm\">\n  <hstack gap=\"sm\">\n",
+            "<window font=\"sans\" pad=\"none\" size=\"sm\">\n  <tabs gap=\"sm\" grow=\"true\">\n",
         );
 
         for (at, workspace) in self.workspaces.iter().enumerate() {
@@ -2132,16 +2193,15 @@ impl Screen {
                 continue;
             }
 
-            // Trailing spaces reserve the room the close glyph is drawn into.
-            // The glyph is compositor paint over the button, the way window
-            // controls are, so the label must leave it a landing zone.
+            // The element reserves the room for the cross and draws it, so
+            // there are no trailing spaces to leave it a landing zone.
             let busy = if workspace.agent.is_some() { " *" } else { "" };
             out.push_str(&format!(
-                "    <button id=\"nav-desk-{id}\" label=\"{name}{busy}    \"{emphasis} \
+                "    <tab id=\"nav-desk-{id}\" label=\"{name}{busy}\" closable=\"true\"{chosen} \
                  description=\"Switches to this agentdesk\"/>\n",
                 id = workspace.id,
                 name = awproto::display::escape(&self.tab_name(workspace)),
-                emphasis = if at == self.current { " emphasis=\"primary\"" } else { "" },
+                chosen = if at == self.current { " selected=\"true\"" } else { "" },
             ));
         }
 
@@ -2165,7 +2225,7 @@ impl Screen {
             );
         }
 
-        out.push_str("  </hstack>\n</window>\n");
+        out.push_str("  </tabs>\n</window>\n");
         out
     }
 
@@ -2173,16 +2233,13 @@ impl Screen {
         let markup = self.nav_markup();
         let Ok(doc) = Document::parse(&markup, 0) else { return };
 
-        // The frame is the bar minus a margin that centres one row of small
-        // controls, computed rather than hoped. The earlier version handed the
-        // whole bar to a padded window, and the padding pushed the buttons past
-        // the bottom edge, which is why the tabs looked like they were bleeding
-        // off the screen.
+        // The whole bar. The strip is what insets its tabs, caps and foots
+        // itself and draws its own hairline, so there is nothing left here to
+        // compute: an earlier version worked the margins out by hand and the
+        // element now owns that arithmetic for the bar and for applications
+        // alike.
         let bar = self.nav_rect();
-        let row = fonts.line_height(&Style { size: 11.0 * ui::scale(), ..Style::default() }) + 12;
-        let inset_y = ((bar.h - row) / 2).max(2);
-        let frame = Rect::new(bar.x + 10, bar.y + inset_y, bar.w - 20, bar.h - inset_y * 2);
-        self.nav_layout = ui::layout_chrome(fonts, &doc, &Frame::Whole(frame), &mut self.nav_scroll);
+        self.nav_layout = ui::layout_chrome(fonts, &doc, &Frame::Whole(bar), &mut self.nav_scroll);
         self.nav = Some(doc);
     }
 
@@ -2252,7 +2309,7 @@ impl Screen {
             && let Ok(wanted) = number.parse::<u32>()
         {
             // The close glyph occupies the tab's right end.
-            if x >= rect.x + rect.w - tab_close_w() {
+            if x >= rect.x + rect.w - ui::tab_close_w() {
                 self.requests.push(vec!["close-desk".into(), wanted.to_string()]);
                 self.notes.push(format!("workspace {wanted}: close requested from its tab"));
                 return true;
@@ -2322,13 +2379,13 @@ impl Screen {
             self.build_nav(fonts);
         }
         let tabs = self.nav_tab_rects();
-        // Where the pointer falls among the other tabs' centres is the slot
-        // this one belongs in.
-        let slot = tabs
-            .iter()
-            .filter(|(tab, _)| *tab != id)
-            .filter(|(_, rect)| x > rect.x + rect.w / 2)
-            .count();
+        // Where the pointer falls among the other tabs' middles is the slot
+        // this one belongs in. The arithmetic is `ui::tab_slot`, which is
+        // also what an application's strip uses: the rule is the same one
+        // and there is no reason for two of it.
+        let held = tabs.iter().position(|(tab, _)| *tab == id).unwrap_or(0);
+        let rects: Vec<Rect> = tabs.iter().map(|(_, rect)| *rect).collect();
+        let slot = ui::tab_slot(&rects, held, x);
 
         let Some(from) = self.workspaces.iter().position(|w| w.id == id) else { return };
         if slot == from {
@@ -2692,7 +2749,8 @@ impl Screen {
 
     fn draw_nav(&self, canvas: &mut Canvas, fonts: &Fonts, _pointer: (i32, i32)) {
         let rect = self.nav_rect();
-        canvas.fill_rect(rect, ui::raised());
+        // No fill and no hairline here: the strip paints the band, the tabs
+        // and their crosses, exactly as it does inside an application.
         let Some(doc) = &self.nav else { return };
 
         // While a tab is being renamed its field carries the caret, on the same
@@ -2712,20 +2770,14 @@ impl Screen {
             ui::paint_subtree(canvas, fonts, &self.images, &doc.tree, &self.nav_layout, Document::ROOT, &focus)
         });
 
-        // Close glyphs, drawn over each tab's reserved right end the way window
-        // controls are drawn over windows: chrome on chrome, not markup.
+        // The crosses are the strip's, drawn with the tabs. What is left
+        // here is the one thing that is in no tree: the tab being carried.
         let current_id = self.workspaces.get(self.current).map(|w| w.id);
         let dragging = self
             .tab_drag
             .as_ref()
             .filter(|held| held.moved)
             .map(|held| (held.id, held.at_x - held.grab_dx));
-        for (id, tab) in self.nav_tab_rects() {
-            if dragging.is_some_and(|(dragged, _)| dragged == id) {
-                continue;
-            }
-            Self::draw_tab_close(canvas, tab, current_id == Some(id));
-        }
 
         // The held tab is lifted out of the row and rides under the pointer.
         // Without this the only feedback was the row rearranging once the
@@ -2759,21 +2811,10 @@ impl Screen {
                     ui::text(),
                 );
             });
-            Self::draw_tab_close(canvas, ghost, active);
+            ui::draw_tab_close(canvas, ghost, active);
         }
 
-        canvas.fill_rect(Rect::new(rect.x, rect.y + rect.h - 1, rect.w, 1), ui::border());
-    }
-
-    /// The close glyph at a tab's right end.
-    fn draw_tab_close(canvas: &mut Canvas, tab: Rect, active: bool) {
-        let cx = (tab.x + tab.w - tab_close_w() / 2 - ui::sc(2)) as f32;
-        let cy = (tab.y + tab.h / 2) as f32;
-        let r = ui::sc(3) as f32;
-        let ink = if active { ui::text() } else { ui::muted() };
-        let t = ui::sc(1).max(1);
-        canvas.stroke_line(cx - r, cy - r, cx + r, cy + r, t, ink);
-        canvas.stroke_line(cx - r, cy + r, cx + r, cy - r, t, ink);
+        let _ = rect;
     }
 
     /// A readout of what the compositor is holding, for screenshots.

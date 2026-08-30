@@ -67,8 +67,8 @@ answers blocked, for you and the human alike; answer the dialog and the rest com
 
 How acting works:
 - act names an application, a control id, and one action from a closed vocabulary: focus, \
-click, type-text, clear, submit, check, uncheck, toggle, select, deselect, set-value, \
-open, close.
+click, type-text, clear, submit, check, uncheck, toggle, select, select-range, deselect, \
+set-value, open, close, move.
 - The compositor stages every action itself: the target's window comes to the front and \
 its siblings are put away before your action lands. You cannot move, resize or arrange \
 windows, and never need to.
@@ -97,6 +97,15 @@ and the row you want first. A cell outside the window cannot be acted on, becaus
 not there to name; read it into view first.
 - Cells take select to choose one, and type-text, clear and submit when they are \
 editable. There is no click on a cell.
+- select-range chooses a run of cells at once: name one corner as the target and the \
+other corner's id as the value, as in target A1 with value C5. Both must be in the same \
+table. It is one action because a person dragging across a grid did one thing.
+- A column header and a row both take select, which is how a whole column or row is \
+chosen. Tabs take select too, and one listing move can be reordered: name the tab and \
+give the position it should take, counting from zero.
+- A menu takes open and close, and its items take click while it is open. Opening a menu \
+by name is how you reach a command a human would right-click for; there is no \
+right-click in your vocabulary and you do not need one.
 
 Working style:
 - Read before acting: list_apps, then read_app, then act. Open what the work needs with \
@@ -455,12 +464,12 @@ fn tool_definitions() -> Vec<ToolDef> {
                     "action": {
                         "type": "string",
                         "enum": ["focus", "click", "type-text", "clear", "submit", "check",
-                                 "uncheck", "toggle", "select", "deselect", "set-value",
-                                 "open", "close"],
+                                 "uncheck", "toggle", "select", "select-range", "deselect",
+                                 "set-value", "open", "close", "move"],
                         "description": "What to do"
                     },
                     "target": {"type": "string", "description": "The control's id"},
-                    "value": {"type": "string", "description": "The text for type-text, or the number for set-value"}
+                    "value": {"type": "string", "description": "The text for type-text, the number for set-value, or the other corner's cell id for select-range, or the position for move"}
                 },
                 "required": ["app", "action", "target"],
                 "additionalProperties": false
