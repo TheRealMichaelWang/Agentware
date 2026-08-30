@@ -128,7 +128,7 @@ impl StartMenu {
         self.panel = Rect::new(area.x + (area.w - w) / 2, area.y + (area.h - h) / 2, w, h);
 
         let frame = self.panel.inset(inset());
-        self.layout = ui::layout(fonts, &doc, &Frame::Whole(frame), &mut self.scroll);
+        self.layout = ui::layout_chrome(fonts, &doc, &Frame::Whole(frame), &mut self.scroll);
         self.doc = Some(doc);
     }
 

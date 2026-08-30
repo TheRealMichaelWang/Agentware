@@ -52,9 +52,28 @@ const KEY_UP: u16 = 103;
 const KEY_LEFT: u16 = 105;
 const KEY_RIGHT: u16 = 106;
 const KEY_DOWN: u16 = 108;
+const KEY_A: u16 = 30;
+const KEY_X: u16 = 45;
+const KEY_C: u16 = 46;
+const KEY_V: u16 = 47;
 
-/// Turn a key code into a key, applying shift and caps lock.
-pub fn decode(code: u16, shift: bool, caps: bool) -> Key {
+/// Turn a key code into a key, applying shift, caps lock and control.
+///
+/// Control is where a chord becomes an intention. The four it names are the
+/// clipboard's, and they come out as what they do; every other control combo
+/// becomes [`Key::Other`] rather than the letter it sits on, because Ctrl+B
+/// is not the letter b and typing one into a field would be a surprise.
+pub fn decode(code: u16, shift: bool, caps: bool, ctrl: bool) -> Key {
+    if ctrl {
+        return match code {
+            KEY_C => Key::Copy,
+            KEY_X => Key::Cut,
+            KEY_V => Key::Paste,
+            KEY_A => Key::SelectAll,
+            other => Key::Other(other),
+        };
+    }
+
     match code {
         KEY_ESC => return Key::Escape,
         KEY_BACKSPACE => return Key::Backspace,

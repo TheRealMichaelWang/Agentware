@@ -17,7 +17,7 @@
 //!
 //! Notice what this file still cannot do, model or no model. It never
 //! produces an event, only intents, so a rejection (`disabled`, `blocked`,
-//! `not-visible`) is an answer handed back to the model as a tool result to
+//! `unsupported-action`) is an answer handed back to the model as a tool result to
 //! reason about, not an error. It never names a workspace, cannot see the
 //! agentdesk that started it, and cannot read the transcript of its own
 //! streamed thoughts. It cannot open an application itself: it asks the
@@ -68,23 +68,35 @@ answers blocked, for you and the human alike; answer the dialog and the rest com
 How acting works:
 - act names an application, a control id, and one action from a closed vocabulary: focus, \
 click, type-text, clear, submit, check, uncheck, toggle, select, deselect, set-value, \
-open, close, scroll-into-view.
+open, close.
 - The compositor stages every action itself: the target's window comes to the front and \
 its siblings are put away before your action lands. You cannot move, resize or arrange \
 windows, and never need to.
 - type-text replaces a field's contents with the given value, typed on screen one \
 keystroke at a time. submit is the Enter key. check and uncheck are unconditional; prefer \
 them over toggle so the outcome does not depend on stale state.
-- scroll-into-view makes a node visible when it is scrolled away; name the node you want \
-seen, never a container.
+- Scrolling is not something you do. Acting on a control scrolls whatever has to move so \
+that it is on screen first, exactly as the window is brought to the front for you. You \
+never ask for it and are never told a control was out of view.
 
 Rejections are answers, not failures:
 - disabled: the application has disabled it; something in the app must change first.
 - blocked: a dialog is in front; read the view and answer the dialog.
-- not-visible: scrolled out of view; scroll-into-view is the remedy.
+- unreachable: the compositor could not bring it on screen. This is a fault in the \
+system rather than a step you missed; report it and try something else.
 - no-such-node, no-such-app: nothing by that name; read again before retrying.
 - unsupported-action: that element does not take that action.
 - needs-approval: the human must approve it; say what you wanted to do and stop.
+
+Tables hold a window, not a sheet:
+- A <table> carries rows, how many exist altogether, and first-row, which row its first \
+row is. The rows in the view are the only ones that exist anywhere; a sheet of ten \
+thousand is read forty at a time, as a human reads one.
+- read_rows moves that window and returns the fresh view: name the app, the table's id, \
+and the row you want first. A cell outside the window cannot be acted on, because it is \
+not there to name; read it into view first.
+- Cells take select to choose one, and type-text, clear and submit when they are \
+editable. There is no click on a cell.
 
 Working style:
 - Read before acting: list_apps, then read_app, then act. Open what the work needs with \
@@ -222,7 +234,7 @@ fn main() {
         let mut acted = false;
         let mut results = Vec::new();
         for (id, name, input) in calls {
-            acted |= matches!(name.as_str(), "act" | "open_app");
+            acted |= matches!(name.as_str(), "act" | "open_app" | "read_rows");
             let (content, is_error) = run_tool(&mut agent, &name, &input);
             results.push(Block::ToolResult { id, content, is_error });
         }
@@ -409,6 +421,28 @@ fn tool_definitions() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "read_rows",
+            description: "Read a table from a given row. A table holds only the rows the \
+                          application chose to describe, so a large sheet is read a \
+                          window at a time; this moves that window and returns the \
+                          application's fresh view. A cell outside the window cannot be \
+                          acted on, because it is not there to name.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "app": {"type": "string", "description": "The application's name"},
+                    "table": {"type": "string", "description": "The table's id, as the view gives it"},
+                    "first_row": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "The row that should be first, counting from zero"
+                    }
+                },
+                "required": ["app", "table", "first_row"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
             name: "act",
             description: "Perform one action on one control, by id. The compositor brings \
                           the app's window to the front itself, moves the visible cursor \
@@ -422,7 +456,7 @@ fn tool_definitions() -> Vec<ToolDef> {
                         "type": "string",
                         "enum": ["focus", "click", "type-text", "clear", "submit", "check",
                                  "uncheck", "toggle", "select", "deselect", "set-value",
-                                 "open", "close", "scroll-into-view"],
+                                 "open", "close"],
                         "description": "What to do"
                     },
                     "target": {"type": "string", "description": "The control's id"},
@@ -484,6 +518,22 @@ fn run_tool(agent: &mut Agent, name: &str, input: &Value) -> (String, bool) {
                 Err(err) => connection_lost(&err),
             }
         }
+        "read_rows" => {
+            let (Some(app), Some(table)) = (field("app"), field("table")) else {
+                return ("read_rows needs an app and a table id".to_owned(), true);
+            };
+            // Numbers arrive as numbers, so this one is not read with the
+            // string helper the rest use.
+            let first = input.get("first_row").and_then(Value::as_u64).unwrap_or(0) as u32;
+            agent.say(turn::KIND_ACTION, &format!("reading {table} in {app} from row {first}"));
+            match agent.link.rows(&app, &table, first) {
+                Ok(markup) if markup.is_empty() => {
+                    (format!("no view came back for {app:?}; is it open?"), true)
+                }
+                Ok(markup) => (markup, false),
+                Err(err) => connection_lost(&err),
+            }
+        }
         "act" => {
             let (Some(app), Some(action), Some(target)) =
                 (field("app"), field("action"), field("target"))
@@ -510,8 +560,9 @@ fn run_tool(agent: &mut Agent, name: &str, input: &Value) -> (String, bool) {
                 Outcome::Rejected(reason) => {
                     agent.say(turn::KIND_ACTION, &format!("{told}: {reason}"));
                     // A rejection is an answer the model reasons about, not
-                    // an error: `blocked` says to look for the dialog,
-                    // `not-visible` says to scroll. is_error stays false.
+                    // an error: `blocked` says to look for the dialog and
+                    // `disabled` says the application must change first.
+                    // is_error stays false.
                     (format!("rejected: {reason}"), false)
                 }
             }

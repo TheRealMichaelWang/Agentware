@@ -82,7 +82,7 @@ No id, no description, no actions. Invisible to agents.
 | `vstack` | `gap`, `align`, `grow` | Stacks children top to bottom. |
 | `hstack` | `gap`, `align`, `grow` | Stacks children left to right. |
 | `grid` | `cols`, `gap` | Uniform columns. |
-| `scroll` | `dir=x\|y\|both`, `anchor=end` | Clips and scrolls its overflow. Needs no id: see `scroll-into-view`. `anchor="end"` keeps the end in view as content grows, until the human scrolls away from it: a transcript's behaviour. |
+| `scroll` | `dir=x\|y\|both`, `anchor=end` | Clips and scrolls its overflow. Needs no id: an agent never addresses one, because acting on a node inside it scrolls it. `anchor="end"` keeps the end in view as content grows, until the human scrolls away from it: a transcript's behaviour. |
 | `split` | `dir`, `ratio` | Two resizable panes. Used for the workspace side pane. |
 
 There is no absolute positioning, no `z-index`, and no stylesheet. The layout model is deliberately small enough to implement deterministically and to reason about without simulation.
@@ -160,14 +160,24 @@ A `select` is a dropdown. Its `open` is the application's, like every other piec
 | --- | --- | --- | --- |
 | `list` | `label`, `multi` | `disabled` | — |
 | `item` | `label` | `selected`, `disabled` | `focus` `click` `select` `deselect` |
-| `table` | `label` | `disabled` | — |
-| `column` | `label` | — | — |
-| `row` | — | `selected` | `focus` `select` |
-| `cell` | — | — | — |
+| `table` | `label`, `rows`, `first-row` | `disabled` | — |
+| `column` | `label`, `chars` | — | — |
+| `row` | `label` | `selected` | `focus` `select` |
+| `cell` | — | `value`, `editable`, `selected`, `disabled` | `focus` `select`, plus `type-text` `clear` `submit` when `editable` |
 | `tabs` | `label` | — | — |
 | `tab` | `label` | `selected`, `disabled` | `focus` `select` |
 
 `item` has both `click` and `select` because they are different intentions: clicking a file opens it, selecting it marks it for a subsequent operation.
+
+### A table holds a window, not a sheet
+
+A `cell` is a control, not content: a spreadsheet's cells are named, read and typed into one at a time, and something that cannot be addressed cannot be any of those. It is the one control whose description is not written by the application, because its meaning is entirely positional and a sheet has far too many of them for a sentence each; the compositor composes one from the column's label and the row's, so `A1` reads as "The cell in column A, 1". There is no `click` on a cell. Pressing one means choosing it, and `select` is the event a person pressing it produces; pressing an already-chosen editable cell puts the caret in, which is what a double click means elsewhere, spread over two presses because there is no double click in the event vocabulary.
+
+**The `row` children are the window, not the sheet.** `rows` says how many rows exist altogether and `first-row` which row the first child is, so a sheet of ten thousand rows is described forty at a time and the tree stays the size of the screen. Nothing else in the system works this way, and nothing else needs to: an application resends everything because everything is small. A spreadsheet is the first thing that is not.
+
+Two axes with two owners follow from that. Across is the compositor's, an ordinary offset over columns that are all present. Down is the application's: the compositor draws the bar against `rows`, and the wheel, the bar and an agent's `query rows` all become a `scroll` event carrying the row that should now be first. The application answers by re-rendering with a new `first-row`, exactly as a dropdown answers `open` by re-rendering with its options. It is the only scroll position that crosses the protocol, and it crosses because it is not a scroll position: it is which slice of the sheet the application chose to describe.
+
+A column's width is in `chars`, not pixels, because a column's width is a property of what is in it and a pixel count would be a different column on a different display. The human may drag a column's edge, and where they drag it to is the compositor's, like a scroll offset: the application declares where a column starts and is never told it moved.
 
 ### Menus and overlays
 
@@ -201,15 +211,41 @@ The complete closed set. Nothing else exists.
 | `set-value` | number | Set a numeric value. |
 | `open` | — | Expand a menu, dropdown or popover. |
 | `close` | — | Collapse it. |
-| `scroll-into-view` | — | Make a node visible. Any node, not just controls. |
 
-### `scroll-into-view` is special
 
-The haimanager rejects an intent naming a node that is not visible, because an agent must not be able to act on something a human could not have clicked. That would leave an agent stuck the moment its target scrolled off screen.
+### Scrolling is not in the vocabulary
 
-`scroll-into-view` is the way out, and it targets **any node**, control or not. It is also the one action handled entirely by the haimanager: the agent says which node it wants visible, and the haimanager works out which container to scroll and by how much. The agent never addresses a scroll container, which is why `scroll` needs no id.
+There is no verb for it, and an agent is never told something was out of view.
 
-This is the intent principle applied to a mechanism: the agent expresses what it wants to be true, not the steps to make it so.
+Acting on a node scrolls whatever has to move first: every scroll container above it, outermost first, and a table across its columns. This is the same thing arrangement does one level up, where acting on an application brings its window forward and puts its siblings away. Reachability is something the compositor makes true, not a question it answers.
+
+The rejection that used to exist for this, `not-visible`, is gone. It was a symptom wearing the name of one of its causes: a nested container the old code did not walk, a table it walked straight past, a folded dropdown option whose rectangle happened to be empty. Each of those is either a bug here or a different word. What remains is `unreachable`, which an agent should never see: it means the compositor tried to reveal a node and failed, and it is logged as the fault it is.
+
+A row nobody sent is the one thing revealing cannot fix, and that is not scrolling. See `query rows` below.
+
+## Selection and the clipboard
+
+Neither is in the protocol, in either direction.
+
+Highlighting is the human's: a press anchors, a drag extends, and the run between is painted behind the words. Ctrl+A, Ctrl+C, Ctrl+X and Ctrl+V are recognised by the compositor against its own copy of a text control, so what an application receives from a paste is a `type-text` carrying the value the control now has, exactly what it would have received had the human typed the words out. No application needs to know a clipboard exists, and none can read one it was not given. No modifier ever reaches the event vocabulary: the keyboard layer turns the chord into the intention before anything else sees it.
+
+## Reading a collection too large to send
+
+A table holds a window. An agent reading a thousand-row sheet sees the forty rows the application described, which is what a human sees too, and `rows` and `first-row` in its view tell it that is what it is holding.
+
+To read a different part it asks:
+
+```
+query rows <app> <table> <first-row>
+```
+
+The compositor asks the application to move that table's window and answers with the view once it has, within a bounded wait. One call both asks and reads.
+
+It is a **query rather than an action** for two reasons. It is a read: the agent wants to see a part of a collection, not change anything. And there is nothing to act on — a cell outside the window is not in the tree, so an intent naming it has no target to resolve. An application that ignores the request costs the agent one stale view whose `first-row` says plainly that nothing moved.
+
+## Selection and the clipboard
+
+An agent may **read** the clipboard and may not write one. Reading is how it learns what the human just copied, which is context it has no other way to get. There is nothing to write, because an agent that wants text somewhere says so with `type-text` rather than putting it down and picking it up again. The answer carries a kind as well as its content: `none`, `text`, or `image` for a picture as base64. Nothing produces an image yet; the kind exists so that the day something does, a reader that only understands words says it cannot read it rather than printing base64 as if it were words.
 
 ## What the Agent Actually Sees
 
@@ -271,7 +307,7 @@ The haimanager resolves the target to a rectangle, verifies it is visible, hit-t
 
 ```xml
 <rejected target="send" reason="disabled"/>
-<rejected target="row-88" reason="not-visible"/>
+<rejected target="row-88" reason="blocked"/>
 <rejected target="purchase" reason="needs-approval"/>
 <rejected target="send-message" reason="not-addressable"/>
 ```
@@ -295,9 +331,9 @@ The full catalogue above is the target. Sixteen elements are enough to build the
 ```
 vstack  hstack  scroll  text  divider  icon  image
 button  field  editor  checkbox  select  option
-list  item  dialog
+list  item  dialog  table  column  row  cell
 ```
 
 Everything else is additive. Nothing in the reduced set forecloses the rest, and no element should be built before an application actually needs it.
 
-`slider`, `table` and `tabs` are the ones most likely to be wanted next, in that order. Each needs renderer machinery the ones built so far do not: drag tracking for `slider`, column sizing for `table`. `select` is built; its overlay is the same machinery a dialog's is.
+`slider` and `tabs` are the ones most likely to be wanted next. `slider` needs drag tracking, for which the column edges and the scrollbars are now the pattern. `select` is built; its overlay is the same machinery a dialog's is. `table` is built, along with the two things it needed that nothing else did: a second scrolling axis, and a window over content too large to send.

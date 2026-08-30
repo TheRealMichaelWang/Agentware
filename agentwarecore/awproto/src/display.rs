@@ -62,6 +62,15 @@ pub const ACTION_DESELECT: &str = "deselect";
 /// `open` state, as it owns every other, and answers by re-rendering.
 pub const ACTION_OPEN: &str = "open";
 pub const ACTION_CLOSE: &str = "close";
+/// A table asked to move its window: the value is the row that should now be
+/// first. The application owns which rows it has sent, exactly as it owns a
+/// dropdown's `open`, and answers by re-rendering with a new `first-row`.
+///
+/// This is the one place a scroll position crosses the protocol, and it does
+/// so because it is not a scroll position: it is which slice of a thousand
+/// rows the application chose to describe. Offsets inside a `scroll`
+/// container remain the compositor's and are still never sent anywhere.
+pub const ACTION_SCROLL: &str = "scroll";
 
 /// Longest tree the haimanager will accept from one client.
 ///

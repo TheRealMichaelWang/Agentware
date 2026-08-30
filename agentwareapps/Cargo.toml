@@ -5,7 +5,7 @@
 # directory rather than a convention.
 [workspace]
 resolver = "3"
-members = ["awcalc", "awfiles"]
+members = ["awcalc", "awfiles", "awsheet"]
 
 [profile.release]
 opt-level = "z"

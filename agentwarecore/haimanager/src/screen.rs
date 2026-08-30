@@ -64,6 +64,7 @@ use std::time::{Duration, Instant};
 use awproto::agent;
 
 use crate::client::{Client, Kind, Progress};
+use crate::clipboard::Clipboard;
 use crate::cursor;
 use crate::document::Document;
 use crate::images::Images;
@@ -163,6 +164,14 @@ fn min_window() -> (i32, i32) { (ui::sc(320), ui::sc(200)) }
 /// claim rather than something on screen.
 const FLIGHT: Duration = Duration::from_millis(600);
 
+/// How long an agent's `rows` query waits for the application to describe a
+/// different window before it is answered with whatever is on screen.
+///
+/// Long enough for a re-render, short enough that an application which
+/// ignores the request costs the agent a pause rather than a hang. The reply
+/// carries `first-row`, so an agent can always see whether it moved.
+const ROWS_WAIT: Duration = Duration::from_millis(400);
+
 /// How long the conversation pane takes to fold away or return.
 const PANE_FOLD: Duration = Duration::from_millis(200);
 
@@ -205,6 +214,21 @@ struct Flight {
     to: (i32, i32),
     started: Instant,
     stage: Stage,
+}
+
+/// An agent's `rows` query, waiting for the application to answer.
+///
+/// The compositor cannot describe rows nobody sent, so this is one of the
+/// two places it asks an application for something and waits: it holds the
+/// agent's reply until a fresh tree arrives or the wait runs out. The
+/// version asked at is what tells a genuinely new tree from the one already
+/// held.
+struct PendingRows {
+    agent: RawFd,
+    app: RawFd,
+    app_name: String,
+    asked_at: u64,
+    until: Instant,
 }
 
 /// Where the keyboard is pointed.
@@ -294,6 +318,16 @@ pub struct Screen {
     /// The client whose scrollbar thumb is being dragged, so pointer motion
     /// keeps reaching it even when the pointer leaves the bar.
     scroll_drag: Option<RawFd>,
+    /// The client the pointer is dragging a text selection out of, on the
+    /// same terms: a selection that stopped extending the moment the pointer
+    /// left the field would be a selection nobody could finish.
+    text_drag: Option<RawFd>,
+    /// The client whose column edge is being dragged.
+    column_drag: Option<RawFd>,
+    /// What the human last copied. One per machine, held here because the
+    /// compositor is the only process that sees both ends of a copy: it owns
+    /// the keyboard the chord arrives on and the text being edited.
+    clipboard: Clipboard,
     /// A tab held by the pointer. Whether it becomes a drag or a click is
     /// decided by whether it moves before it is released.
     tab_drag: Option<TabDrag>,
@@ -306,6 +340,8 @@ pub struct Screen {
 
     /// The intent being performed, if any.
     flight: Option<Flight>,
+    /// Agents waiting to be told what a table's new window holds.
+    pending_rows: Vec<PendingRows>,
     /// Intents that arrived while one was in flight. An agent waits for its
     /// answer before sending the next, so this is a safety net rather than a
     /// pipeline.
@@ -358,10 +394,14 @@ impl Screen {
             notes: Vec::new(),
             drag: None,
             scroll_drag: None,
+            text_drag: None,
+            column_drag: None,
+            clipboard: Clipboard::default(),
             tab_drag: None,
             renaming: None,
             start: None,
             flight: None,
+            pending_rows: Vec::new(),
             queued: VecDeque::new(),
             agent_cursor: None,
             overlay_dirty: false,
@@ -776,6 +816,9 @@ impl Screen {
             self.flight = None;
         }
         self.queued.retain(|(from, _)| *from != fd);
+        // An agent or an application that has gone leaves nobody to answer
+        // and nothing to answer with.
+        self.pending_rows.retain(|pending| pending.agent != fd && pending.app != fd);
         if self.clients.iter().all(|client| client.kind != Kind::Agent) {
             self.agent_cursor = None;
         }
@@ -837,6 +880,8 @@ impl Screen {
         if progress.dirty {
             self.nav = None;
         }
+        // A fresh tree may be the window an agent is waiting on.
+        self.settle_rows();
         Some(progress)
     }
 
@@ -934,8 +979,18 @@ impl Screen {
                 if let Some(fd) = self.scroll_drag
                     && let Some(client) = self.client_mut(fd)
                 {
-                    client.drag_scroll(fonts, y);
+                    client.drag_scroll(fonts, x, y);
                     scene = true;
+                }
+                if let Some(fd) = self.text_drag
+                    && let Some(client) = self.client_mut(fd)
+                {
+                    scene |= client.drag_select(fonts, x, y);
+                }
+                if let Some(fd) = self.column_drag
+                    && let Some(client) = self.client_mut(fd)
+                {
+                    scene |= client.drag_column(fonts, x);
                 }
 
                 // Hover feedback lives in the scene, so crossing on or off a
@@ -956,6 +1011,16 @@ impl Screen {
                     && let Some(client) = self.client_mut(fd)
                 {
                     client.end_scroll_drag();
+                }
+                if let Some(fd) = self.text_drag.take()
+                    && let Some(client) = self.client_mut(fd)
+                {
+                    client.end_select();
+                }
+                if let Some(fd) = self.column_drag.take()
+                    && let Some(client) = self.client_mut(fd)
+                {
+                    client.end_column_drag();
                 }
                 self.nav_release(fonts)
             }
@@ -1191,9 +1256,7 @@ impl Screen {
                 self.focus = Surface::App(fd);
                 let dirty =
                     self.route_to(fd, fonts, Event::ButtonPressed { button: Button::Left, x, y });
-                if self.client(fd).is_some_and(Client::scroll_dragging) {
-                    self.scroll_drag = Some(fd);
-                }
+                self.note_drags(fd);
                 dirty
             }
 
@@ -1241,10 +1304,8 @@ impl Screen {
                 let desk = self.workspaces.get(self.current).and_then(|w| w.desk);
                 let dirty =
                     self.route_desk(fonts, Event::ButtonPressed { button: Button::Left, x, y });
-                if let Some(fd) = desk
-                    && self.client(fd).is_some_and(Client::scroll_dragging)
-                {
-                    self.scroll_drag = Some(fd);
+                if let Some(fd) = desk {
+                    self.note_drags(fd);
                 }
                 dirty
             }
@@ -1395,9 +1456,37 @@ impl Screen {
     }
 
     fn route_to(&mut self, fd: RawFd, fonts: &Fonts, event: Event) -> bool {
-        self.client_mut(fd)
-            .map(|client| client.handle(fonts, event))
+        // The clipboard and the clients are separate fields, so the borrow
+        // checker lets one be handed to the other.
+        let clipboard = &mut self.clipboard;
+        self.clients
+            .iter_mut()
+            .find(|client| client.fd() == fd)
+            .map(|client| client.handle(fonts, event, clipboard))
             .unwrap_or(false)
+    }
+
+    /// Remember what a press inside a client took hold of, so that pointer
+    /// motion keeps reaching it once the pointer wanders off the thing it
+    /// grabbed. Three kinds of drag, one rule.
+    fn note_drags(&mut self, fd: RawFd) {
+        // Asked and answered before anything is written, so the borrow on the
+        // client ends before the fields it would conflict with are set.
+        let Some((scrolling, selecting, sizing)) = self
+            .client(fd)
+            .map(|client| (client.scroll_dragging(), client.selecting(), client.sizing_column()))
+        else {
+            return;
+        };
+        if scrolling {
+            self.scroll_drag = Some(fd);
+        }
+        if selecting {
+            self.text_drag = Some(fd);
+        }
+        if sizing {
+            self.column_drag = Some(fd);
+        }
     }
 
     fn route_desk(&mut self, fonts: &Fonts, event: Event) -> bool {
@@ -1478,6 +1567,27 @@ impl Screen {
                 false
             }
 
+            // What the human last copied. Readable because it is context an
+            // agent has no other way to get, and not writable because an
+            // agent with something to say says it with `type-text` rather
+            // than putting it down for itself to pick up.
+            (agent::MSG_QUERY, agent::MSG_CLIPBOARD) => {
+                let (kind, content) =
+                    (self.clipboard.kind(), self.clipboard.content().to_owned());
+                self.reply(from, &[agent::MSG_CLIPBOARD, kind, &content]);
+                false
+            }
+
+            // Read a different part of a table. A query rather than an
+            // action because it is a read, and because there is nothing to
+            // act on: a cell outside the window is not in the tree, so an
+            // intent naming one has no target to resolve.
+            (agent::MSG_QUERY, agent::MSG_ROWS) => {
+                let (app, table, row) =
+                    (field(2).to_owned(), field(3).to_owned(), field(4).to_owned());
+                self.read_rows(from, &app, &table, &row)
+            }
+
             (agent::MSG_INTENT, _) => {
                 if self.flight.is_some() {
                     self.queued.push_back((from, fields.to_vec()));
@@ -1490,6 +1600,100 @@ impl Screen {
                 self.notes.push(format!("agent sent {other:?}, which is not a request"));
                 false
             }
+        }
+    }
+
+    /// Ask an application for a different window of one of its tables, and
+    /// answer the agent once it has described it.
+    fn read_rows(&mut self, from: RawFd, app: &str, table: &str, row: &str) -> bool {
+        let refuse = |screen: &mut Screen, reason: &str| {
+            let markup = format!("<rejected target=\"{table}\" reason=\"{reason}\"/>");
+            screen.reply(from, &[agent::MSG_VIEW, app, &markup]);
+        };
+
+        let Some(at) = self.agent_workspace(from) else {
+            refuse(self, agent::REASON_NOT_ADDRESSABLE);
+            return false;
+        };
+        let Some(app_fd) = self.app_in(at, app) else {
+            let reason = self.why_not(at, app);
+            refuse(self, reason);
+            return false;
+        };
+        let Ok(row) = row.parse::<i32>() else {
+            refuse(self, agent::REASON_UNSUPPORTED);
+            return false;
+        };
+        let Some(index) = self.client(app_fd).and_then(|client| client.node_by_id(table)) else {
+            refuse(self, agent::REASON_NO_SUCH_NODE);
+            return false;
+        };
+
+        // Already showing it: answer at once rather than asking for a window
+        // the application is already describing and waiting to be told so.
+        let showing = self.client(app_fd).and_then(|client| client.number(index, "first-row"));
+        if showing == Some(row.max(0)) {
+            self.answer_view(from, app_fd, app);
+            return false;
+        }
+
+        let version = self.client(app_fd).map_or(0, Client::version);
+        let asked = self
+            .client_mut(app_fd)
+            .map(|client| client.ask_for_row(index, row))
+            .unwrap_or(false);
+        if !asked {
+            // Not a table, or one with no id to address. What is on screen is
+            // still a true answer to what the agent asked to see.
+            self.answer_view(from, app_fd, app);
+            return false;
+        }
+
+        self.pending_rows.push(PendingRows {
+            agent: from,
+            app: app_fd,
+            app_name: app.to_owned(),
+            asked_at: version,
+            until: Instant::now() + ROWS_WAIT,
+        });
+        self.notes.push(format!("agent asked {app} for row {row} of {table}"));
+        false
+    }
+
+    fn answer_view(&mut self, to: RawFd, app_fd: RawFd, app: &str) {
+        let markup = self
+            .client(app_fd)
+            .and_then(Client::agent_view)
+            .unwrap_or_default();
+        self.reply(to, &[agent::MSG_VIEW, app, &markup]);
+    }
+
+    /// Answer every waiting `rows` query whose application has re-rendered,
+    /// or whose wait has run out.
+    fn settle_rows(&mut self) {
+        if self.pending_rows.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let ready: Vec<usize> = self
+            .pending_rows
+            .iter()
+            .enumerate()
+            .filter(|(_, pending)| {
+                let answered = self
+                    .client(pending.app)
+                    .map(|client| client.version() > pending.asked_at);
+                // An application that has gone is answered with nothing
+                // rather than left holding the agent forever.
+                answered.unwrap_or(true) || now >= pending.until
+            })
+            .map(|(at, _)| at)
+            .collect();
+
+        for at in ready.into_iter().rev() {
+            let pending = self.pending_rows.remove(at);
+            let app_name = pending.app_name.clone();
+            self.answer_view(pending.agent, pending.app, &app_name);
         }
     }
 
@@ -1663,21 +1867,13 @@ impl Screen {
             return false;
         };
 
-        // `scroll-into-view` is the one action the compositor performs itself,
-        // and the one that targets any node rather than only a control. With
-        // arrangement automatic, scrolling is the one way a node can still be
-        // out of sight, and this is the way out. The agent says what it wants
-        // to be true and not how to bring it about.
-        if action == "scroll-into-view" {
-            let moved = self
-                .client_mut(app_fd)
-                .map(|client| client.reveal(fonts, index))
-                .unwrap_or(false);
-            self.confirm(from, &app, &target, &action);
-            self.notes.push(format!("agent revealed {target} in {app}"));
-            return moved || true;
-        }
-
+        // Everything the action needs to be legitimate, in the order that
+        // makes each answer say what it means.
+        //
+        // The action list first, because it is derived from the element and
+        // its state and is the same list the agent was shown: a disabled
+        // control, or an option of a closed dropdown, offers nothing, and
+        // saying so is more use than any remark about where it is on screen.
         if client.is_disabled(index) {
             self.refuse(from, &app, &target, agent::REASON_DISABLED);
             return false;
@@ -1689,16 +1885,37 @@ impl Screen {
             self.refuse(from, &app, &target, agent::REASON_BLOCKED);
             return false;
         }
+        if !client.offers(index, &action) {
+            self.refuse(from, &app, &target, agent::REASON_UNSUPPORTED);
+            return false;
+        }
         if client.needs_approval(index) {
             self.refuse(from, &app, &target, agent::REASON_NEEDS_APPROVAL);
             return false;
         }
-        // Scrolled out of its own container.
-        if !client.is_visible(index) {
-            self.refuse(from, &app, &target, agent::REASON_NOT_VISIBLE);
+
+        // Then make it reachable. Scrolling is not something an agent asks
+        // for and not something it is told about: acting on a node moves
+        // whatever has to move, exactly as acting on an application arranges
+        // its window. What is left after this is a node the compositor tried
+        // to reveal and could not, which is a fault here rather than a step
+        // the agent missed.
+        let reachable = self
+            .client_mut(app_fd)
+            .map(|client| client.reveal(fonts, index))
+            .unwrap_or(false);
+        if !reachable {
+            self.notes.push(format!(
+                "BUG: could not bring {target} in {app} into view; the agent was told so"
+            ));
+            self.refuse(from, &app, &target, agent::REASON_UNREACHABLE);
             return false;
         }
 
+        let Some(client) = self.client(app_fd) else {
+            self.refuse(from, &app, &target, agent::REASON_NO_SUCH_APP);
+            return false;
+        };
         let rect = client.rect_of(index);
         let to = (rect.x + rect.w / 2, rect.y + rect.h / 2);
 
@@ -1734,6 +1951,7 @@ impl Screen {
 
     /// Advance whatever is moving.
     pub fn tick(&mut self, fonts: &Fonts) -> bool {
+        self.settle_rows();
         let busy = self.wants_frame();
         // One frame after the last animation ends, so a pressed control is
         // repainted unpressed rather than staying that way until the next time
@@ -1964,7 +2182,7 @@ impl Screen {
         let row = fonts.line_height(&Style { size: 11.0 * ui::scale(), ..Style::default() }) + 12;
         let inset_y = ((bar.h - row) / 2).max(2);
         let frame = Rect::new(bar.x + 10, bar.y + inset_y, bar.w - 20, bar.h - inset_y * 2);
-        self.nav_layout = ui::layout(fonts, &doc, &Frame::Whole(frame), &mut self.nav_scroll);
+        self.nav_layout = ui::layout_chrome(fonts, &doc, &Frame::Whole(frame), &mut self.nav_scroll);
         self.nav = Some(doc);
     }
 
@@ -2735,4 +2953,150 @@ pub enum CompositorKey {
     ToggleDebug,
     /// F3. Fold the conversation pane away, for when the window needs the room.
     TogglePane,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use awproto::display::ACTION_SCROLL;
+    use awproto::{Decoder, encode};
+    use std::io::{Read, Write};
+    use std::os::fd::{AsRawFd, OwnedFd};
+
+    /// One frame off a socket, blocking. The peers here are stand-ins for an
+    /// application and an agent, and both are being driven a step at a time,
+    /// so there is always either something to read or a bug.
+    fn frame(stream: &mut UnixStream) -> Vec<String> {
+        let mut decoder = Decoder::with_limit(1024 * 1024);
+        let mut buf = [0u8; 8192];
+        loop {
+            if let Some(fields) = decoder.next_frame().expect("a frame") {
+                return fields;
+            }
+            let read = stream.read(&mut buf).expect("the peer is still there");
+            assert!(read > 0, "the connection closed with nothing said");
+            decoder.feed(&buf[..read]);
+        }
+    }
+
+    fn sheet(first: i32) -> String {
+        let mut out = format!(
+            "<window title=\"Sheet\" pad=\"none\"><table id=\"sheet\" grow=\"true\" \
+             rows=\"1000\" first-row=\"{first}\" description=\"The grid\">\
+             <column label=\"A\" chars=\"8\"/>"
+        );
+        for row in first..first + 3 {
+            out.push_str(&format!(
+                "<row label=\"{}\"><cell id=\"A{}\" value=\"r{}\"/></row>",
+                row + 1,
+                row + 1,
+                row
+            ));
+        }
+        out.push_str("</table></window>");
+        out
+    }
+
+    /// The whole of `query rows`: an agent asks for a window it cannot see,
+    /// the application is asked to describe it, and the agent is answered
+    /// with the fresh view once it has.
+    ///
+    /// Worth an integration test rather than a unit one, because every part
+    /// of it is the seam between two processes: the compositor asking, the
+    /// application answering, and the agent's reply held in between.
+    #[test]
+    fn an_agent_reads_a_window_the_application_had_not_sent() {
+        ui::set_scale(1.0);
+        let fonts = Fonts::load().expect("the faces are compiled in");
+        let mut screen = Screen::new(Rect::new(0, 0, 1200, 800), &fonts);
+
+        let (mut app, app_end) = UnixStream::pair().expect("a socketpair");
+        let app_fd = app_end.as_raw_fd();
+        screen
+            .attach(
+                &fonts,
+                &["app-attached".into(), "1".into(), "awsheet".into(), "0".into()],
+                OwnedFd::from(app_end),
+            )
+            .expect("the application attached");
+
+        let (mut agent, agent_end) = UnixStream::pair().expect("a socketpair");
+        let agent_fd = agent_end.as_raw_fd();
+        screen
+            .attach(
+                &fonts,
+                &["agent-attached".into(), "1".into(), "0".into()],
+                OwnedFd::from(agent_end),
+            )
+            .expect("the agent attached");
+
+        // The application describes rows 1 to 3 of a thousand.
+        app.write_all(&encode(&["render", "1", &sheet(0)])).unwrap();
+        screen.readable(app_fd, &fonts);
+
+        // The agent asks to read from row 500, which is nowhere in that tree.
+        agent
+            .write_all(&encode(&["query", "rows", "awsheet", "sheet", "500"]))
+            .unwrap();
+        let progress = screen.readable(agent_fd, &fonts).expect("the agent was read");
+        screen.requests(&fonts, agent_fd, progress.requests);
+
+        // The application is asked, and nothing has been said to the agent
+        // yet: there is nothing true to say until the answer arrives.
+        let asked = frame(&mut app);
+        assert_eq!(asked[0], "event", "the application was not asked: {asked:?}");
+        assert_eq!(asked[3], ACTION_SCROLL, "asked for the wrong thing: {asked:?}");
+        assert_eq!(asked[4], "500", "asked for the wrong row: {asked:?}");
+
+        // It answers with that window, and the agent's reply follows.
+        app.write_all(&encode(&["render", "2", &sheet(500)])).unwrap();
+        screen.readable(app_fd, &fonts);
+
+        let reply = frame(&mut agent);
+        assert_eq!(reply[0], agent::MSG_VIEW, "not a view: {reply:?}");
+        assert_eq!(reply[1], "awsheet");
+        assert!(reply[2].contains("first-row=\"500\""), "the window did not move: {}", reply[2]);
+        assert!(reply[2].contains("id=\"A501\""), "the rows are not the ones asked for: {}", reply[2]);
+    }
+
+    /// A window the application is already describing is answered at once,
+    /// rather than asking for what is already there and waiting to be told.
+    #[test]
+    fn a_window_already_on_screen_is_answered_without_asking() {
+        ui::set_scale(1.0);
+        let fonts = Fonts::load().unwrap();
+        let mut screen = Screen::new(Rect::new(0, 0, 1200, 800), &fonts);
+
+        let (mut app, app_end) = UnixStream::pair().unwrap();
+        let app_fd = app_end.as_raw_fd();
+        screen
+            .attach(
+                &fonts,
+                &["app-attached".into(), "1".into(), "awsheet".into(), "0".into()],
+                OwnedFd::from(app_end),
+            )
+            .unwrap();
+        let (mut agent, agent_end) = UnixStream::pair().unwrap();
+        let agent_fd = agent_end.as_raw_fd();
+        screen
+            .attach(
+                &fonts,
+                &["agent-attached".into(), "1".into(), "0".into()],
+                OwnedFd::from(agent_end),
+            )
+            .unwrap();
+
+        app.write_all(&encode(&["render", "1", &sheet(500)])).unwrap();
+        screen.readable(app_fd, &fonts);
+
+        agent
+            .write_all(&encode(&["query", "rows", "awsheet", "sheet", "500"]))
+            .unwrap();
+        let progress = screen.readable(agent_fd, &fonts).unwrap();
+        screen.requests(&fonts, agent_fd, progress.requests);
+
+        let reply = frame(&mut agent);
+        assert_eq!(reply[0], agent::MSG_VIEW);
+        assert!(reply[2].contains("first-row=\"500\""), "{}", reply[2]);
+    }
 }
