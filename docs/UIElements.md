@@ -165,9 +165,33 @@ A `select` is a dropdown. Its `open` is the application's, like every other piec
 | `row` | `label` | `selected` | `focus` `select` |
 | `cell` | — | `value`, `editable`, `selected`, `disabled` | `focus` `select`, plus `type-text` `clear` `submit` when `editable` |
 | `tabs` | `label` | — | — |
-| `tab` | `label` | `selected`, `disabled` | `focus` `select` |
+| `tab` | `label` | `selected`, `closable`, `movable`, `disabled` | `focus` `select`, plus `close` when `closable` and `move` when `movable` |
+
+**The navigation bar is built from these elements.** Its agentdesk tabs are `tab` elements in a `tabs` strip, written by the compositor as the same markup an application writes, so there is one implementation of a row of tabs and an application gets whatever the bar gets. What the bar has that an application's tabs do not is renaming in place: an agentdesk's name is compositor chrome, kept by the compositor and never told to the workspace, so there is nothing in the protocol for it and an application that wants an editable name renders a `field` and owns it. Switching workspaces is the bar's too, for the same reason.
+
+**`tabs` is a bar, not a row.** Read the navigation bar a pixel at a time, down a column between two of its tabs, and it is: three rows of `raised`, then the tabs standing on `background`, then two rows of `raised`, then one of `border`. The important half is the middle. Its tabs stand on the same colour as the desk behind the bar, and the raised rows are thin edges above and below; painting a full band and standing tabs on it makes them look like buttons lying on a bar rather than tabs cut into one. The strip reproduces that structure and reaches the document's edges, because the bar the screen paints under the navigation document does. An unemphasised `button` fills with `raised` too, so on the band its fill disappears and what is left is text: that is why the navigation bar's tabs read as tabs and its plus reads as a plus. Put the same controls on a window's darker background and they come out as raised chips, a toolbar. The band is the difference, so the element paints it.
+
+Neither a tab nor a menu renders a press, and a tab draws no focus ring either. What they did is visible in what they became: the tab is now the chosen one, the menu is now open, and a flash on top of that reads as a button being clicked. The ring is what makes switching quickly flash: the moment a tab is pressed it takes focus and outlines itself in the accent, and only once the application has answered does it fill, so an outline becomes a fill. The rule lives in the paint, not in either click path, because the navigation bar's tabs are clicked through the compositor's own handler and an application's through `Client::act`; a pair of matching conditions in two places is one edit away from not matching.
+
+A `tab` is then simply a button through the same face every pressable surface wears, with the chosen one carrying `emphasis="primary"` exactly as the navigation bar puts it on the current agentdesk. A tab marked `closable` reserves room at its right end for the cross that closes it, drawn by the same function that draws the navigation bar's, and a press there sends `close` rather than `select`.
+
+A tab marked `movable` can be dragged along its strip, and the slot it lands in is worked out by the same function the navigation bar uses: count the tabs whose middle the pointer has passed. That much is shared. What cannot be is what happens next, because the two orders have different owners. The bar's order is the compositor's, so it rearranges itself under the hand. An application's is the application's, so the compositor says only where the hand put the tab, as a `move` whose value is the slot it should take counting from zero, and the application answers with a new tree, exactly as it answers a table's `scroll`. One event each time the pointer crosses another tab's middle, on the same principle as one event per keystroke: what the application hears is what the hand did, as it does it.
+
+An agent has `move` too, since where a sheet sits in a workbook is the document's business rather than the screen's, unlike a window, which an agent may never arrange. A tab nobody marked `movable` offers no `move`, and asking for one is answered `unsupported-action`.
+
+The strip holds the tabs and whatever else belongs in the bar beside them: the plus that adds one is an ordinary `button`, and a menu can stand there too, the way the navigation bar carries its own plus and its stop. Its children being controls in the tree rather than chrome is what makes them addressable — an agent adds a sheet by pressing the plus, and the compositor's own plus, being chrome, is invisible to it.
+
+Which content belongs to the chosen tab is the application's business, and it renders that itself; a strip that also owned panels would be the one container in the catalogue deciding what was inside it.
 
 `item` has both `click` and `select` because they are different intentions: clicking a file opens it, selecting it marks it for a subsequent operation.
+
+### Choosing a run of cells
+
+`select-range` names one corner as the target and the other corner's id as the value. Both must be cells in the same table; anything else is refused.
+
+One action rather than fifteen selects, because a person dragging across a grid did one thing, and because "A1 through C5" is legible in a way a list of ids is not. The human's drag produces the same event, sent again each time the run reaches another cell, in the same spirit as one event per keystroke: the application hears what the hand is doing while it does it. What the run looks like is then the application's business, painted from the `selected` state it puts on its own cells.
+
+A column header and a row take plain `select`, which is how a whole column or row is chosen.
 
 ### A table holds a window, not a sheet
 
@@ -183,8 +207,14 @@ A column's width is in `chars`, not pixels, because a column's width is a proper
 
 | Element | Attributes | State | Actions |
 | --- | --- | --- | --- |
-| `menu` | `label` | `open` | `open` `close` |
+| `menu` | `label` | `open` | `focus` `open` `close` |
 | `menuitem` | `label`, `icon` | `disabled` | `focus` `click` |
+
+A `menu` is a dropdown by another name, and deliberately the same machinery: its items float below it while it is open, painted last and hit first, and fold away to nothing when it is closed, exactly as a `select`'s options do. Both verbs are offered whatever the state, so an intent says what should be true and one that already is does nothing.
+
+**Right-click belongs to the application, not to the vocabulary.** The other mouse button sends a `context` event naming whatever was under it, and that is all it does: what it means is the application's to decide, and what it usually decides is to open a menu. The compositor then hangs that menu's items from where the press landed, which is what makes a context menu appear under the hand. Nothing in the tree says so; the compositor knows because it saw the press, and a press with the ordinary button clears it again.
+
+An agent has no right-click and needs none: it opens a menu by naming it, which reaches the same commands without a pointer. A menu with no label draws nothing at all and still holds a place in the tree, which is how an application offers a context menu that is not also a menu bar.
 | `dialog` | `label` | — | — |
 | `popover` | `label` | `open` | `close` |
 
@@ -207,6 +237,7 @@ The complete closed set. Nothing else exists.
 | `uncheck` | — | Make unchecked, whatever it was. |
 | `toggle` | — | Invert. |
 | `select` | — | Make this the selected one. |
+| `select-range` | the other corner's id | Choose a run of cells between two corners. |
 | `deselect` | — | Remove from the selection. |
 | `set-value` | number | Set a numeric value. |
 | `open` | — | Expand a menu, dropdown or popover. |

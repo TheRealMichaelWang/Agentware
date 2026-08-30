@@ -255,6 +255,11 @@ pub fn style_at(tree: &Tree, index: usize) -> Style {
             Some("heading") => body_size() * 1.45,
             Some("subheading") => body_size() * 1.15,
             Some("caption") => body_size() * 0.85,
+            // A tab is chrome-sized. The navigation bar renders its whole
+            // document at `sm`, so tabs matching it in every way but their
+            // type would still not match. An application that sets a size
+            // still wins, because the inherited value is applied below.
+            _ if node.tag == Tag::Tab => body_size() * 0.85,
             _ => body_size(),
         },
         weight: if matches!(role, Some("heading") | Some("subheading")) {
@@ -510,7 +515,7 @@ impl Layout {
     /// floats; the tree does, so callers pass it and this checks the floating
     /// nodes before the rest.
     pub fn hit_with_overlays(&self, tree: &Tree, x: i32, y: i32) -> Option<usize> {
-        for select in tree.open_selects().into_iter().rev() {
+        for select in tree.open_overlays().into_iter().rev() {
             if let Some(option) = tree
                 .node(select)
                 .children
@@ -575,6 +580,25 @@ impl Layout {
 /// The clamp belongs here because only layout knows how tall the content turned
 /// out to be. A container whose content shrank should not stay scrolled past its
 /// own end.
+/// The compositor's own state that layout has to read.
+///
+/// All of it is ephemeral, none of it is in any tree, and it grew from one
+/// map to four things, which is where a list of arguments stops being
+/// readable. What they have in common is that the application neither sets
+/// them nor is told about them.
+pub struct Ephemeral<'a> {
+    /// Offsets down, one per scroll container.
+    pub scroll: &'a mut HashMap<String, i32>,
+    /// Offsets across, which only a table has.
+    pub scroll_x: &'a mut HashMap<String, i32>,
+    /// Column widths the human dragged.
+    pub columns: &'a HashMap<String, i32>,
+    /// Where the last right-press landed, while it still stands. An open menu
+    /// hangs from here, which is what makes a context menu appear under the
+    /// hand rather than wherever the application put the menu.
+    pub context_at: Option<(i32, i32)>,
+}
+
 /// Lay out a document that cannot hold a table: the compositor's own chrome.
 ///
 /// The navigation bar and the start menu are built here rather than by any
@@ -589,17 +613,12 @@ pub fn layout_chrome(
 ) -> Layout {
     let mut across = HashMap::new();
     let columns = HashMap::new();
-    layout(fonts, doc, frame, scroll, &mut across, &columns)
+    let mut state =
+        Ephemeral { scroll, scroll_x: &mut across, columns: &columns, context_at: None };
+    layout(fonts, doc, frame, &mut state)
 }
 
-pub fn layout(
-    fonts: &Fonts,
-    doc: &Document,
-    frame: &Frame,
-    scroll: &mut HashMap<String, i32>,
-    scroll_x: &mut HashMap<String, i32>,
-    columns: &HashMap<String, i32>,
-) -> Layout {
+pub fn layout(fonts: &Fonts, doc: &Document, frame: &Frame, state: &mut Ephemeral) -> Layout {
     let count = doc.tree.nodes.len();
     let bounds = match frame {
         Frame::Whole(rect) => *rect,
@@ -609,9 +628,10 @@ pub fn layout(
     let mut placer = Placer {
         fonts,
         doc,
-        scroll,
-        scroll_x,
-        columns,
+        scroll: state.scroll,
+        scroll_x: state.scroll_x,
+        columns: state.columns,
+        context_at: state.context_at,
         rects: vec![Rect::new(0, 0, 0, 0); count],
         clips: vec![bounds; count],
         scrollers: Vec::new(),
@@ -704,6 +724,19 @@ fn measure(fonts: &Fonts, tree: &Tree, index: usize, width: i32) -> i32 {
             tile_pad() * 2 + tile_icon() + sc(6) + line_height(fonts, tree, index)
         }
         Tag::Button | Tag::Field | Tag::Item | Tag::Select => control_height(fonts, tree, index),
+        // A menu is a control the width of its label; its items float and
+        // take no room in the flow. One with no label draws nothing and
+        // holds a small slot, so that it still has a rectangle an agent can
+        // name and a place for its items to hang from.
+        Tag::Menu | Tag::Tab => control_height(fonts, tree, index),
+        Tag::MenuItem => 0,
+        // A strip is a row of tabs plus the band that shows above and below
+        // them. Measured off a tab rather than off the strip, because a tab
+        // sets its own smaller type and the band is sized to what it holds.
+        // A strip nobody sized: the tabs, a cap above and the same below.
+        // Given a height instead, as the navigation bar gives one, the cap
+        // is worked out from it.
+        Tag::Tabs => tabs_row(fonts, tree, index) + tabs_cap_default() * 2,
 
         // A table is its header plus the rows it was given. It only ever
         // holds the window the application sent, so this is a small number
@@ -817,6 +850,8 @@ struct Placer<'a> {
     /// because where a column's edge sits is no more its business than where
     /// its window is.
     columns: &'a HashMap<String, i32>,
+    /// Where an open menu should hang from, when a right-press put it there.
+    context_at: Option<(i32, i32)>,
     rects: Vec<Rect>,
     clips: Vec<Rect>,
     scrollers: Vec<Scroller>,
@@ -914,16 +949,62 @@ impl Placer<'_> {
             return;
         }
 
-        // A dropdown's options are not in the flow. Open, they hang below it
-        // in a column the dropdown's width, over whatever is there, and above
-        // it instead if the window has no room below. Closed, they are
-        // nowhere: an empty rectangle, so nothing paints them and nothing
-        // hits them.
-        if tag == Tag::Select {
+        // A strip of tabs: each at its own width, left to right, the way a
+        // row lays out fixed children, inside a band that stands a little
+        // taller than they do.
+        if tag == Tag::Tabs {
+            // The frame between the caps is what the navigation bar handed
+            // its buttons, measured off the band rather than off the strip's
+            // own box so that the first tab starts where the band does. An
+            // application's strip sits inside a padded window and its band
+            // already reaches the window's edges; measuring from the box
+            // left its tabs a margin the bar does not have.
+            let frame = tabs_frame(self.fonts, inner, inside);
+            // The row inside it is a tab's own height, not the frame's, and
+            // the frame is then a *clip* over it. Sizing the row to the frame
+            // instead changes the lighting by a step per row: it looks the
+            // same and is not.
+            let room = Rect::new(
+                frame.x,
+                frame.y,
+                frame.w,
+                tabs_row(self.fonts, &self.doc.tree, index),
+            );
+            let cut = inside.intersect(&frame).unwrap_or(Rect::new(frame.x, frame.y, 0, 0));
+            self.place_row(&children, room, gap, cut);
+            return;
+        }
+
+        // A dropdown's options and a menu's items are not in the flow. Open,
+        // they hang below in a column, over whatever is there, and above
+        // instead if the window has no room below. Closed, they are nowhere:
+        // an empty rectangle, so nothing paints them and nothing hits them.
+        if tag == Tag::Select || tag == Tag::Menu {
             let open = node.flag("open");
             let row = control_height(self.fonts, tree, index);
+            // A dropdown's list is the width of its box, because the box is
+            // showing one of the same values. A menu's is the width of its
+            // widest item, because a menu button says "Edit" and its items
+            // say things like "Paste as values".
+            let width = if tag == Tag::Menu {
+                children
+                    .iter()
+                    .map(|&child| natural_width(self.fonts, tree, child))
+                    .max()
+                    .unwrap_or(0)
+                    .max(area.w)
+            } else {
+                area.w
+            };
             let count = children.len() as i32;
-            let below = area.y + area.h;
+            // A menu the human opened with the other button hangs from where
+            // they pressed; everything else hangs from its own box. Nothing
+            // in the tree says which, because the compositor is what saw the
+            // press.
+            let (anchor_x, above, below) = match self.context_at.filter(|_| tag == Tag::Menu) {
+                Some((x, y)) => (x, y, y),
+                None => (area.x, area.y, area.y + area.h),
+            };
             // Floating over what follows means escaping the container's clip:
             // the options answer to the document's, not to the group or list
             // the box happens to sit in. Clipping them locally silently ate
@@ -931,14 +1012,14 @@ impl Placer<'_> {
             // dropdown found by living in a group exactly one row tall.
             let float_clip = self.clips[Tree::ROOT];
             let fits_below = below + row * count <= float_clip.y + float_clip.h;
-            let top = if fits_below || area.y - row * count < float_clip.y {
+            let top = if fits_below || above - row * count < float_clip.y {
                 below
             } else {
-                area.y - row * count
+                above - row * count
             };
             for (at, child) in children.into_iter().enumerate() {
                 let rect = if open {
-                    Rect::new(area.x, top + row * at as i32, area.w, row)
+                    Rect::new(anchor_x, top + row * at as i32, width, row)
                 } else {
                     Rect::new(0, 0, 0, 0)
                 };
@@ -1000,8 +1081,20 @@ impl Placer<'_> {
             // want the room, or centre themselves when painted.
             let mut slot = Rect::new(x, inner.y, width, inner.h);
             if matches!(node.tag, Tag::Button | Tag::Field | Tag::Select | Tag::Checkbox) {
-                let own = measure(self.fonts, &self.doc.tree, child, width).min(inner.h);
-                slot = Rect::new(x, inner.y + (inner.h - own) / 2, width, own);
+                // A control with a border all the way round is kept inside
+                // what is actually visible, as well as inside the row. It
+                // only ever differs in a strip of tabs, where the row is a
+                // tab's height and the frame clipping it is shorter: a tab
+                // with no bottom edge is the whole point of a tab, and a box
+                // with no bottom edge is a bug. The navigation bar's rename
+                // field is where it showed.
+                let bounded = if matches!(node.tag, Tag::Field | Tag::Select) {
+                    inner.h.min((clip.y + clip.h - inner.y).max(0))
+                } else {
+                    inner.h
+                };
+                let own = measure(self.fonts, &self.doc.tree, child, width).min(bounded);
+                slot = Rect::new(x, inner.y + (bounded - own) / 2, width, own);
             }
             self.place(child, slot, clip);
             x += width + gap;
@@ -1161,7 +1254,20 @@ impl Placer<'_> {
             self.clips[row] = body_clip;
             let mut cx = left;
             for (at, &cell) in tree.cells(row).iter().enumerate() {
-                let width = widths.get(at).copied().unwrap_or(0);
+                // A cell past the last declared column takes the width of the
+                // last one, or a default when a table declared no columns at
+                // all. Zero would be a cell nobody could see or reach, which
+                // is a silent hole rather than an answer: what the
+                // application got wrong is the header, and the way to say so
+                // is to draw the cell it forgot to name.
+                let width = widths
+                    .get(at)
+                    .copied()
+                    .or_else(|| widths.last().copied())
+                    .unwrap_or_else(|| {
+                        character_width(self.fonts, tree, index) * DEFAULT_COLUMN_CHARS
+                            + control_pad() * 2
+                    });
                 self.rects[cell] = Rect::new(cx, y, width, row_h);
                 self.clips[cell] = cell_clip;
                 cx += width;
@@ -1245,6 +1351,130 @@ pub fn document_width(fonts: &Fonts, tree: &Tree) -> i32 {
     wanted_width(fonts, tree, Tree::ROOT)
 }
 
+/// The strip above the tabs, and the strip below them before the hairline.
+///
+/// Both taken off the navigation bar, read out of a capture a pixel at a
+/// time, because guessing at this produced the wrong answer twice. Down a
+/// column through one of its tabs the bar is: three rows of `raised`, then
+/// the tab itself standing on `background`, then two more rows of `raised`,
+/// then one row of `border`.
+///
+/// The important half is what the tabs stand on. They stand on the same
+/// colour as the desk behind the bar, not on a raised band, and the raised
+/// rows are thin edges above and below. Painting a full band and putting
+/// tabs on top of it is what makes them look like buttons lying on a bar
+/// rather than tabs cut into one.
+/// How much raised shows above the tabs, and so below them too.
+///
+/// Derived from the height the strip was given rather than fixed, because
+/// that is what the navigation bar did: it worked its inset out from the bar
+/// it had to fill, so the arithmetic came out differently at every interface
+/// scale. Fixed constants agreed with it at 1.0 and at nothing else, which
+/// is a whole class of bug this codebase has a rule against and I wrote
+/// anyway: every metric is a logical size through `sc`, and a *derived* one
+/// stays derived.
+///
+/// The `+ 12` is unscaled and the size is the small one, both copied from
+/// the bar verbatim. They are not what anyone would write now; they are what
+/// the bar is, and the bar is not to change.
+fn tabs_cap(fonts: &Fonts, height: i32) -> i32 {
+    let row = fonts.line_height(&Style { size: 11.0 * scale(), ..Style::default() }) + 12;
+    ((height - row) / 2).max(2)
+}
+
+/// The natural cap, for a strip nobody has given a height to.
+fn tabs_cap_default() -> i32 { sc(3) }
+
+/// How tall the tabs in a strip stand. Measured off a tab rather than off
+/// the strip, since a tab sets its own smaller type.
+fn tabs_row(fonts: &Fonts, tree: &Tree, strip: usize) -> i32 {
+    tree.node(strip)
+        .children
+        .iter()
+        .copied()
+        .find(|&child| tree.node(child).tag == Tag::Tab)
+        .map(|tab| control_height(fonts, tree, tab))
+        .unwrap_or_else(|| control_height(fonts, tree, strip))
+}
+/// The margin before the first tab and after the last. The band runs to the
+/// edges under it; the tabs do not start there.
+///
+/// Unscaled, like the `+ 12` in [`tabs_cap`], and for the same reason: the
+/// navigation bar's frame was inset by a raw ten pixels, so scaling this
+/// agreed with it at 1.0 and nowhere else.
+fn tabs_lead() -> i32 { 10 }
+
+/// The band a strip paints: the width of whatever it is clipped to rather
+/// than of its own box. A row of tabs standing in the middle of a window
+/// with a margin either side is a row of buttons.
+fn tabs_band(rect: Rect, clip: Rect) -> Rect {
+    Rect::new(clip.x, rect.y, clip.w, rect.h)
+}
+
+/// The frame the tabs stand in: the band, inset by the cap above and below
+/// and the margin at each end.
+///
+/// One function because the band and the tabs have to agree about where the
+/// strip begins. They did not when the band was drawn across the clip and
+/// the tabs were laid out from the strip's box, which is a difference only
+/// an application ever saw, since the bar's box is the bar.
+fn tabs_frame(fonts: &Fonts, rect: Rect, clip: Rect) -> Rect {
+    let band = tabs_band(rect, clip);
+    let cap = tabs_cap(fonts, band.h);
+    Rect::new(
+        band.x + tabs_lead(),
+        band.y + cap,
+        (band.w - tabs_lead() * 2).max(0),
+        (band.h - cap * 2).max(0),
+    )
+}
+
+/// Which slot a tab dragged to `x` belongs in, given every tab's rectangle
+/// in display order and which of them is the one being carried.
+///
+/// The navigation bar's rule, shared with an application's strip because
+/// there is no second way to do this that is worth having: count the other
+/// tabs whose middle the pointer has passed. It holds no state, so several
+/// motions arriving between two repaints all agree, which is what a paced
+/// test never catches and mouse speed always does.
+pub fn tab_slot(rects: &[Rect], held: usize, x: i32) -> usize {
+    rects
+        .iter()
+        .enumerate()
+        .filter(|(at, _)| *at != held)
+        .filter(|(_, rect)| x > rect.x + rect.w / 2)
+        .count()
+}
+
+/// Where the cross that closes a tab is drawn, measured in from the right.
+pub fn tab_close_w() -> i32 { sc(20) }
+
+/// A closable tab's label with the room for its cross on the end.
+///
+/// Four spaces, which is not a measurement anyone would choose: it is what
+/// the navigation bar reserved before this element existed, where the room
+/// was four literal spaces written into the label. Measured as one string
+/// rather than added on afterwards, because a proportional font's advances
+/// do not accumulate the same way and the two differ by a pixel.
+fn tab_label_room(label: &str, closable: bool) -> String {
+    if closable { format!("{label}    ") } else { label.to_owned() }
+}
+
+/// The cross at a tab's right end.
+///
+/// Lives here rather than in the navigation bar because the bar is not the
+/// only thing with tabs any more: an application's strip draws the same
+/// cross, and one function is what keeps them the same cross.
+pub fn draw_tab_close(canvas: &mut Canvas, tab: Rect, active: bool) {
+    let cx = (tab.x + tab.w - tab_close_w() / 2 - sc(2)) as f32;
+    let cy = (tab.y + tab.h / 2) as f32;
+    let r = sc(3) as f32;
+    let ink = if active { text() } else { muted() };
+    let thickness = sc(1).max(1);
+    canvas.stroke_line(cx - r, cy - r, cx + r, cy + r, thickness, ink);
+    canvas.stroke_line(cx - r, cy + r, cx + r, cy - r, thickness, ink);
+}
+
 /// Room at a dropdown's right end for the chevron that says it opens.
 fn chevron_w() -> i32 { sc(22) }
 /// Whether a document's top-level content asks to fill whatever it is given.
@@ -1305,6 +1535,8 @@ fn wanted_width(fonts: &Fonts, tree: &Tree, index: usize) -> i32 {
             gutter + columns
         }
         Tag::Row | Tag::Cell | Tag::Column => 0,
+        Tag::MenuItem => 0,
+        Tag::Menu | Tag::Tab | Tag::Tabs => natural_width(fonts, tree, index),
         Tag::HStack => {
             let gaps = gap_of(node) * (node.children.len().saturating_sub(1)) as i32;
             children(false).sum::<i32>() + gaps
@@ -1350,7 +1582,31 @@ fn natural_width(fonts: &Fonts, tree: &Tree, index: usize) -> i32 {
             fonts.measure(label_of(node), &style) + button_pad() * 2 + icon
         }
         Tag::Checkbox => checkbox_size() + 8 + fonts.measure(label_of(node), &style),
-        Tag::Item | Tag::Option => fonts.measure(label_of(node), &style) + control_pad() * 2,
+        Tag::Item | Tag::Option | Tag::MenuItem => {
+            fonts.measure(label_of(node), &style) + control_pad() * 2
+        }
+        Tag::Tab => {
+            let room = tab_label_room(label_of(node), node.flag("closable"));
+            fonts.measure(&room, &style) + button_pad() * 2
+        }
+        // A menu with no label is a place for its items to hang from and
+        // nothing else, so it asks for almost nothing.
+        Tag::Menu => {
+            let label = label_of(node);
+            if label.is_empty() {
+                sc(2)
+            } else {
+                fonts.measure(label, &style) + button_pad() * 2
+            }
+        }
+        Tag::Tabs => {
+            let gap = gap_of(node);
+            node.children
+                .iter()
+                .map(|&child| natural_width(fonts, tree, child))
+                .sum::<i32>()
+                + gap * (node.children.len().saturating_sub(1)) as i32
+        }
         // Wide enough for its widest option, so choosing one never changes
         // the width of the row it sits in.
         Tag::Select => {
@@ -1554,7 +1810,7 @@ pub fn paint_subtree(
     // runs here for any open select inside this branch; the root is left to
     // the window arm, or every open list would paint twice.
     if index != Tree::ROOT {
-        for select in tree.open_selects() {
+        for select in tree.open_overlays() {
             if tree.within(select, index) {
                 paint_popup(canvas, fonts, images, tree, layout, select, focus);
             }
@@ -1662,6 +1918,47 @@ fn paint_popup(
     }
 }
 
+/// The face every pressable surface in the system wears.
+///
+/// One function because the navigation bar's agentdesk tabs *are* buttons:
+/// `nav_markup` writes them as `button` with `emphasis="primary"` on the
+/// current one. A `tab` element that painted itself would be the same thing
+/// drawn twice, and the two would drift the first time either was touched.
+/// What differs between them is only what goes on top of the face: a label,
+/// an icon, a glyph.
+fn paint_control_face(
+    canvas: &mut Canvas,
+    rect: Rect,
+    emphasis: Option<&str>,
+    disabled: bool,
+    pressed: bool,
+    focused: bool,
+) {
+    let fill = match (disabled, pressed, emphasis) {
+        (true, _, _) => surface(),
+        (_, true, Some("primary")) => accent_deep(),
+        (_, true, Some("danger")) => danger_deep(),
+        // `self::`, because callers have a local `pressed` shadowing the
+        // palette function of the same name.
+        (_, true, _) => self::pressed(),
+        (_, _, Some("primary")) => accent(),
+        (_, _, Some("danger")) => danger(),
+        _ => raised(),
+    };
+    // Lit faintly from above, except when disabled (flat says inert) or
+    // pressed (a control being pushed in should not look raised).
+    if disabled || pressed {
+        canvas.fill_round_rect(rect, radius_control(), fill);
+    } else {
+        canvas.fill_round_rect_vgrad(rect, radius_control(), lift(fill, 10), fill);
+    }
+    if focused && !disabled {
+        canvas.stroke_round_rect(rect, radius_control(), 2, accent());
+    } else if emphasis.is_none() {
+        canvas.stroke_round_rect(rect, radius_control(), 1, border());
+    }
+}
+
 fn paint_node(
     canvas: &mut Canvas,
     fonts: &Fonts,
@@ -1678,8 +1975,19 @@ fn paint_node(
     let focused = focus.node == Some(index);
     let pressed = focus.pressed == Some(index);
 
-    // A pressed control sinks by a pixel. Small enough not to reflow anything,
-    // large enough that a still frame shows which control was just acted on.
+    // A pressed control sinks by a pixel. Small enough not to reflow
+    // anything, large enough that a still frame shows which control was just
+    // acted on.
+    //
+    // A tab and a menu are exempt, and the exemption lives here rather than
+    // in either click path. What they did is visible in what they became:
+    // the tab is now the chosen one, the menu is now open. A flash on top of
+    // that reads as a button being clicked, which is the one thing they must
+    // not look like. The navigation bar's tabs have never flashed, because
+    // its clicks never reach `Client::act`; expressing the rule in the paint
+    // both paths share is what stops the two ever disagreeing again.
+    let shows_press = !matches!(node.tag, Tag::Tab | Tag::Menu);
+    let pressed = pressed && shows_press;
     let rect = if pressed { Rect::new(rect.x, rect.y + 1, rect.w, rect.h) } else { rect };
 
     // Disabled always wins over a colour the application chose: a control that
@@ -1767,29 +2075,7 @@ fn paint_node(
 
         Tag::Button => {
             let emphasis = node.attr("emphasis");
-            let fill = match (disabled, pressed, emphasis) {
-                (true, _, _) => surface(),
-                (_, true, Some("primary")) => accent_deep(),
-                (_, true, Some("danger")) => danger_deep(),
-                // `self::`, because the local `pressed` above shadows the
-                // palette function here.
-                (_, true, _) => self::pressed(),
-                (_, _, Some("primary")) => accent(),
-                (_, _, Some("danger")) => danger(),
-                _ => raised(),
-            };
-            // Lit faintly from above, except when disabled (flat says inert)
-            // or pressed (a control being pushed in should not look raised).
-            if disabled || pressed {
-                canvas.fill_round_rect(rect, radius_control(), fill);
-            } else {
-                canvas.fill_round_rect_vgrad(rect, radius_control(), lift(fill, 10), fill);
-            }
-            if focused && !disabled {
-                canvas.stroke_round_rect(rect, radius_control(), 2, accent());
-            } else if emphasis.is_none() {
-                canvas.stroke_round_rect(rect, radius_control(), 1, border());
-            }
+            paint_control_face(canvas, rect, emphasis, disabled, pressed, focused);
 
             let label = label_of(node);
             let icon = node
@@ -2034,7 +2320,11 @@ fn paint_node(
         // One heading over one column, on the raised surface every header in
         // the system wears.
         Tag::Column => {
-            canvas.fill_round_rect_vgrad(rect, 0, lift(raised(), 6), raised());
+            if node.flag("selected") {
+                canvas.fill_rect(rect, selected());
+            } else {
+                canvas.fill_round_rect_vgrad(rect, 0, lift(raised(), 6), raised());
+            }
             canvas.fill_rect(Rect::new(rect.x + rect.w - 1, rect.y, 1, rect.h), border());
             canvas.fill_rect(Rect::new(rect.x, rect.y + rect.h - 1, rect.w, 1), border());
             let label = label_of(node);
@@ -2047,6 +2337,123 @@ fn paint_node(
                 &style,
                 if disabled { muted() } else { text() },
             );
+        }
+
+        // A menu: a label you press, or nothing at all. An unlabelled one is
+        // a place for its items to hang from, opened by whatever the
+        // application decided a right-click means.
+        Tag::Menu => {
+            let label = label_of(node);
+            if label.is_empty() {
+                // Nothing to draw: it exists to be named and to hang its
+                // items from.
+            } else {
+                // Words on the band, lit only while its list is showing. The
+                // fill used to follow focus as well, so pressing it once left
+                // a filled box standing behind the word for as long as the
+                // keyboard pointed there, and a menu wearing a box is a
+                // button. Focus is a hairline instead: visible to whoever is
+                // tabbing through and to nobody else.
+                if node.flag("open") {
+                    canvas.fill_round_rect(rect, radius_control(), theme().pressed);
+                } else if focused && !disabled {
+                    canvas.stroke_round_rect(rect, radius_control(), 1, accent());
+                }
+                let width = fonts.measure(label, &style);
+                canvas.draw_text(
+                    fonts,
+                    label,
+                    rect.x + ((rect.w - width) / 2).max(button_pad()),
+                    centred(rect.h),
+                    &style,
+                    ink,
+                );
+            }
+        }
+
+        Tag::MenuItem => {
+            if focused {
+                canvas.fill_rect(rect, theme().pressed);
+            }
+            canvas.draw_text(
+                fonts,
+                label_of(node),
+                rect.x + control_pad(),
+                centred(rect.h),
+                &style,
+                ink,
+            );
+        }
+
+        // The band, which is the whole of why the navigation bar's tabs look
+        // the way they do.
+        //
+        // Its tabs are unemphasised buttons on a `raised` strip, and an
+        // unemphasised button fills with `raised`: the fill disappears into
+        // the band and what is left is text. The plus at its end disappears
+        // the same way. So a tab strip paints the band first and everything
+        // in it comes out looking like the navigation bar without being told
+        // to, including whatever an application puts in the strip beside its
+        // tabs.
+        Tag::Tabs => {
+            // The navigation bar's structure, reproduced: a thin raised cap,
+            // the tabs standing on the same colour as the desk behind, a
+            // thin raised foot, and the hairline under it. The tabs are not
+            // on the raised part; that is the whole difference between a tab
+            // cut into a bar and a button lying on one.
+            //
+            // It reaches the document's edges rather than the strip's own
+            // rectangle, because the bar the screen paints under the
+            // navigation document does, and one that stopped short of the
+            // window's sides would be a floating row.
+            let band = tabs_band(rect, clip);
+            let line = band.y + band.h - 1;
+            // Raised everywhere, then the desk's own colour punched into the
+            // middle where the tabs stand. What is left raised is a cap
+            // above, a foot below, and a margin at each end: exactly what the
+            // navigation bar was, where the screen filled the bar and the
+            // document's window painted its inset frame over it. The punched
+            // rectangle is the same frame the tabs were laid out in, from
+            // the same function, so the two cannot part company.
+            canvas.fill_rect(band, raised());
+            canvas.fill_rect(tabs_frame(fonts, rect, clip), background());
+            canvas.fill_rect(Rect::new(band.x, line, band.w, 1), border());
+        }
+
+        // A tab is a button that says which one you are on, exactly as the
+        // navigation bar's agentdesks are: the chosen one wears the primary
+        // emphasis, the rest wear none and vanish into the band behind them.
+        // Through the same face, so the two cannot drift apart.
+        Tag::Tab => {
+            let chosen = node.flag("selected");
+            // Neither the press nor the focus ring is drawn. Both are states
+            // the navigation bar's tabs never show, and the ring is what
+            // makes switching quickly flash: the moment a tab is pressed it
+            // takes focus and outlines itself in the accent, and only a
+            // frame later, once the application has answered, does it fill.
+            // An outline that becomes a fill is a flash. Being the chosen
+            // one is the only thing a tab says about itself.
+            paint_control_face(canvas, rect, chosen.then_some("primary"), disabled, false, false);
+
+            // The words sit where they sat when the room for the cross was
+            // four spaces on the end of them: the padded string is centred
+            // and only the label itself is drawn.
+            let label = label_of(node);
+            let room = tab_label_room(label, node.flag("closable"));
+            let width = fonts.measure(&room, &style);
+            canvas.clipped(rect.inset(1), |canvas| {
+                canvas.draw_text(
+                    fonts,
+                    label,
+                    rect.x + ((rect.w - width) / 2).max(control_pad()),
+                    centred(rect.h),
+                    &style,
+                    ink,
+                );
+            });
+            if node.flag("closable") {
+                draw_tab_close(canvas, rect, chosen);
+            }
         }
 
         Tag::Row => {
@@ -2107,7 +2514,7 @@ fn paint_node(
         for child in dialogs {
             paint_node(canvas, fonts, images, tree, layout, child, focus);
         }
-        for select in tree.open_selects() {
+        for select in tree.open_overlays() {
             paint_popup(canvas, fonts, images, tree, layout, select, focus);
         }
     } else if node.tag == Tag::Select {
@@ -2285,7 +2692,13 @@ mod tests {
         let mut down = HashMap::new();
         let mut across = HashMap::new();
         let columns = HashMap::new();
-        let layout = layout(&fonts, &doc, &Frame::Whole(area), &mut down, &mut across, &columns);
+        let mut state = Ephemeral {
+            scroll: &mut down,
+            scroll_x: &mut across,
+            columns: &columns,
+            context_at: None,
+        };
+        let layout = layout(&fonts, &doc, &Frame::Whole(area), &mut state);
         (doc, layout)
     }
 
@@ -2380,8 +2793,78 @@ mod tests {
         let mut across = HashMap::new();
         across.insert("#sheet".to_owned(), 100_000);
         let columns = HashMap::new();
-        let _ = layout(&fonts, &doc, &Frame::Whole(Rect::new(0, 0, 400, 300)), &mut down, &mut across, &columns);
+        let mut state = Ephemeral {
+            scroll: &mut down,
+            scroll_x: &mut across,
+            columns: &columns,
+            context_at: None,
+        };
+        {
+            // Scoped, so the borrow ends before the map is read back.
+            let _ = layout(&fonts, &doc, &Frame::Whole(Rect::new(0, 0, 400, 300)), &mut state);
+        }
         let held = across.get("#sheet").copied().unwrap();
         assert!(held < 400, "an offset past the last column survived: {held}");
+    }
+
+    const STRIP: &str = r#"<window title="Sheet">
+        <vstack gap="sm" grow="true">
+          <tabs gap="sm">
+            <tab id="one" label="Sheet 1" closable="true" movable="true" selected="true" description="a"/>
+            <tab id="two" label="Sheet 2" closable="true" movable="true" description="b"/>
+            <field id="rename" value="Sheet 1" description="the name being typed"/>
+            <button id="new" label="+" description="adds one"/>
+          </tabs>
+          <text>a note</text>
+        </vstack>
+      </window>"#;
+
+    /// The band a strip paints runs to the edges of what it is clipped to,
+    /// so its tabs have to start from there too. Measured from the strip's
+    /// own box instead, an application's tabs stood a window's padding
+    /// further in than the navigation bar's, which is a margin the bar does
+    /// not have and nobody asked for.
+    #[test]
+    fn tabs_start_where_their_band_does() {
+        let (doc, layout) = placed(STRIP, Rect::new(0, 0, 600, 400));
+        let first = doc.index_of("#one").expect("the first tab");
+        assert_eq!(
+            layout.rect_of(first).x,
+            10,
+            "the first tab did not start at the band's own margin"
+        );
+    }
+
+    /// A tab is deliberately cut off at the bottom by the frame it stands in,
+    /// which is what makes it a tab rather than a button lying on a bar. A
+    /// box with a border all the way round is not, and the navigation bar's
+    /// rename field is one: it lost its bottom edge to the same clip.
+    #[test]
+    fn a_box_in_a_strip_keeps_its_bottom_edge() {
+        let (doc, layout) = placed(STRIP, Rect::new(0, 0, 600, 400));
+        let field = doc.index_of("#rename").expect("the field");
+        let rect = layout.rect_of(field);
+        let clip = layout.clips[field];
+        assert!(
+            rect.y + rect.h <= clip.y + clip.h,
+            "the field ran past what is visible: {rect:?} in {clip:?}"
+        );
+    }
+
+    /// The slot a dragged tab belongs in, which the navigation bar and an
+    /// application's strip both ask for. It holds no state on purpose: input
+    /// arrives several motions to one repaint, and every one of them has to
+    /// agree about where the tab is going.
+    #[test]
+    fn a_dragged_tab_takes_the_slot_its_pointer_is_in() {
+        let rects = [
+            Rect::new(0, 0, 100, 20),
+            Rect::new(100, 0, 100, 20),
+            Rect::new(200, 0, 100, 20),
+        ];
+        assert_eq!(tab_slot(&rects, 2, 10), 0, "carried to the front");
+        assert_eq!(tab_slot(&rects, 2, 250), 2, "left where it was");
+        assert_eq!(tab_slot(&rects, 0, 120), 0, "not past the next middle yet");
+        assert_eq!(tab_slot(&rects, 0, 160), 1, "past it now");
     }
 }

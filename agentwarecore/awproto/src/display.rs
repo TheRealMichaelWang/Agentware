@@ -62,6 +62,29 @@ pub const ACTION_DESELECT: &str = "deselect";
 /// `open` state, as it owns every other, and answers by re-rendering.
 pub const ACTION_OPEN: &str = "open";
 pub const ACTION_CLOSE: &str = "close";
+/// A run of cells chosen at once: the target is one corner and the value is
+/// the id of the other. One event for one gesture, because a drag across a
+/// grid is one thing a person did, and because an agent saying "A1 through
+/// C5" in a single intent is legible in a way fifteen selects are not.
+pub const ACTION_SELECT_RANGE: &str = "select-range";
+/// The other mouse button, on the node under it. Carries no meaning of its
+/// own: an application answers by opening one of its menus, or ignores it.
+///
+/// Not in the agent's vocabulary. An agent opens a menu by naming it, which
+/// is the same command reached without a pointer, so nothing here needs a
+/// second path for it.
+pub const ACTION_CONTEXT: &str = "context";
+/// A tab carried into another position: the value is the slot it should take
+/// among its strip's tabs, counting from zero.
+///
+/// The order is the application's, unlike the navigation bar's, whose order
+/// is chrome and never told to a workspace. So the compositor does not
+/// rearrange anything here: it says where the hand put the tab and the
+/// application answers by re-rendering, exactly as it answers a `scroll`.
+/// One event each time the pointer crosses another tab's middle, on the same
+/// principle as one event per keystroke.
+pub const ACTION_MOVE: &str = "move";
+
 /// A table asked to move its window: the value is the row that should now be
 /// first. The application owns which rows it has sent, exactly as it owns a
 /// dropdown's `open`, and answers by re-rendering with a new `first-row`.

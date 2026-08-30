@@ -160,6 +160,20 @@ pub struct Client {
     /// A column edge being dragged: which column, where the pointer took
     /// hold, and how wide it was when it did.
     column_drag: Option<(String, i32, i32)>,
+    /// A run of cells being dragged out: the corner it started from, by key
+    /// and by id, and the cell the run currently reaches. The id is kept
+    /// because it is what the application is told; the key because it is what
+    /// survives a re-render.
+    cell_drag: Option<(String, String)>,
+    cell_extent: Option<String>,
+    /// A tab being carried to another position: its key, and the slot it was
+    /// last told to take. The slot is remembered so that crossing the same
+    /// midpoint twice in one burst does not tell the application twice.
+    tab_drag: Option<(String, usize)>,
+    /// Where the last right-press landed, while it still stands. An open menu
+    /// hangs from here, which is what makes a context menu appear under the
+    /// hand rather than wherever the application happened to put the menu.
+    context_at: Option<(i32, i32)>,
     /// Whether this client's caret is drawn lit right now. Written by the
     /// compositor before painting: only the client keystrokes actually go to
     /// gets a caret at all, and its phase comes from the screen's blink clock.
@@ -230,6 +244,10 @@ impl Client {
             columns: HashMap::new(),
             selecting: None,
             column_drag: None,
+            cell_drag: None,
+            cell_extent: None,
+            tab_drag: None,
+            context_at: None,
             caret_on: false,
             scroll_shown: None,
             scroll_drag: None,
@@ -471,14 +489,13 @@ impl Client {
 
     fn relayout(&mut self, fonts: &Fonts) {
         let Some(doc) = &self.doc else { return };
-        self.layout = ui::layout(
-            fonts,
-            doc,
-            &self.frame,
-            &mut self.scroll,
-            &mut self.scroll_x,
-            &self.columns,
-        );
+        let mut state = ui::Ephemeral {
+            scroll: &mut self.scroll,
+            scroll_x: &mut self.scroll_x,
+            columns: &self.columns,
+            context_at: self.context_at,
+        };
+        self.layout = ui::layout(fonts, doc, &self.frame, &mut state);
     }
 
     /// How tall this client's document wants to be at a given width, or `None`
@@ -704,7 +721,7 @@ impl Client {
 
         let node = doc.tree.node(index);
         let rect = self.layout.rect_of(index);
-        let actions = node.tag.actions(node.disabled()).join(" ");
+        let actions = awml::actions_of(&doc.tree, index).join(" ");
         format!(
             "focus: <{}> id={} at {},{} {}x{} actions: {}",
             node.tag.name(),
@@ -724,6 +741,7 @@ impl Client {
     pub fn handle(&mut self, fonts: &Fonts, event: Event, clipboard: &mut Clipboard) -> bool {
         match event {
             Event::ButtonPressed { button: Button::Left, x, y } => self.click(fonts, x, y),
+            Event::ButtonPressed { button: Button::Right, x, y } => self.context(fonts, x, y),
             Event::Scrolled { delta, x, y } => self.wheel(fonts, delta, x, y),
             Event::KeyPressed(key) => self.key(fonts, key, clipboard),
             _ => false,
@@ -738,6 +756,112 @@ impl Client {
     /// Whether a column edge is being dragged.
     pub fn sizing_column(&self) -> bool {
         self.column_drag.is_some()
+    }
+
+    /// Whether a run of cells is being dragged out.
+    pub fn selecting_cells(&self) -> bool {
+        self.cell_drag.is_some()
+    }
+
+    /// Whether a tab is being carried along its strip.
+    pub fn moving_tab(&self) -> bool {
+        self.tab_drag.is_some()
+    }
+
+    /// The other mouse button, on whatever is under it.
+    ///
+    /// It carries no meaning of its own: what a right-press means is the
+    /// application's to decide, and all this does is say where it landed and
+    /// on what. An application answers by opening one of its menus, and the
+    /// compositor hangs that menu from here, which is the whole of what makes
+    /// a context menu appear under the hand.
+    ///
+    /// Not in the agent's vocabulary. An agent opens a menu by naming it,
+    /// which reaches the same commands without a pointer.
+    fn context(&mut self, fonts: &Fonts, x: i32, y: i32) -> bool {
+        self.context_at = Some((x, y));
+        let Some(doc) = &self.doc else { return false };
+        let target = self
+            .layout
+            .hit(&doc.tree, x, y)
+            .and_then(|index| doc.tree.node(index).id())
+            .unwrap_or_default()
+            .to_owned();
+        self.note = if target.is_empty() {
+            format!("the other button at {x},{y}")
+        } else {
+            format!("the other button on {target}")
+        };
+        self.emit(&target, display::ACTION_CONTEXT, "");
+        // The menu the application may open in answer hangs from the press,
+        // so the layout has to be built against it.
+        self.relayout(fonts);
+        true
+    }
+
+    /// Carry a run of cells out under the pointer.
+    ///
+    /// One event per cell the run reaches, in the same spirit as one event
+    /// per keystroke: what the application hears is what the hand did, as it
+    /// does it, and the highlight it paints in answer is its own.
+    pub fn drag_cells(&mut self, x: i32, y: i32) -> bool {
+        let Some((anchor_key, anchor_id)) = self.cell_drag.clone() else { return false };
+        let Some(doc) = &self.doc else { return false };
+        let Some(index) = self.layout.hit(&doc.tree, x, y) else { return false };
+        if doc.tree.node(index).tag != Tag::Cell {
+            return false;
+        }
+        // Both corners must be in the same grid: a run that started in one
+        // table and ended in another is not a run of anything.
+        let same = doc
+            .index_of(&anchor_key)
+            .and_then(|anchor| Some((doc.tree.table_of(anchor)?, doc.tree.table_of(index)?)))
+            .is_some_and(|(from, to)| from == to);
+        if !same {
+            return false;
+        }
+
+        let reached = doc.tree.node(index).id().unwrap_or_default().to_owned();
+        if reached.is_empty() || self.cell_extent.as_deref() == Some(reached.as_str()) {
+            return false;
+        }
+        self.cell_extent = Some(reached.clone());
+        self.note = format!("{anchor_id} through {reached}");
+        self.emit(&anchor_id, display::ACTION_SELECT_RANGE, &reached);
+        true
+    }
+
+    pub fn end_cell_drag(&mut self) {
+        self.cell_drag = None;
+        self.cell_extent = None;
+    }
+
+    /// Carry a tab along its strip.
+    ///
+    /// Where the pointer falls among the other tabs' middles is the slot this
+    /// one belongs in, which is the navigation bar's rule from the navigation
+    /// bar's function. The difference is who does the rearranging: the bar's
+    /// order is the compositor's, so it reorders itself, and an application's
+    /// is the application's, so it is told and answers with a new tree. One
+    /// event per slot crossed, the way a run of cells sends one per cell.
+    pub fn drag_tabs(&mut self, fonts: &Fonts, x: i32) -> bool {
+        let Some((key, last)) = self.tab_drag.clone() else { return false };
+        let Some(doc) = &self.doc else { return false };
+        let Some(index) = doc.index_of(&key) else { return false };
+        let Some(strip) = doc.tree.node(index).parent else { return false };
+        let tabs = doc.tree.tabs(strip);
+        let Some(held) = tabs.iter().position(|&tab| tab == index) else { return false };
+        let rects: Vec<Rect> = tabs.iter().map(|&tab| self.layout.rect_of(tab)).collect();
+        let slot = ui::tab_slot(&rects, held, x);
+        if slot == last {
+            return false;
+        }
+        self.tab_drag = Some((key, slot));
+        self.act(fonts, index, "move", &slot.to_string()).is_ok()
+    }
+
+    pub fn end_tab_drag(&mut self) {
+        self.tab_drag = None;
     }
 
     /// Extend the selection to wherever the pointer has got to.
@@ -841,7 +965,7 @@ impl Client {
         // A click anywhere but on an open dropdown or its options closes it,
         // and does nothing else: the press that dismisses a menu is not also
         // a press on what was behind it.
-        if let Some(open) = doc.tree.open_selects().last().copied()
+        if let Some(open) = doc.tree.open_overlays().last().copied()
             && !hit.is_some_and(|index| index == open || doc.tree.node(index).parent == Some(open))
         {
             let _ = self.act(fonts, open, "close", "");
@@ -875,8 +999,13 @@ impl Client {
             return true;
         }
 
+        let rect = self.layout.rect_of(index);
         let already = self.focus.as_deref() == Some(key.as_str());
         self.focus = Some(key.clone());
+        // A press with the ordinary button ends whatever the other one had
+        // standing, so a menu bar's items hang from the menu and not from
+        // wherever the last right-press happened to be.
+        self.context_at = None;
 
         // A click on a text control places the caret and reports nothing: where
         // the caret is inside a value is not the application's business.
@@ -888,6 +1017,12 @@ impl Client {
             // because there is no double click in the event vocabulary and
             // adding one would be a second way to produce an event.
             if tag == Tag::Cell && !(already && editable) {
+                // The press is also where a run of cells would start. Whether
+                // it becomes one is decided by whether the pointer moves,
+                // exactly as it is for a run of text.
+                let id = doc.tree.node(index).id().unwrap_or_default().to_owned();
+                self.cell_drag = Some((key.clone(), id));
+                self.cell_extent = None;
                 let _ = self.act(fonts, index, "select", "");
                 return true;
             }
@@ -915,13 +1050,40 @@ impl Client {
         // pressing the box means invert it.
         // A dropdown's box opens or closes it, and one of its options is
         // chosen: what a person pressing each of them means.
+        // A movable tab is also where a drag along the strip would start.
+        // Whether it becomes one is decided by whether the pointer moves,
+        // exactly as it is for a run of cells or a run of text. The cross is
+        // not part of it: a press there is a close, not a grip.
+        let carried = if tag == Tag::Tab
+            && node.flag("movable")
+            && !(node.flag("closable") && x >= rect.x + rect.w - ui::tab_close_w())
+        {
+            doc.tree
+                .node(index)
+                .parent
+                .and_then(|strip| doc.tree.tabs(strip).iter().position(|&tab| tab == index))
+        } else {
+            None
+        };
+
         let action = match tag {
             Tag::Checkbox => display::ACTION_TOGGLE,
-            Tag::Select if node.flag("open") => "close",
-            Tag::Select => "open",
-            Tag::Option | Tag::Row => "select",
+            Tag::Select | Tag::Menu if node.flag("open") => "close",
+            Tag::Select | Tag::Menu => "open",
+            // The cross at a tab's right end closes it; anywhere else on it
+            // chooses it. The same division the navigation bar makes, at the
+            // same place on the tab, because it is the same cross.
+            Tag::Tab if node.flag("closable") && x >= rect.x + rect.w - ui::tab_close_w() => {
+                display::ACTION_CLOSE
+            }
+            // A header, a row's gutter, a tab: pressing any of them means
+            // choosing it, so the event is the one a person produced.
+            Tag::Option | Tag::Row | Tag::Column | Tag::Tab => "select",
             _ => display::ACTION_CLICK,
         };
+        if let Some(slot) = carried {
+            self.tab_drag = Some((key, slot));
+        }
         let _ = self.act(fonts, index, action, "");
         true
     }
@@ -975,11 +1137,14 @@ impl Client {
         // Focus is the compositor's. An application is never told about it,
         // which is why it is not in the event vocabulary at all.
         self.focus = Some(key.clone());
+        // An agent's action is not a right-press, so a menu it opens hangs
+        // from the menu rather than from wherever the human last pressed.
+        self.context_at = None;
 
         // Anything that activates a control shows a press. Typing does not: the
         // characters appearing is the feedback, and a field that flashed on
         // every keystroke would be unreadable.
-        if !matches!(action, "focus" | "type-text" | "clear") {
+        if !matches!(action, "focus" | "type-text" | "clear" | "move") {
             self.press = Some((key.clone(), Instant::now()));
         }
 
@@ -1000,6 +1165,24 @@ impl Client {
                 }
             }
 
+            // A run of cells, named by its two corners. The value is the
+            // other corner's id, which is checked here rather than passed on
+            // trust: an application told about a corner that does not exist
+            // would be told about a run that is not one.
+            "select-range" => {
+                let Some(other) = self.node_by_id(value) else {
+                    return Err(agent::REASON_NO_SUCH_NODE);
+                };
+                let Some(doc) = &self.doc else { return Err(agent::REASON_NO_SUCH_NODE) };
+                if doc.tree.node(other).tag != Tag::Cell {
+                    return Err(agent::REASON_UNSUPPORTED);
+                }
+                if doc.tree.table_of(index) != doc.tree.table_of(other) {
+                    return Err(agent::REASON_UNSUPPORTED);
+                }
+                self.emit(&id, display::ACTION_SELECT_RANGE, value);
+            }
+
             // A dropdown's option is always reported when chosen, even the
             // one already chosen: choosing is also what closes the list, and
             // an application that hears nothing would leave it open.
@@ -1013,6 +1196,36 @@ impl Client {
                         display::ACTION_DESELECT
                     };
                     self.emit(&id, verb, "");
+                }
+            }
+
+            // A tab's close is not a state to be made true, it is a thing
+            // done once: what it means is "take this one away", and the
+            // application answers by not sending it again.
+            "close" if tag == Tag::Tab => self.emit(&id, display::ACTION_CLOSE, ""),
+
+            // A tab carried to another position. The slot is checked here
+            // rather than passed on trust, for the same reason a run of
+            // cells checks its other corner: an application told to put a
+            // tab in a slot that does not exist has been told nothing. A tab
+            // already in that slot sends nothing, like every other
+            // unconditional form.
+            "move" if tag == Tag::Tab => {
+                let Some(doc) = &self.doc else { return Err(agent::REASON_NO_SUCH_NODE) };
+                let tabs = doc
+                    .tree
+                    .node(index)
+                    .parent
+                    .map(|strip| doc.tree.tabs(strip))
+                    .unwrap_or_default();
+                let Ok(slot) = value.parse::<usize>() else {
+                    return Err(agent::REASON_UNSUPPORTED);
+                };
+                if slot >= tabs.len() {
+                    return Err(agent::REASON_UNSUPPORTED);
+                }
+                if tabs[slot] != index {
+                    self.emit(&id, display::ACTION_MOVE, value);
                 }
             }
 
@@ -1108,10 +1321,7 @@ impl Client {
     /// more use to an agent than any remark about where it is on screen.
     pub fn offers(&self, index: usize, action: &str) -> bool {
         let Some(doc) = &self.doc else { return false };
-        let node = doc.tree.node(index);
-        node.tag
-            .actions_for(doc.tree.inert(index), node.flag("editable"))
-            .contains(&action)
+        awml::actions_of(&doc.tree, index).contains(&action)
     }
 
     /// One numeric attribute, for the compositor's own arithmetic about a
@@ -1693,6 +1903,7 @@ mod tests {
 
     use crate::paint::Rect;
     use crate::ui::Frame;
+    use awproto::Decoder;
     use std::os::unix::net::UnixStream;
 
     /// A client holding one tree, framed into a rectangle.
@@ -1791,7 +2002,7 @@ mod tests {
 
     fn window(first: i32, rows: &[i32]) -> String {
         let mut out = format!(
-            "<window pad=\"none\"><table id=\"sheet\" grow=\"true\" rows=\"1000\"              first-row=\"{first}\" description=\"The grid\"><column label=\"A\" chars=\"8\"/>"
+            "<window pad=\"none\"><table id=\"sheet\" grow=\"true\" rows=\"1000\"              first-row=\"{first}\" description=\"The grid\">             <column label=\"A\" chars=\"8\"/><column label=\"B\" chars=\"8\"/>"
         );
         for &row in rows {
             out.push_str(&format!(
@@ -1851,6 +2062,112 @@ mod tests {
         assert_eq!(client.focus_state().node, Some(back), "the cell cursor did not come back");
     }
 
+    /// Whatever the client has said to its application, without waiting for
+    /// more. Non-blocking, so a test that expected an event and got none
+    /// fails rather than hanging.
+    fn said(peer: &mut UnixStream) -> Vec<Vec<String>> {
+        peer.set_nonblocking(true).unwrap();
+        let mut decoder = Decoder::with_limit(1024 * 1024);
+        let mut buf = [0u8; 8192];
+        loop {
+            match peer.read(&mut buf) {
+                Ok(0) => break,
+                Ok(read) => decoder.feed(&buf[..read]),
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) => panic!("reading the peer: {err}"),
+            }
+        }
+        let mut out = Vec::new();
+        while let Some(fields) = decoder.next_frame().unwrap() {
+            out.push(fields);
+        }
+        out
+    }
+
+    /// Dragging across cells is one gesture, so it is one kind of event, sent
+    /// as the run grows. The application paints the highlight; the compositor
+    /// only says what the hand did.
+    #[test]
+    fn dragging_across_cells_reports_a_run() {
+        let (fonts, mut client, mut peer) =
+            framed(&window(0, &[1, 2, 3]), Rect::new(0, 0, 400, 300));
+        let mut clipboard = Clipboard::default();
+
+        // Press on A1, which selects it and arms the drag.
+        let a1 = client.layout.rect_of(client.node_by_id("A1").unwrap());
+        client.handle(
+            &fonts,
+            Event::ButtonPressed { button: Button::Left, x: a1.x + 2, y: a1.y + 2 },
+            &mut clipboard,
+        );
+        assert!(client.selecting_cells(), "the press did not arm a run");
+        let opening = said(&mut peer);
+        assert!(
+            opening.iter().any(|fields| fields[3] == display::ACTION_SELECT && fields[2] == "A1"),
+            "the press did not choose the cell it landed on: {opening:?}"
+        );
+
+        // Carry it to B3.
+        let b3 = client.layout.rect_of(client.node_by_id("B3").unwrap());
+        client.drag_cells(b3.x + 2, b3.y + 2);
+        let dragged = said(&mut peer);
+        let run = dragged
+            .iter()
+            .find(|fields| fields[3] == display::ACTION_SELECT_RANGE)
+            .unwrap_or_else(|| panic!("no run was reported: {dragged:?}"));
+        assert_eq!(run[2], "A1", "the run does not start where the press did");
+        assert_eq!(run[4], "B3", "the run does not reach where the pointer is");
+
+        // The same cell again says nothing: one event per cell reached, not
+        // one per pixel of pointer motion.
+        client.drag_cells(b3.x + 3, b3.y + 3);
+        assert!(said(&mut peer).is_empty(), "a run was reported twice for one cell");
+    }
+
+    /// An agent naming both corners, and the two ways that can be wrong.
+    #[test]
+    fn an_agent_names_both_corners_of_a_run() {
+        let (fonts, mut client, mut peer) =
+            framed(&window(0, &[1, 2, 3]), Rect::new(0, 0, 400, 300));
+        let a1 = client.node_by_id("A1").unwrap();
+
+        assert_eq!(client.act(&fonts, a1, "select-range", "B3"), Ok(()));
+        let said = said(&mut peer);
+        let run = said.iter().find(|f| f[3] == display::ACTION_SELECT_RANGE).expect("a run");
+        assert_eq!((run[2].as_str(), run[4].as_str()), ("A1", "B3"));
+
+        // A corner that does not exist is not a corner.
+        assert_eq!(
+            client.act(&fonts, a1, "select-range", "Z99"),
+            Err(awproto::agent::REASON_NO_SUCH_NODE)
+        );
+    }
+
+    /// The other button says where it landed and on what, and nothing else.
+    /// What it means is the application's to decide.
+    #[test]
+    fn the_other_button_reports_what_was_under_it() {
+        let (fonts, mut client, mut peer) =
+            framed(&window(0, &[1, 2, 3]), Rect::new(0, 0, 400, 300));
+        let mut clipboard = Clipboard::default();
+        let b2 = client.layout.rect_of(client.node_by_id("B2").unwrap());
+
+        client.handle(
+            &fonts,
+            Event::ButtonPressed { button: Button::Right, x: b2.x + 2, y: b2.y + 2 },
+            &mut clipboard,
+        );
+        let said = said(&mut peer);
+        let context = said
+            .iter()
+            .find(|fields| fields[3] == display::ACTION_CONTEXT)
+            .unwrap_or_else(|| panic!("nothing was reported: {said:?}"));
+        assert_eq!(context[2], "B2", "reported on the wrong node");
+        // And it is remembered, because a menu opened in answer hangs from it.
+        assert_eq!(client.context_at, Some((b2.x + 2, b2.y + 2)));
+    }
+
     fn editing(value: &str, anchor: Option<usize>, caret: usize) -> Editing {
         Editing { value: value.to_owned(), caret, anchor, outstanding: Vec::new() }
     }
@@ -1893,6 +2210,125 @@ mod tests {
         assert_eq!(state.selected_text().as_deref(), Some("héllo "));
         assert!(state.delete_selection());
         assert_eq!(state.value, "wörld");
+    }
+
+    /// A tab does not flash when it is pressed, and the rule is not in
+    /// either click path.
+    ///
+    /// The navigation bar's tabs go through `click_nav` and an application's
+    /// through `Client::act`, so anything that made them look alike by
+    /// matching conditions in both would be one edit away from not. The
+    /// press is still recorded here, uniformly, for whatever is pressed;
+    /// what a tab does with it is the paint's business, and the paint is
+    /// shared.
+    #[test]
+    fn a_tab_records_a_press_and_renders_none() {
+        let source = r#"<window pad="none"><tabs>
+             <tab id="one" label="One" selected="true" description="The first"/>
+             <tab id="two" label="Two" description="The second"/>
+           </tabs></window>"#;
+        let (fonts, mut client, _peer) = framed(source, Rect::new(0, 0, 400, 100));
+        let two = client.node_by_id("two").unwrap();
+
+        client.act(&fonts, two, "select", "").expect("chosen");
+        // Recorded, exactly as it is for a button: the click path knows
+        // nothing about tabs.
+        assert!(client.press.is_some(), "the press was special-cased away in the click path");
+        // And not rendered, which is the half that keeps the two bars alike.
+        assert_eq!(
+            client.focus_state().pressed,
+            Some(two),
+            "the paint is not being handed the press to ignore"
+        );
+    }
+
+    /// A tab carried along its strip tells the application where the hand put
+    /// it, and nothing else.
+    ///
+    /// This is the half that cannot be shared with the navigation bar. The
+    /// arithmetic is: `ui::tab_slot` answers for both. What differs is who
+    /// owns the order. The bar's is the compositor's, so it rearranges
+    /// itself; an application's is the application's, so it is told and
+    /// answers with a new tree, exactly as it answers a table's `scroll`.
+    #[test]
+    fn a_movable_tab_reports_where_it_was_carried() {
+        let source = r#"<window pad="none"><tabs>
+             <tab id="one" label="One" selected="true" movable="true" description="The first"/>
+             <tab id="two" label="Two" movable="true" description="The second"/>
+             <tab id="three" label="Three" movable="true" description="The third"/>
+           </tabs></window>"#;
+        let (fonts, mut client, mut peer) = framed(source, Rect::new(0, 0, 400, 100));
+        let mut clipboard = Clipboard::default();
+
+        // Press the last one, which chooses it and takes hold of it.
+        let three = client.layout.rect_of(client.node_by_id("three").unwrap());
+        client.handle(
+            &fonts,
+            Event::ButtonPressed { button: Button::Left, x: three.x + 2, y: three.y + 2 },
+            &mut clipboard,
+        );
+        assert!(client.moving_tab(), "the press did not take hold of the tab");
+        let _ = said(&mut peer);
+
+        // Carry it past the first tab's middle.
+        let one = client.layout.rect_of(client.node_by_id("one").unwrap());
+        assert!(client.drag_tabs(&fonts, one.x + 2), "the drag reported nothing");
+        let moved = said(&mut peer);
+        let event = moved
+            .iter()
+            .find(|fields| fields[3] == display::ACTION_MOVE)
+            .unwrap_or_else(|| panic!("no move was reported: {moved:?}"));
+        assert_eq!(event[2], "three", "the wrong tab was carried");
+        assert_eq!(event[4], "0", "the slot is not where the pointer is");
+
+        // The same slot again says nothing: one event per slot crossed.
+        assert!(!client.drag_tabs(&fonts, one.x + 3), "the same slot was sent twice");
+
+        // A tab nobody marked movable is not one, and an agent asking is
+        // told so rather than quietly reordering somebody's sheets.
+        let source = r#"<window pad="none"><tabs>
+             <tab id="one" label="One" selected="true" description="The first"/>
+             <tab id="two" label="Two" description="The second"/>
+           </tabs></window>"#;
+        let (fonts, mut client, _peer) = framed(source, Rect::new(0, 0, 400, 100));
+        let two = client.node_by_id("two").unwrap();
+        assert_eq!(
+            client.act(&fonts, two, "move", "0"),
+            Err(agent::REASON_UNSUPPORTED),
+            "a tab that cannot be moved was moved"
+        );
+    }
+
+    /// A strip is a cap, the tabs, a foot and a hairline.
+    ///
+    /// Read out of the navigation bar a pixel at a time: down a column
+    /// between two of its tabs there are three rows of `raised`, then
+    /// twenty-six of `background`, then two of `raised` and one of `border`.
+    /// What matters is the middle: its tabs stand on the same colour as the
+    /// desk behind the bar, not on a raised band. Painting the band and
+    /// putting tabs on it is what made them look like buttons lying on a
+    /// bar, and it took three attempts because it cannot be seen by looking,
+    /// only by reading the pixels.
+    #[test]
+    fn a_tab_strip_leaves_band_showing_above_and_below() {
+        let source = r#"<window pad="none"><tabs>
+             <tab id="one" label="One" selected="true" description="The first"/>
+             <tab id="two" label="Two" description="The second"/>
+           </tabs></window>"#;
+        let (_fonts, client, _peer) = framed(source, Rect::new(0, 0, 400, 100));
+        let doc = client.doc.as_ref().unwrap();
+        let strip = (0..doc.tree.nodes.len())
+            .find(|&at| doc.tree.node(at).tag == Tag::Tabs)
+            .expect("the strip");
+        let tab = client.node_by_id("one").unwrap();
+
+        let band = client.layout.rect_of(strip);
+        let sits = client.layout.rect_of(tab);
+        assert!(sits.y > band.y, "no cap above the tab");
+        assert!(
+            sits.y + sits.h < band.y + band.h - 1,
+            "no foot below the tab for the hairline to sit under"
+        );
     }
 
     /// A press that never moved is a caret, not a selection.
