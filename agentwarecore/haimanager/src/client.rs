@@ -48,6 +48,7 @@ use awproto::agent;
 use awproto::display::{self, MAX_TREE};
 
 use crate::awml::{self, Tag};
+use crate::clipboard::Clipboard;
 use crate::document::Document;
 use crate::images::Images;
 use crate::input::{Button, Event, Key};
@@ -63,6 +64,9 @@ use crate::ui::{self, Focus, Frame, Layout};
 /// and holding its backlog forever would let one wedged application consume
 /// memory in the one process that owns the screen.
 const MAX_BACKLOG: usize = 256 * 1024;
+
+/// How many rows one notch of the wheel moves a table.
+const WHEEL_ROWS: i32 = 3;
 
 /// How long a scrollbar stays on screen after its content last moved.
 const SCROLLBAR_LINGER: Duration = Duration::from_millis(900);
@@ -99,6 +103,11 @@ struct Editing {
     value: String,
     /// Caret position, in characters.
     caret: usize,
+    /// Where a selection began, when there is one. The selected run is
+    /// everything between this and the caret, in either order, and it is the
+    /// compositor's alone: an application is told what the value became, not
+    /// which part of it was highlighted on the way.
+    anchor: Option<usize>,
     /// Values sent to the application and not yet seen echoed back in a tree.
     outstanding: Vec<String>,
 }
@@ -137,6 +146,20 @@ pub struct Client {
     focus: Option<String>,
     editing: HashMap<String, Editing>,
     scroll: HashMap<String, i32>,
+    /// Offsets across, which only a table has. Kept apart from the offsets
+    /// down rather than paired with them, because every scroll container has
+    /// one of those and almost nothing has one of these.
+    scroll_x: HashMap<String, i32>,
+    /// Column widths the human dragged, in pixels, keyed by the column's
+    /// identity. Ephemeral like the rest of this: an application says what a
+    /// column should start at and is never told it moved, for the same reason
+    /// it is never told where its window is.
+    columns: HashMap<String, i32>,
+    /// A text control whose selection is being dragged out by the pointer.
+    selecting: Option<String>,
+    /// A column edge being dragged: which column, where the pointer took
+    /// hold, and how wide it was when it did.
+    column_drag: Option<(String, i32, i32)>,
     /// Whether this client's caret is drawn lit right now. Written by the
     /// compositor before painting: only the client keystrokes actually go to
     /// gets a caret at all, and its phase comes from the screen's blink clock.
@@ -148,6 +171,9 @@ pub struct Client {
     /// the thumb it was grabbed, so the thumb tracks the hand rather than
     /// jumping to centre itself under it.
     scroll_drag: Option<(String, i32)>,
+    /// Whether the bar being dragged is the one across. A table has two, and
+    /// they share a node, so the axis is what tells them apart.
+    scroll_across: bool,
     /// The control currently showing a press, and when it started.
     ///
     /// Ephemeral in the strictest sense: it lasts a sixth of a second and never
@@ -200,9 +226,14 @@ impl Client {
             focus: None,
             editing: HashMap::new(),
             scroll: HashMap::new(),
+            scroll_x: HashMap::new(),
+            columns: HashMap::new(),
+            selecting: None,
+            column_drag: None,
             caret_on: false,
             scroll_shown: None,
             scroll_drag: None,
+            scroll_across: false,
             press: None,
         })
     }
@@ -360,11 +391,17 @@ impl Client {
     /// resolve to nothing later: a focus ring on a control the application has
     /// removed is a lie about where the next keystroke goes.
     fn reconcile(&mut self, next: &mut Document) {
-        if let Some(key) = &self.focus
-            && !next.has_key(key)
-        {
-            self.focus = None;
-        }
+        // Focus is remembered by identity even when the node is not in the
+        // tree that just arrived. A row outside a table's window has not been
+        // removed, it is merely not being described, and forgetting where the
+        // cell cursor was would mean scrolling past it and back lost it.
+        // While the node is absent the key resolves to nothing, so there is
+        // no ring, no caret and nowhere for a keystroke to land; when the
+        // application describes it again the cursor is where it was left.
+        //
+        // The edit in progress is not kept, deliberately. Every keystroke was
+        // already reported, so the application holds the value; keeping a
+        // local copy across an absence would let a stale one overwrite it.
 
         // A dialog that has just appeared takes the keyboard: focus moves to
         // its first control, unless focus is already inside it. What a dialog
@@ -394,6 +431,7 @@ impl Client {
                     self.editing.entry(key).or_insert(Editing {
                         caret: value.chars().count(),
                         value,
+                        anchor: None,
                         outstanding: Vec::new(),
                     });
                 }
@@ -433,7 +471,14 @@ impl Client {
 
     fn relayout(&mut self, fonts: &Fonts) {
         let Some(doc) = &self.doc else { return };
-        self.layout = ui::layout(fonts, doc, &self.frame, &mut self.scroll);
+        self.layout = ui::layout(
+            fonts,
+            doc,
+            &self.frame,
+            &mut self.scroll,
+            &mut self.scroll_x,
+            &self.columns,
+        );
     }
 
     /// How tall this client's document wants to be at a given width, or `None`
@@ -511,7 +556,8 @@ impl Client {
             ),
             None => (None, 0),
         };
-        Focus { node, caret, pressed, caret_visible: self.caret_on, scrollbar }
+        let anchor = self.focus.as_ref().and_then(|key| self.editing.get(key)?.anchor);
+        Focus { node, caret, anchor, pressed, caret_visible: self.caret_on, scrollbar }
     }
 
     /// Whether keystrokes to this client would land in a text control, which is
@@ -550,48 +596,92 @@ impl Client {
     fn grab_scrollbar(&mut self, fonts: &Fonts, x: i32, y: i32) -> bool {
         let Some(doc) = &self.doc else { return false };
         // Only a visible bar is grabbable. An invisible one that still caught
-        // clicks would make the content's right edge mysteriously dead.
+        // clicks would make the content's right edge mysteriously dead. A
+        // table's bars are always visible, so they are always grabbable.
         let lit = self.focus_state().scrollbar;
 
         for scroller in self.layout.scrollers.iter().rev() {
-            if lit != Some(scroller.node) {
+            if !scroller.asks && !scroller.horizontal && lit != Some(scroller.node) {
                 continue;
             }
             let rect = self.layout.rect_of(scroller.node);
             let Some((track, thumb)) = ui::scrollbar_geometry(rect, scroller) else { continue };
             // The whole track answers, a little widened, because a hairline
             // thumb is a cruel target.
-            let target = Rect::new(track.x - ui::sc(4), track.y, track.w + ui::sc(8), track.h);
+            let target = if scroller.horizontal {
+                Rect::new(track.x, track.y - ui::sc(4), track.w, track.h + ui::sc(8))
+            } else {
+                Rect::new(track.x - ui::sc(4), track.y, track.w + ui::sc(8), track.h)
+            };
             if !target.contains(x, y) {
                 continue;
             }
 
             let key = doc.key(scroller.node).to_owned();
-            let grab = if thumb.contains(x, y) { y - thumb.y } else { thumb.h / 2 };
+            let grab = if scroller.horizontal {
+                if thumb.contains(x, y) { x - thumb.x } else { thumb.w / 2 }
+            } else if thumb.contains(x, y) {
+                y - thumb.y
+            } else {
+                thumb.h / 2
+            };
             self.scroll_drag = Some((key, grab));
-            self.drag_scroll(fonts, y);
+            self.scroll_across = scroller.horizontal;
+            self.drag_scroll(fonts, x, y);
             return true;
         }
         false
     }
 
     /// Follow the hand while a thumb is held.
-    pub fn drag_scroll(&mut self, fonts: &Fonts, y: i32) -> bool {
+    pub fn drag_scroll(&mut self, fonts: &Fonts, x: i32, y: i32) -> bool {
         let Some((key, grab)) = self.scroll_drag.clone() else { return false };
         let Some(doc) = &self.doc else { return false };
         let Some(node) = doc.index_of(&key) else { return false };
-        let Some(scroller) = self.layout.scrollers.iter().find(|s| s.node == node) else {
+        let Some(scroller) = self
+            .layout
+            .scrollers
+            .iter()
+            .find(|scroller| scroller.node == node && scroller.horizontal == self.scroll_across)
+        else {
             return false;
         };
 
         let rect = self.layout.rect_of(node);
         let Some((track, thumb)) = ui::scrollbar_geometry(rect, scroller) else { return false };
-        let travel = (track.h - thumb.h).max(1);
-        let furthest = (scroller.content - scroller.viewport).max(0);
-        let offset = ((y - grab - track.y) * furthest / travel).clamp(0, furthest);
+        let (along, span, start, size) = if scroller.horizontal {
+            (x, track.w, track.x, thumb.w)
+        } else {
+            (y, track.h, track.y, thumb.h)
+        };
+        let travel = (span - size).max(1);
+        let furthest = scroller.furthest();
+        let offset = ((along - grab - start) * furthest / travel).clamp(0, furthest);
+
+        // A table's bar is drawn against the whole sheet, so dragging it is a
+        // question rather than a move: what comes back is a tree holding a
+        // different window.
+        if scroller.asks {
+            let step = scroller.step.max(1);
+            let row = offset / step;
+            if row == scroller.offset / step {
+                return false;
+            }
+            let id = doc.tree.node(node).id().unwrap_or_default().to_owned();
+            if id.is_empty() {
+                return false;
+            }
+            self.note = format!("asked {id} for row {row}");
+            self.emit(&id, display::ACTION_SCROLL, &row.to_string());
+            return true;
+        }
 
         if offset != scroller.offset {
-            self.scroll.insert(key.clone(), offset);
+            if scroller.horizontal {
+                self.scroll_x.insert(key.clone(), offset);
+            } else {
+                self.scroll.insert(key.clone(), offset);
+            }
             self.relayout(fonts);
         }
         self.scroll_shown = Some((key, Instant::now()));
@@ -631,13 +721,104 @@ impl Client {
 
     /// Route one input event into this client. Returns true if the screen needs
     /// repainting.
-    pub fn handle(&mut self, fonts: &Fonts, event: Event) -> bool {
+    pub fn handle(&mut self, fonts: &Fonts, event: Event, clipboard: &mut Clipboard) -> bool {
         match event {
             Event::ButtonPressed { button: Button::Left, x, y } => self.click(fonts, x, y),
             Event::Scrolled { delta, x, y } => self.wheel(fonts, delta, x, y),
-            Event::KeyPressed(key) => self.key(fonts, key),
+            Event::KeyPressed(key) => self.key(fonts, key, clipboard),
             _ => false,
         }
+    }
+
+    /// Whether the pointer is dragging a selection out of a text control.
+    pub fn selecting(&self) -> bool {
+        self.selecting.is_some()
+    }
+
+    /// Whether a column edge is being dragged.
+    pub fn sizing_column(&self) -> bool {
+        self.column_drag.is_some()
+    }
+
+    /// Extend the selection to wherever the pointer has got to.
+    pub fn drag_select(&mut self, fonts: &Fonts, x: i32, y: i32) -> bool {
+        let Some(key) = self.selecting.clone() else { return false };
+        let Some(doc) = &self.doc else { return false };
+        let Some(index) = doc.index_of(&key) else { return false };
+        let caret = self.caret_at(fonts, index, x, y);
+        let Some(state) = self.editing.get_mut(&key) else { return false };
+        if state.caret == caret {
+            return false;
+        }
+        state.caret = caret;
+        true
+    }
+
+    pub fn end_select(&mut self) {
+        let Some(key) = self.selecting.take() else { return };
+        if let Some(state) = self.editing.get_mut(&key)
+            && state.anchor == Some(state.caret)
+        {
+            state.anchor = None;
+        }
+    }
+
+    /// Which character of a text control a point lands on.
+    fn caret_at(&self, fonts: &Fonts, index: usize, x: i32, y: i32) -> usize {
+        let Some(doc) = &self.doc else { return 0 };
+        let node = doc.tree.node(index);
+        let value = match node.attr("value") {
+            Some(value) => value.to_owned(),
+            None if node.tag == Tag::Cell => node.text.clone(),
+            None => String::new(),
+        };
+        let style = ui::style_at(&doc.tree, index);
+        let key = doc.key(index);
+        let current = self.editing.get(key).map_or(0, |state| state.caret);
+        ui::caret_at_point(
+            fonts,
+            &value,
+            &style,
+            node.tag,
+            self.layout.rect_of(index),
+            current,
+            (x, y),
+        )
+    }
+
+    /// Take hold of a column's trailing edge, if the point is on one.
+    fn grab_column(&mut self, x: i32, y: i32) -> bool {
+        let Some(doc) = &self.doc else { return false };
+        for table in (0..doc.tree.nodes.len()).filter(|&i| doc.tree.node(i).tag == Tag::Table) {
+            for column in doc.tree.columns(table) {
+                let rect = self.layout.rect_of(column);
+                if rect.w == 0 || !self.layout.is_visible(column) {
+                    continue;
+                }
+                let edge = Rect::new(rect.x + rect.w - ui::column_grip(), rect.y, ui::column_grip() * 2, rect.h);
+                if edge.contains(x, y) {
+                    self.column_drag = Some((doc.key(column).to_owned(), x, rect.w));
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Carry a column's edge with the pointer.
+    pub fn drag_column(&mut self, fonts: &Fonts, x: i32) -> bool {
+        let Some((key, from, width)) = self.column_drag.clone() else { return false };
+        let next = (width + (x - from)).max(ui::sc(24));
+        if self.columns.get(&key) == Some(&next) {
+            return false;
+        }
+        self.columns.insert(key, next);
+        self.relayout(fonts);
+        true
+    }
+
+    pub fn end_column_drag(&mut self) {
+        self.column_drag = None;
     }
 
     /// Resolve a point to a node and act on it.
@@ -647,6 +828,9 @@ impl Client {
     /// agent path being the same path is what stops it becoming a second
     /// implementation that can disagree.
     fn click(&mut self, fonts: &Fonts, x: i32, y: i32) -> bool {
+        if self.grab_column(x, y) {
+            return true;
+        }
         if self.grab_scrollbar(fonts, x, y) {
             return true;
         }
@@ -676,8 +860,12 @@ impl Client {
         let tag = node.tag;
         let id = node.id().unwrap_or_default().to_owned();
         let key = doc.key(index).to_owned();
-        let value = node.attr("value").unwrap_or("").to_owned();
-        let rect = self.layout.rect_of(index);
+        let editable = node.flag("editable");
+        let value = match node.attr("value") {
+            Some(value) => value.to_owned(),
+            None if tag == Tag::Cell => node.text.clone(),
+            None => String::new(),
+        };
 
         if node.disabled() {
             // Not reported to the application at all. A disabled control has no
@@ -687,25 +875,37 @@ impl Client {
             return true;
         }
 
+        let already = self.focus.as_deref() == Some(key.as_str());
         self.focus = Some(key.clone());
 
         // A click on a text control places the caret and reports nothing: where
-        // the caret is inside a value is not the application's business. The
-        // hit is mapped through the same shift the content was painted with,
-        // and by row for an editor, so the caret lands on the character the
-        // human aimed at rather than where it would be if nothing had
-        // scrolled and everything were one line.
-        if matches!(tag, Tag::Field | Tag::Editor) {
-            let style = ui::style_at(&doc.tree, index);
-            let current = self.editing.get(&key).map_or(0, |state| state.caret);
-            let caret = ui::caret_at_point(fonts, &value, &style, tag, rect, current, (x, y));
-            let state = self.editing.entry(key).or_insert(Editing {
+        // the caret is inside a value is not the application's business.
+        if tag.is_text() {
+            // A cell is chosen before it is edited. The first press selects
+            // it, which is the event a person pressing it produces; a second,
+            // once it already carries the ring, puts the caret in. That is
+            // what a double click means elsewhere, spread over two presses,
+            // because there is no double click in the event vocabulary and
+            // adding one would be a second way to produce an event.
+            if tag == Tag::Cell && !(already && editable) {
+                let _ = self.act(fonts, index, "select", "");
+                return true;
+            }
+
+            let caret = self.caret_at(fonts, index, x, y);
+            let state = self.editing.entry(key.clone()).or_insert(Editing {
                 value,
                 caret: 0,
+                anchor: None,
                 outstanding: Vec::new(),
             });
             state.caret = caret.min(state.value.chars().count());
-            self.note = format!("caret in {id} at {}", state.caret);
+            // The press is where a selection starts; the drag is what makes
+            // it one. A press that never moves leaves anchor and caret in the
+            // same place, which is no selection at all.
+            state.anchor = Some(state.caret);
+            self.selecting = Some(key);
+            self.note = format!("caret in {id} at {caret}");
             return true;
         }
 
@@ -719,7 +919,7 @@ impl Client {
             Tag::Checkbox => display::ACTION_TOGGLE,
             Tag::Select if node.flag("open") => "close",
             Tag::Select => "open",
-            Tag::Option => "select",
+            Tag::Option | Tag::Row => "select",
             _ => display::ACTION_CLICK,
         };
         let _ = self.act(fonts, index, action, "");
@@ -754,9 +954,17 @@ impl Client {
         if doc.tree.blocked(index) {
             return Err(agent::REASON_BLOCKED);
         }
-        if !tag.actions(disabled).contains(&action) {
+        // Asked through `offers`, which knows a cell's `editable`. The
+        // tag-only form answers for a cell that cannot be typed into,
+        // whatever the application said, so an agent's type-text was refused
+        // on a cell the human could type into perfectly well. Typing by hand
+        // goes through `key` and consults no list at all, which is why this
+        // only ever bit the agent.
+        if !self.offers(index, action) {
             return Err(agent::REASON_UNSUPPORTED);
         }
+        let Some(doc) = &self.doc else { return Err(agent::REASON_NO_SUCH_NODE) };
+        let node = doc.tree.node(index);
 
         let id = node.id().unwrap_or_default().to_owned();
         let key = doc.key(index).to_owned();
@@ -822,6 +1030,7 @@ impl Client {
                 let state = self.editing.entry(key).or_insert(Editing {
                     value: current,
                     caret: 0,
+                    anchor: None,
                     outstanding: Vec::new(),
                 });
                 state.value = next.clone();
@@ -880,10 +1089,6 @@ impl Client {
         self.layout.rect_of(index)
     }
 
-    pub fn is_visible(&self, index: usize) -> bool {
-        self.layout.is_visible(index)
-    }
-
     pub fn is_disabled(&self, index: usize) -> bool {
         self.doc
             .as_ref()
@@ -893,6 +1098,31 @@ impl Client {
     /// Whether a node is behind an open dialog.
     pub fn is_blocked(&self, index: usize) -> bool {
         self.doc.as_ref().is_some_and(|doc| doc.tree.blocked(index))
+    }
+
+    /// Whether an element offers an action in its current state.
+    ///
+    /// The same derived list the agent was shown, asked in one place so that
+    /// the check before an action and the list in the view cannot disagree.
+    /// An option of a closed dropdown offers nothing, and hearing that is
+    /// more use to an agent than any remark about where it is on screen.
+    pub fn offers(&self, index: usize, action: &str) -> bool {
+        let Some(doc) = &self.doc else { return false };
+        let node = doc.tree.node(index);
+        node.tag
+            .actions_for(doc.tree.inert(index), node.flag("editable"))
+            .contains(&action)
+    }
+
+    /// One numeric attribute, for the compositor's own arithmetic about a
+    /// table's window.
+    pub fn number(&self, index: usize, name: &str) -> Option<i32> {
+        self.doc
+            .as_ref()?
+            .tree
+            .node(index)
+            .attr(name)
+            .and_then(|value| value.parse().ok())
     }
 
     /// Whether the application declared that a human must approve this control
@@ -908,56 +1138,136 @@ impl Client {
             .is_some_and(|doc| doc.tree.node(index).flag("must-ask-perms"))
     }
 
-    /// Scroll whatever has to move so a node is inside its container.
+    /// Scroll whatever has to move so a node can be acted on.
     ///
-    /// This is the one action handled entirely by the compositor. The agent says
-    /// which node it wants visible and the compositor works out which container
-    /// to scroll and by how much, which is why `scroll` needs no id and an agent
-    /// never addresses one. It is the intent principle applied to a mechanism:
-    /// express what should be true, not the steps to make it so.
+    /// This runs before every intent, so an agent never expresses a scroll
+    /// and never hears that something was out of view. It is the same idea as
+    /// arranging an application's window: reachability is something the
+    /// compositor makes true rather than a question it answers.
+    ///
+    /// Every scroll container above the node is moved, outermost first,
+    /// because moving an outer one changes where the inner one sits and doing
+    /// it the other way round undoes the work. A table is moved across, over
+    /// the columns it holds. What it cannot do is move a table down: the rows
+    /// on screen are the ones the application sent, so a row below the body
+    /// is one only the application can bring up, and [`Client::ask_for_row`]
+    /// is how it is asked.
+    ///
+    /// Returns whether the node is reachable now.
     pub fn reveal(&mut self, fonts: &Fonts, index: usize) -> bool {
         let Some(doc) = &self.doc else { return false };
 
-        // Innermost scroll container above the node. Only one is moved: a nested
-        // scroll is rare and moving the outer one first would undo the inner.
+        // Containers above the node, outermost first.
+        let mut containers: Vec<usize> = Vec::new();
         let mut at = doc.tree.node(index).parent;
-        let mut container = None;
         while let Some(node) = at {
-            if doc.tree.node(node).tag == Tag::Scroll {
-                container = Some(node);
-                break;
+            if matches!(doc.tree.node(node).tag, Tag::Scroll | Tag::Table) {
+                containers.push(node);
             }
             at = doc.tree.node(node).parent;
         }
+        containers.reverse();
 
-        let Some(container) = container else { return false };
+        for container in containers {
+            self.reveal_within(fonts, index, container);
+        }
+
+        if self.layout.is_visible(index) {
+            return true;
+        }
+
+        // Still out of sight, which for a cell means the application placed
+        // it below the body of its own table. Ask for a window that starts
+        // there, so the next attempt finds it on screen.
+        if let Some(doc) = &self.doc
+            && let Some(table) = doc.tree.table_of(index)
+            && let Some((down, _)) = doc.tree.cell_position(index)
+        {
+            let first = doc
+                .tree
+                .node(table)
+                .attr("first-row")
+                .and_then(|value| value.parse::<i32>().ok())
+                .unwrap_or(0);
+            self.ask_for_row(table, first + down as i32);
+        }
+        false
+    }
+
+    /// Move one container so that a node inside it comes into view.
+    fn reveal_within(&mut self, fonts: &Fonts, index: usize, container: usize) {
+        let Some(doc) = &self.doc else { return };
+        let key = doc.key(container).to_owned();
+        let horizontal = doc.tree.node(container).tag == Tag::Table;
+
         let rect = self.layout.rect_of(index);
         let view = self.layout.rect_of(container);
+        let held = self
+            .layout
+            .scrollers
+            .iter()
+            .find(|scroller| scroller.node == container && scroller.horizontal == horizontal);
+        let Some(scroller) = held else { return };
+        let (offset, furthest) = (scroller.offset, scroller.furthest());
 
-        let shift = if rect.y < view.y {
+        // A table is moved across, over the columns it holds; everything else
+        // is moved down, over content laid out in full.
+        let shift = if horizontal {
+            // The gutter is frozen, so the room a cell has to be inside of
+            // starts after it rather than at the table's edge.
+            let left = view.x + ui::gutter_width(fonts, &doc.tree, container);
+            if rect.x < left {
+                rect.x - left
+            } else if rect.x + rect.w > view.x + view.w {
+                rect.x + rect.w - (view.x + view.w)
+            } else {
+                return;
+            }
+        } else if rect.y < view.y {
             rect.y - view.y
         } else if rect.y + rect.h > view.y + view.h {
             rect.y + rect.h - (view.y + view.h)
         } else {
-            return false;
+            return;
         };
 
-        let key = doc.key(container).to_owned();
-        // From the offset as laid out, not as stored: a container following
-        // its end stores a marker rather than a number.
-        let was = self
-            .layout
-            .scrollers
-            .iter()
-            .find(|scroller| scroller.node == container)
-            .map(|scroller| scroller.offset)
-            .unwrap_or(0);
-        self.scroll.insert(key.clone(), was + shift);
-        // The bar lights up for the agent's scrolling exactly as it does for
-        // the human's wheel, so the human watching sees where the view moved.
+        let next = (offset + shift).clamp(0, furthest);
+        if next == offset {
+            return;
+        }
+        if horizontal {
+            self.scroll_x.insert(key.clone(), next);
+        } else {
+            self.scroll.insert(key.clone(), next);
+        }
+        // The bar lights up for the compositor's scrolling exactly as it does
+        // for the human's wheel, so the human watching sees where the view
+        // moved and why.
         self.scroll_shown = Some((key, Instant::now()));
         self.relayout(fonts);
         self.note = format!("scrolled to reveal {}", self.label());
+    }
+
+    /// Ask an application to bring a row of a table into its window.
+    /// Ask an application to bring a row of a table into its window.
+    ///
+    /// The compositor cannot scroll a table itself: the rows on screen are
+    /// the ones the application chose to describe, and no offset here can
+    /// conjure the ones it did not send. So an agent that wants row five
+    /// hundred asks for it, and the application answers with a tree. This is
+    /// the same promise kept at a larger scale: the agent
+    /// says what should be true and never how to bring it about.
+    pub fn ask_for_row(&mut self, index: usize, row: i32) -> bool {
+        let Some(doc) = &self.doc else { return false };
+        if doc.tree.node(index).tag != Tag::Table {
+            return false;
+        }
+        let id = doc.tree.node(index).id().unwrap_or_default().to_owned();
+        if id.is_empty() {
+            return false;
+        }
+        self.note = format!("asked {id} for row {row}");
+        self.emit(&id, display::ACTION_SCROLL, &row.max(0).to_string());
         true
     }
 
@@ -970,15 +1280,49 @@ impl Client {
     fn wheel(&mut self, fonts: &Fonts, delta: i32, x: i32, y: i32) -> bool {
         let Some(doc) = &self.doc else { return false };
 
+        // A table does not scroll: it asks. Its rows are the window the
+        // application chose, so moving is a question for the application and
+        // the answer is a new tree. Checked before the ordinary containers so
+        // that a table inside a scrolling page takes the notch itself.
+        // Read out of the iterator before anything is emitted: the borrow it
+        // holds on the layout cannot outlive the write to the socket.
+        let asking = self
+            .layout
+            .scrollers_at(x, y)
+            .find(|scroller| scroller.asks)
+            .map(|scroller| {
+                let step = scroller.step.max(1);
+                (
+                    scroller.offset / step,
+                    scroller.content / step,
+                    (scroller.viewport / step).max(1),
+                    doc.tree.node(scroller.node).id().unwrap_or_default().to_owned(),
+                )
+            });
+        if let Some((first, total, visible, id)) = asking {
+            let next = (first - delta * WHEEL_ROWS).clamp(0, (total - visible).max(0));
+            if next == first || id.is_empty() {
+                return false;
+            }
+            self.note = format!("asked {id} for row {next}");
+            self.emit(&id, display::ACTION_SCROLL, &next.to_string());
+            return true;
+        }
+
         // Innermost first, and the first that can still move takes the
         // notch: a container at its end, or one that never overflowed, hands
         // it outward rather than swallowing it. Positive delta is a push away
         // from the human, which moves the content down and the viewport up.
-        let Some((key, next, furthest)) = self.layout.scrollers_at(x, y).find_map(|scroller| {
-            let furthest = (scroller.content - scroller.viewport).max(0);
-            let next = (scroller.offset - delta * ui::wheel_step()).clamp(0, furthest);
-            (next != scroller.offset).then(|| (doc.key(scroller.node).to_owned(), next, furthest))
-        }) else {
+        let Some((key, next, furthest)) = self
+            .layout
+            .scrollers_at(x, y)
+            .filter(|scroller| !scroller.horizontal)
+            .find_map(|scroller| {
+                let furthest = scroller.furthest();
+                let next = (scroller.offset - delta * ui::wheel_step()).clamp(0, furthest);
+                (next != scroller.offset).then(|| (doc.key(scroller.node).to_owned(), next, furthest))
+            })
+        else {
             return false;
         };
 
@@ -989,7 +1333,7 @@ impl Client {
         true
     }
 
-    fn key(&mut self, fonts: &Fonts, key: Key) -> bool {
+    fn key(&mut self, fonts: &Fonts, key: Key, clipboard: &mut Clipboard) -> bool {
         if key == Key::Tab {
             return self.focus_next();
         }
@@ -1004,68 +1348,162 @@ impl Client {
 
         let node = doc.tree.node(index);
         let tag = node.tag;
-        if !matches!(tag, Tag::Field | Tag::Editor) || node.disabled() {
+        if !tag.is_text() || node.disabled() {
             return false;
         }
+        // A cell takes text only when the application says it does; a field
+        // and an editor always do.
+        let editable = tag != Tag::Cell || node.flag("editable");
         let id = node.id().unwrap_or_default().to_owned();
-        let seed = node.attr("value").unwrap_or("").to_owned();
+        let seed = match node.attr("value") {
+            Some(value) => value.to_owned(),
+            None if tag == Tag::Cell => node.text.clone(),
+            None => String::new(),
+        };
         // A compositor-internal attribute for chat-shaped editors: Enter
         // submits and Shift+Enter breaks the line, the convention every
         // messenger keeps. Without it an editor keeps the catalogue's rule,
         // Enter breaks the line, because a general editor has no submit.
         let enter_submits = node.flag("enter-submits");
+        let typing = self.editing.contains_key(&focus_key);
 
-        let state = self.editing.entry(focus_key).or_insert(Editing {
-            value: seed,
+        // Moving about the grid comes first, because in a cell the arrows
+        // mean the grid until something is being typed into it, and then
+        // they mean the caret. Up and down always leave: a spreadsheet that
+        // trapped the selection in a half-typed cell would be unusable.
+        if tag == Tag::Cell {
+            match key {
+                Key::Up => return self.move_cell(fonts, 0, -1),
+                Key::Down | Key::Enter => return self.move_cell(fonts, 0, 1),
+                Key::Left if !typing => return self.move_cell(fonts, -1, 0),
+                Key::Right if !typing => return self.move_cell(fonts, 1, 0),
+                Key::Escape if typing => {
+                    // Give the cell back the value the application last sent.
+                    // Every keystroke was already reported, so undoing has to
+                    // be reported too, as the value it ends on.
+                    self.editing.remove(&focus_key);
+                    self.emit(&id, display::ACTION_TYPE_TEXT, &seed);
+                    if let Some(doc) = &mut self.doc {
+                        doc.tree.nodes[index].set("value", &seed);
+                    }
+                    self.relayout(fonts);
+                    self.note = format!("cancelled the edit in {id}");
+                    return true;
+                }
+                _ => {}
+            }
+            if !editable {
+                return false;
+            }
+        }
+
+        // A cell that is not being typed into yet starts empty, so the first
+        // character replaces what was there rather than appending to it,
+        // which is what every spreadsheet does and what the human expects
+        // when they select a cell and start typing.
+        let fresh = tag == Tag::Cell && !typing;
+        let state = self.editing.entry(focus_key.clone()).or_insert(Editing {
+            value: if fresh { String::new() } else { seed.clone() },
             caret: 0,
+            anchor: None,
             outstanding: Vec::new(),
         });
         state.caret = state.caret.min(state.value.chars().count());
 
-        let mut changed = false;
+        // The clipboard. None of this is in the display protocol: what the
+        // application hears is the value the control ended up with, exactly
+        // as if the human had typed it out.
         match key {
-            Key::Char(character) => {
-                state.value.insert(byte_at(&state.value, state.caret), character);
-                state.caret += 1;
-                changed = true;
+            Key::SelectAll => {
+                state.anchor = Some(0);
+                state.caret = state.value.chars().count();
+                self.note = format!("selected all of {id}");
+                return true;
             }
-            Key::Backspace => {
-                if state.caret == 0 {
-                    return false;
-                }
-                state.caret -= 1;
-                state.value.remove(byte_at(&state.value, state.caret));
-                changed = true;
-            }
-            Key::Left => state.caret = state.caret.saturating_sub(1),
-            Key::Right => state.caret = (state.caret + 1).min(state.value.chars().count()),
-            Key::Up | Key::Down if tag == Tag::Editor => {
-                state.caret = move_line(&state.value, state.caret, key == Key::Down);
-            }
-            // Enter confirms a field and inserts a newline in an editor. That is
-            // the whole reason the two elements are separate: an editor offers no
-            // `submit` because Enter already means something else in it. An
-            // editor marked `enter-submits` swaps the two: Enter confirms and
-            // Shift+Enter breaks the line. In a field the shift is simply not
-            // load-bearing: there is no line to break, so both confirm.
-            Key::Enter | Key::ShiftEnter => {
-                let newline = match tag {
-                    Tag::Editor if enter_submits => key == Key::ShiftEnter,
-                    Tag::Editor => true,
-                    _ => false,
-                };
-                if newline {
-                    state.value.insert(byte_at(&state.value, state.caret), '\n');
-                    state.caret += 1;
-                    changed = true;
-                } else {
-                    self.note = format!("submitted {id}");
-                    let value = state.value.clone();
-                    self.emit(&id, display::ACTION_SUBMIT, &value);
+            Key::Copy | Key::Cut => {
+                let Some(selected) = state.selected_text() else { return false };
+                clipboard.set_text(&selected);
+                if key == Key::Copy {
+                    self.note = format!("copied {} character(s)", selected.chars().count());
                     return true;
                 }
+                state.delete_selection();
             }
-            _ => return false,
+            Key::Paste => {
+                let Some(words) = clipboard.text().map(str::to_owned) else {
+                    self.note = "nothing on the clipboard this can take".into();
+                    return true;
+                };
+                state.delete_selection();
+                let at = byte_at(&state.value, state.caret);
+                state.value.insert_str(at, &words);
+                state.caret += words.chars().count();
+                state.anchor = None;
+            }
+            _ => {}
+        }
+
+        let mut changed = matches!(key, Key::Paste | Key::Cut);
+        if !changed {
+            match key {
+                Key::Char(character) => {
+                    state.delete_selection();
+                    state.value.insert(byte_at(&state.value, state.caret), character);
+                    state.caret += 1;
+                    changed = true;
+                }
+                Key::Backspace => {
+                    if state.delete_selection() {
+                        changed = true;
+                    } else if state.caret == 0 {
+                        return false;
+                    } else {
+                        state.caret -= 1;
+                        state.value.remove(byte_at(&state.value, state.caret));
+                        changed = true;
+                    }
+                }
+                // Moving the caret drops the selection, the way it does
+                // everywhere: the arrow keys are how you stop having one.
+                Key::Left => {
+                    state.anchor = None;
+                    state.caret = state.caret.saturating_sub(1);
+                }
+                Key::Right => {
+                    state.anchor = None;
+                    state.caret = (state.caret + 1).min(state.value.chars().count());
+                }
+                Key::Up | Key::Down if tag == Tag::Editor => {
+                    state.anchor = None;
+                    state.caret = move_line(&state.value, state.caret, key == Key::Down);
+                }
+                // Enter confirms a field and inserts a newline in an editor. That is
+                // the whole reason the two elements are separate: an editor offers no
+                // `submit` because Enter already means something else in it.
+                // An editor marked `enter-submits` swaps the two: Enter
+                // confirms and Shift+Enter breaks the line. In a field the
+                // shift is simply not load-bearing: there is no line to
+                // break, so both confirm.
+                Key::Enter | Key::ShiftEnter => {
+                    let newline = match tag {
+                        Tag::Editor if enter_submits => key == Key::ShiftEnter,
+                        Tag::Editor => true,
+                        _ => false,
+                    };
+                    if newline {
+                        state.delete_selection();
+                        state.value.insert(byte_at(&state.value, state.caret), '\n');
+                        state.caret += 1;
+                        changed = true;
+                    } else {
+                        self.note = format!("submitted {id}");
+                        let value = state.value.clone();
+                        self.emit(&id, display::ACTION_SUBMIT, &value);
+                        return true;
+                    }
+                }
+                _ => return false,
+            }
         }
 
         if !changed {
@@ -1073,6 +1511,7 @@ impl Client {
             return true;
         }
 
+        state.anchor = None;
         let value = state.value.clone();
         state.outstanding.push(value.clone());
         self.note = format!("typed into {id}");
@@ -1084,6 +1523,48 @@ impl Client {
         }
         self.relayout(fonts);
         self.emit(&id, display::ACTION_TYPE_TEXT, &value);
+        true
+    }
+
+    /// Move the grid's cursor, committing whatever was being typed.
+    ///
+    /// The destination is told to the application as a `select`, which is the
+    /// same event a press on it would have produced. That matters more than
+    /// it looks: the application, not the compositor, decides which rows it
+    /// has sent, so it can only keep the cursor in view if it is told the
+    /// cursor moved.
+    fn move_cell(&mut self, fonts: &Fonts, across: i32, down: i32) -> bool {
+        let Some(doc) = &self.doc else { return false };
+        let Some(key) = self.focus.clone() else { return false };
+        let Some(index) = doc.index_of(&key) else { return false };
+        let Some((row_at, column_at)) = doc.tree.cell_position(index) else { return false };
+        let Some(table) = doc.tree.table_of(index) else { return false };
+
+        let rows = doc.tree.rows(table);
+        if rows.is_empty() {
+            return false;
+        }
+        let row = (row_at as i32 + down).clamp(0, rows.len() as i32 - 1) as usize;
+        let cells = doc.tree.cells(rows[row]);
+        if cells.is_empty() {
+            return false;
+        }
+        let column = (column_at as i32 + across).clamp(0, cells.len() as i32 - 1) as usize;
+        let target = cells[column];
+        let target_key = doc.key(target).to_owned();
+        let id = doc.tree.node(index).id().unwrap_or_default().to_owned();
+
+        // Whatever was typed is already with the application, keystroke by
+        // keystroke. Leaving the cell is what says it is finished.
+        if self.editing.remove(&key).is_some() {
+            self.emit(&id, display::ACTION_SUBMIT, "");
+        }
+        if target == index {
+            return true;
+        }
+
+        self.focus = Some(target_key);
+        let _ = self.act(fonts, target, "select", "");
         true
     }
 
@@ -1156,6 +1637,33 @@ impl Client {
     }
 }
 
+impl Editing {
+    /// The selected run, low to high, or `None` when the caret is a point.
+    fn selected(&self) -> Option<(usize, usize)> {
+        let anchor = self.anchor?;
+        let (from, to) = (anchor.min(self.caret), anchor.max(self.caret));
+        (from != to).then_some((from, to))
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let (from, to) = self.selected()?;
+        Some(self.value.chars().skip(from).take(to - from).collect())
+    }
+
+    /// Remove the selected run, leaving the caret where it was. Returns
+    /// whether there was anything to remove, which is what tells a backspace
+    /// whether it has already done its work.
+    fn delete_selection(&mut self) -> bool {
+        let Some((from, to)) = self.selected() else { return false };
+        let start = byte_at(&self.value, from);
+        let end = byte_at(&self.value, to);
+        self.value.replace_range(start..end, "");
+        self.caret = from;
+        self.anchor = None;
+        true
+    }
+}
+
 /// The byte offset of a character position.
 fn byte_at(text: &str, caret: usize) -> usize {
     text.char_indices()
@@ -1177,4 +1685,258 @@ fn move_line(value: &str, caret: usize, down: bool) -> usize {
         at += length + 1;
     }
     caret
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::paint::Rect;
+    use crate::ui::Frame;
+    use std::os::unix::net::UnixStream;
+
+    /// A client holding one tree, framed into a rectangle.
+    ///
+    /// The peer end of the socketpair comes back with it: dropping it would
+    /// break the connection and every event this client tried to send would
+    /// mark it broken instead of arriving.
+    fn framed(source: &str, frame: Rect) -> (Fonts, Client, UnixStream) {
+        ui::set_scale(1.0);
+        let fonts = Fonts::load().expect("the faces are compiled in");
+        let (ours, peer) = UnixStream::pair().expect("a socketpair");
+        let mut client =
+            Client::adopt(Kind::App, 1, "test".to_owned(), 0, ours).expect("adopted");
+        client.apply(&fonts, source, 1);
+        client.set_frame(&fonts, Frame::Whole(frame));
+        (fonts, client, peer)
+    }
+
+    /// A column of buttons taller than any window will give it.
+    fn tall_list() -> String {
+        let mut out = String::from("<window pad=\"none\"><scroll grow=\"true\"><vstack>");
+        for at in 0..40 {
+            out.push_str(&format!(
+                "<button id=\"b{at}\" label=\"row {at}\" description=\"Row {at}\"/>"
+            ));
+        }
+        out.push_str("</vstack></scroll></window>");
+        out
+    }
+
+    /// Acting on a node that is scrolled away brings it into view rather than
+    /// refusing. This is the whole of why `scroll-into-view` no longer exists:
+    /// reachability is made true instead of being asked about.
+    #[test]
+    fn a_scrolled_away_node_is_revealed_rather_than_refused() {
+        let (fonts, mut client, _peer) = framed(&tall_list(), Rect::new(0, 0, 300, 200));
+        let index = client.node_by_id("b39").expect("the last row exists in the tree");
+        assert!(!client.layout.is_visible(index), "the last of forty rows fitted in 200 pixels");
+
+        assert!(client.reveal(&fonts, index), "reveal did not report success");
+        assert!(client.layout.is_visible(index), "the node is still out of view");
+    }
+
+    /// A node inside a scroll container inside another one. The outer has to
+    /// move first: moving the inner one first puts the node where the outer
+    /// then carries it away from again.
+    #[test]
+    fn nested_scroll_containers_are_moved_outermost_first() {
+        let mut inner = String::from(
+            "<window pad=\"none\"><scroll grow=\"true\"><vstack>             <button id=\"top\" label=\"top\" description=\"Top\"/>",
+        );
+        for at in 0..30 {
+            inner.push_str(&format!(
+                "<button id=\"pad{at}\" label=\"pad\" description=\"Padding\"/>"
+            ));
+        }
+        inner.push_str("<scroll><vstack>");
+        for at in 0..30 {
+            inner.push_str(&format!(
+                "<button id=\"deep{at}\" label=\"deep {at}\" description=\"Deep {at}\"/>"
+            ));
+        }
+        inner.push_str("</vstack></scroll></vstack></scroll></window>");
+
+        let (fonts, mut client, _peer) = framed(&inner, Rect::new(0, 0, 300, 200));
+        let index = client.node_by_id("deep29").expect("the deep row exists");
+        assert!(!client.layout.is_visible(index), "it was somehow already in view");
+        assert!(client.reveal(&fonts, index), "reveal did not report success");
+        assert!(client.layout.is_visible(index), "a nested container was not moved");
+    }
+
+    /// A cell off the right-hand edge of a table. The table is not a scroll
+    /// container and the old reveal walked straight past it, so this is the
+    /// second of the two gaps that made `not-visible` look unavoidable.
+    #[test]
+    fn a_cell_off_the_side_of_a_table_is_revealed_across() {
+        let mut source = String::from(
+            "<window pad=\"none\"><table id=\"sheet\" grow=\"true\" rows=\"100\"              first-row=\"0\" description=\"The grid\">",
+        );
+        for name in ["A", "B", "C", "D", "E", "F", "G", "H"] {
+            source.push_str(&format!("<column label=\"{name}\" chars=\"12\"/>"));
+        }
+        source.push_str("<row label=\"1\">");
+        for name in ["A", "B", "C", "D", "E", "F", "G", "H"] {
+            source.push_str(&format!("<cell id=\"{name}1\" value=\"x\"/>"));
+        }
+        source.push_str("</row></table></window>");
+
+        // Narrow on purpose: the last columns are off the side.
+        let (fonts, mut client, _peer) = framed(&source, Rect::new(0, 0, 300, 200));
+        let index = client.node_by_id("H1").expect("the last cell exists");
+        assert!(!client.layout.is_visible(index), "eight columns fitted in 300 pixels");
+        assert!(client.reveal(&fonts, index), "reveal did not report success");
+        assert!(client.layout.is_visible(index), "the table was not moved across");
+    }
+
+    fn window(first: i32, rows: &[i32]) -> String {
+        let mut out = format!(
+            "<window pad=\"none\"><table id=\"sheet\" grow=\"true\" rows=\"1000\"              first-row=\"{first}\" description=\"The grid\"><column label=\"A\" chars=\"8\"/>"
+        );
+        for &row in rows {
+            out.push_str(&format!(
+                "<row label=\"{row}\"><cell id=\"A{row}\" value=\"v\" editable=\"true\"/>                 <cell id=\"B{row}\" value=\"w\"/></row>"
+            ));
+        }
+        out.push_str("</table></window>");
+        out
+    }
+
+    /// An agent typing into an editable cell.
+    ///
+    /// `Tag::actions` cannot know whether a cell is editable, so it answers
+    /// for one that is not, and this went through it: every keystroke an
+    /// agent sent to a perfectly ordinary cell came back
+    /// `unsupported-action`. It never showed up by hand because typing goes
+    /// through the keyboard path, which consults no action list at all.
+    #[test]
+    fn an_agent_may_type_into_an_editable_cell() {
+        let (fonts, mut client, _peer) = framed(&window(0, &[1, 2, 3]), Rect::new(0, 0, 400, 300));
+        let editable = client.node_by_id("A1").expect("the cell exists");
+        let plain = client.node_by_id("B1").expect("the cell exists");
+
+        assert_eq!(client.act(&fonts, editable, "type-text", "42"), Ok(()));
+        assert_eq!(client.act(&fonts, editable, "submit", ""), Ok(()));
+        assert_eq!(client.act(&fonts, editable, "select", ""), Ok(()));
+
+        // A cell the application did not mark editable still takes neither,
+        // which is the other half of the same question being asked properly.
+        assert_eq!(
+            client.act(&fonts, plain, "type-text", "42"),
+            Err(awproto::agent::REASON_UNSUPPORTED)
+        );
+    }
+
+    /// The cell cursor survives the window moving past it and back.
+    ///
+    /// A row outside a table's window has not been removed; it is not being
+    /// described. Forgetting focus for anything absent from the incoming tree
+    /// meant scrolling away from a selected cell lost it for good.
+    #[test]
+    fn the_cell_cursor_survives_a_window_that_moved_past_it() {
+        let (fonts, mut client, _peer) = framed(&window(0, &[1, 2, 3]), Rect::new(0, 0, 400, 300));
+        let cell = client.node_by_id("A2").expect("the cell exists");
+        client.act(&fonts, cell, "select", "").expect("selected");
+        assert!(client.focus_state().node.is_some(), "nothing was selected to begin with");
+
+        // The application describes a window far below. The cell is nowhere
+        // in this tree.
+        client.apply(&fonts, &window(500, &[501, 502, 503]), 2);
+        assert!(client.node_by_id("A2").is_none(), "the row is somehow still here");
+        assert!(client.focus_state().node.is_none(), "a ring on a row nobody sent");
+
+        // And back. The cursor is where it was left.
+        client.apply(&fonts, &window(0, &[1, 2, 3]), 3);
+        let back = client.node_by_id("A2").expect("the row is described again");
+        assert_eq!(client.focus_state().node, Some(back), "the cell cursor did not come back");
+    }
+
+    fn editing(value: &str, anchor: Option<usize>, caret: usize) -> Editing {
+        Editing { value: value.to_owned(), caret, anchor, outstanding: Vec::new() }
+    }
+
+    /// A selection is a run between an anchor and the caret, in either
+    /// direction, and dragging backwards selects the same characters as
+    /// dragging forwards.
+    #[test]
+    fn a_selection_reads_the_same_in_both_directions() {
+        let forwards = editing("hello world", Some(6), 11);
+        let backwards = editing("hello world", Some(11), 6);
+        assert_eq!(forwards.selected_text().as_deref(), Some("world"));
+        assert_eq!(backwards.selected_text().as_deref(), Some("world"));
+        // A caret that has not moved from its anchor is not a selection.
+        assert_eq!(editing("hello", Some(2), 2).selected_text(), None);
+        assert_eq!(editing("hello", None, 2).selected_text(), None);
+    }
+
+    /// Cutting and pasting are edits to the compositor's own copy. What an
+    /// application hears is the value the control ended up with, which is
+    /// exactly what it would have heard had the human typed it.
+    #[test]
+    fn cut_removes_the_run_and_leaves_the_caret_where_it_was() {
+        let mut state = editing("hello world", Some(5), 11);
+        assert_eq!(state.selected_text().as_deref(), Some(" world"));
+        assert!(state.delete_selection());
+        assert_eq!(state.value, "hello");
+        assert_eq!(state.caret, 5);
+        assert_eq!(state.anchor, None, "a deleted selection is not still selected");
+        // Nothing selected, nothing to delete, and the value is untouched.
+        assert!(!state.delete_selection());
+        assert_eq!(state.value, "hello");
+    }
+
+    /// Selections are counted in characters, not bytes, or a cut across
+    /// anything but ASCII would slice a character in half and panic.
+    #[test]
+    fn a_selection_counts_characters_rather_than_bytes() {
+        let mut state = editing("héllo wörld", Some(0), 6);
+        assert_eq!(state.selected_text().as_deref(), Some("héllo "));
+        assert!(state.delete_selection());
+        assert_eq!(state.value, "wörld");
+    }
+
+    /// A press that never moved is a caret, not a selection.
+    ///
+    /// The anchor is set on every press, because a press is where a drag
+    /// would start. Leaving it set once the button came up made the second
+    /// character typed after a click delete the first: the caret had walked
+    /// away from an anchor nobody had dragged, and the run between them
+    /// looked exactly like a selection to replace. Found by typing into the
+    /// pane and reading back "bc" for "abc"; no test would have caught it,
+    /// because it needs a click and a keystroke in that order.
+    #[test]
+    fn a_click_that_did_not_drag_leaves_no_selection() {
+        let mut state = editing("", None, 0);
+        // The press: anchor where the caret landed.
+        state.anchor = Some(state.caret);
+        // A character goes in and the caret moves on.
+        state.value.push('a');
+        state.caret = 1;
+        // With the anchor still standing, the next character would replace
+        // everything since the click.
+        assert_eq!(state.selected_text().as_deref(), Some("a"), "the phantom run this guards against");
+        // Which is why the release drops it, and why an edit does too.
+        state.anchor = None;
+        assert_eq!(state.selected_text(), None);
+    }
+
+    /// The clipboard holds a kind, so the day something copies a picture the
+    /// readers that only understand words say so rather than pasting base64
+    /// into a spreadsheet.
+    #[test]
+    fn the_clipboard_says_what_kind_of_thing_it_holds() {
+        let mut clipboard = Clipboard::default();
+        assert_eq!(clipboard.kind(), awproto::agent::CLIPBOARD_NONE);
+        assert_eq!(clipboard.text(), None);
+
+        clipboard.set_text("copied");
+        assert_eq!(clipboard.kind(), awproto::agent::CLIPBOARD_TEXT);
+        assert_eq!(clipboard.text(), Some("copied"));
+        assert_eq!(clipboard.content(), "copied");
+
+        // Copying nothing empties it rather than holding an empty string,
+        // so "is there anything to paste" has one answer.
+        clipboard.set_text("");
+        assert_eq!(clipboard.kind(), awproto::agent::CLIPBOARD_NONE);
+    }
 }

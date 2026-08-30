@@ -45,6 +45,14 @@ pub enum Tag {
     Select,
     Option,
     Dialog,
+    /// A grid of cells with named columns. Its `row` children are exactly the
+    /// window the application chose to describe, `first-row` says which row
+    /// the first of them is, and `rows` how many exist altogether; see
+    /// `place_table` for what the compositor does with that.
+    Table,
+    Column,
+    Row,
+    Cell,
 }
 
 impl Tag {
@@ -68,6 +76,10 @@ impl Tag {
             "select" => Tag::Select,
             "option" => Tag::Option,
             "dialog" => Tag::Dialog,
+            "table" => Tag::Table,
+            "column" => Tag::Column,
+            "row" => Tag::Row,
+            "cell" => Tag::Cell,
             _ => return None,
         })
     }
@@ -92,6 +104,10 @@ impl Tag {
             Tag::Select => "select",
             Tag::Option => "option",
             Tag::Dialog => "dialog",
+            Tag::Table => "table",
+            Tag::Column => "column",
+            Tag::Row => "row",
+            Tag::Cell => "cell",
         }
     }
 
@@ -104,8 +120,26 @@ impl Tag {
     pub fn is_control(self) -> bool {
         matches!(
             self,
-            Tag::Button | Tag::Field | Tag::Editor | Tag::Checkbox | Tag::Item | Tag::Select | Tag::Option
+            Tag::Button
+                | Tag::Field
+                | Tag::Editor
+                | Tag::Checkbox
+                | Tag::Item
+                | Tag::Select
+                | Tag::Option
+                | Tag::Row
+                | Tag::Cell
         )
+    }
+
+    /// Whether this element holds a value the human types into.
+    ///
+    /// One predicate rather than three `matches!` at the call sites, because
+    /// a cell that is editable behaves as a field in every one of them: the
+    /// caret goes in it, keystrokes edit the compositor's copy, and the
+    /// pointer over it is a beam.
+    pub fn is_text(self) -> bool {
+        matches!(self, Tag::Field | Tag::Editor | Tag::Cell)
     }
 
     /// What an agent may do with this element, given its state.
@@ -115,8 +149,28 @@ impl Tag {
     /// nothing implements, or advertise `click` on a disabled control, and the
     /// action space would stop being closed.
     pub fn actions(self, disabled: bool) -> &'static [&'static str] {
+        self.actions_for(disabled, false)
+    }
+
+    /// The action list, given the element's state.
+    ///
+    /// `editable` is a cell's own state and nothing else's. It is a separate
+    /// argument rather than a lookup because `Tag` does not carry a node, and
+    /// passing the one piece of state that changes the answer keeps the list
+    /// derived from type and state as it must be.
+    pub fn actions_for(self, disabled: bool, editable: bool) -> &'static [&'static str] {
         if disabled {
             return &[];
+        }
+        if self == Tag::Cell {
+            // A cell is always somewhere the human can put the selection; only
+            // an editable one takes text. There is no `click`: pressing a cell
+            // means choosing it, and the event a person produces is `select`.
+            return if editable {
+                &["focus", "select", "type-text", "clear", "submit"]
+            } else {
+                &["focus", "select"]
+            };
         }
         match self {
             Tag::Button => &["focus", "click"],
@@ -129,6 +183,7 @@ impl Tag {
             // be true, and one that is already true is a no-op, not an error.
             Tag::Select => &["focus", "open", "close"],
             Tag::Option => &["select"],
+            Tag::Row => &["focus", "select"],
             _ => &[],
         }
     }
@@ -258,6 +313,87 @@ impl Tree {
     /// view cannot disagree about it.
     pub fn inert(&self, index: usize) -> bool {
         self.nodes[index].disabled() || self.blocked(index) || self.folded(index)
+    }
+
+    /// A table's `column` children, in order. These are its header.
+    pub fn columns(&self, table: usize) -> Vec<usize> {
+        self.children_of(table, Tag::Column)
+    }
+
+    /// A table's `row` children, in order: exactly the window the application
+    /// chose to send, never the whole sheet.
+    pub fn rows(&self, table: usize) -> Vec<usize> {
+        self.children_of(table, Tag::Row)
+    }
+
+    /// A row's `cell` children, in order. Position is what ties a cell to a
+    /// column, so a row with fewer cells than the table has columns simply
+    /// has empty ones at the end.
+    pub fn cells(&self, row: usize) -> Vec<usize> {
+        self.children_of(row, Tag::Cell)
+    }
+
+    fn children_of(&self, parent: usize, tag: Tag) -> Vec<usize> {
+        self.nodes[parent]
+            .children
+            .iter()
+            .copied()
+            .filter(|&child| self.nodes[child].tag == tag)
+            .collect()
+    }
+
+    /// The nearest enclosing table, if a node is inside one.
+    pub fn table_of(&self, index: usize) -> Option<usize> {
+        let mut at = Some(index);
+        while let Some(node) = at {
+            if self.nodes[node].tag == Tag::Table {
+                return Some(node);
+            }
+            at = self.nodes[node].parent;
+        }
+        None
+    }
+
+    /// Where a cell sits in its table: the row's position in the window and
+    /// the cell's position in its row. `None` for anything not in a table.
+    pub fn cell_position(&self, cell: usize) -> Option<(usize, usize)> {
+        let row = self.nodes[cell].parent?;
+        if self.nodes[row].tag != Tag::Row {
+            return None;
+        }
+        let table = self.nodes[row].parent?;
+        let down = self.rows(table).iter().position(|&at| at == row)?;
+        let across = self.cells(row).iter().position(|&at| at == cell)?;
+        Some((down, across))
+    }
+
+    /// What a cell is, in words, for an agent that was given no description.
+    ///
+    /// Every control carries a description because it is the only thing
+    /// saying what the control means. A cell is the one control whose meaning
+    /// is entirely positional, and a spreadsheet has too many of them for a
+    /// human to write a sentence each. So the position is the description,
+    /// composed from the column's own label and the row's.
+    pub fn cell_description(&self, cell: usize) -> String {
+        if let Some(written) = self.nodes[cell].attr("description") {
+            return written.to_owned();
+        }
+        let Some((down, across)) = self.cell_position(cell) else {
+            return "A cell of a table".to_owned();
+        };
+        let table = self.nodes[cell].parent.and_then(|row| self.nodes[row].parent);
+        let column = table
+            .map(|table| self.columns(table))
+            .and_then(|columns| columns.get(across).copied())
+            .and_then(|column| self.nodes[column].attr("label"))
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("column {}", across + 1));
+        let row = self.nodes[cell]
+            .parent
+            .and_then(|row| self.nodes[row].attr("label"))
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("row {}", down + 1));
+        format!("The cell in column {column}, {row}")
     }
 
     /// The nearest value of an inheriting attribute, searching up the tree.
@@ -610,7 +746,11 @@ fn emit(tree: &Tree, index: usize, depth: usize, out: &mut String) {
     // API key entered in Settings would be readable by the very agent it
     // authenticates, through the view of any app that renders it.
     let password = node.attr("kind") == Some("password");
-    for state in ["value", "checked", "selected", "open", "invalid", "busy"] {
+    // `rows` and `first-row` are a table's declared state, and the two an
+    // agent most needs: without them a window of forty rows is
+    // indistinguishable from a sheet of forty, and there is no way to tell
+    // which forty they are. They are what `query rows` is aimed with.
+    for state in ["value", "checked", "selected", "open", "invalid", "busy", "rows", "first-row"] {
         if let Some(value) = node.attr(state) {
             if password && state == "value" {
                 let masked = "*".repeat(value.chars().count());
@@ -629,11 +769,16 @@ fn emit(tree: &Tree, index: usize, depth: usize, out: &mut String) {
     if node.tag.is_control() && tree.blocked(index) {
         attrs.push_str(" blocked");
     }
-    if let Some(description) = node.attr("description") {
+    if node.tag == Tag::Cell {
+        attrs.push_str(&format!(" description=\"{}\"", tree.cell_description(index)));
+    } else if let Some(description) = node.attr("description") {
         attrs.push_str(&format!(" description=\"{description}\""));
     }
     if node.tag.is_control() {
-        let actions = node.tag.actions(tree.inert(index)).join(" ");
+        let actions = node
+            .tag
+            .actions_for(tree.inert(index), node.flag("editable"))
+            .join(" ");
         attrs.push_str(&format!(" actions=\"{actions}\""));
     }
 
@@ -671,5 +816,71 @@ mod tests {
         assert!(!view.contains("sk-ant-secret"), "the secret leaked: {view}");
         assert!(view.contains("value=\"*************\""), "no mask: {view}");
         assert!(view.contains("value=\"plain\""), "a plain field kept its value: {view}");
+    }
+
+    /// A grid reaches an agent as addressable cells that say where they are.
+    ///
+    /// The description is the point. Every control carries one because it is
+    /// the only thing saying what the control means, and a cell is the one
+    /// control whose meaning is purely positional; a sheet with ten thousand
+    /// of them cannot have ten thousand hand-written sentences, so the column
+    /// and the row are the sentence.
+    #[test]
+    fn a_table_reaches_the_agent_as_addressable_cells() {
+        let tree = parse(
+            r#"<window title="Sheet">
+                 <table id="sheet" label="Sheet1" rows="1000" first-row="0"
+                        description="The spreadsheet grid">
+                   <column label="A"/>
+                   <column label="B"/>
+                   <row label="1">
+                     <cell id="A1" value="12" editable="true"/>
+                     <cell id="B1" value="totals"/>
+                   </row>
+                 </table>
+               </window>"#,
+        )
+        .unwrap();
+        let view = agent_view(&tree, "awsheet", 2);
+
+        // The header survives, because which column a cell is in is what the
+        // cell means.
+        assert!(view.contains("<column label=\"A\""), "no header: {view}");
+        // Positions become words, without the application writing them.
+        assert!(
+            view.contains("description=\"The cell in column A, 1\""),
+            "no derived description: {view}"
+        );
+        // Actions are derived from state here as everywhere: only the
+        // editable cell takes text, and neither offers `click`, because
+        // pressing a cell means choosing it.
+        let editable = view.lines().find(|line| line.contains("id=\"A1\"")).unwrap();
+        let plain = view.lines().find(|line| line.contains("id=\"B1\"")).unwrap();
+        assert!(editable.contains("actions=\"focus select type-text clear submit\""), "{editable}");
+        assert!(plain.contains("actions=\"focus select\""), "{plain}");
+    }
+
+    /// A cell the application scrolled past is not in the tree at all, so an
+    /// agent naming it is told there is no such node rather than being
+    /// silently given a different cell that now sits in that position.
+    #[test]
+    fn a_window_holds_only_the_rows_it_was_sent() {
+        let tree = parse(
+            r#"<window title="Sheet">
+                 <table id="sheet" rows="1000" first-row="500" description="The grid">
+                   <column label="A"/>
+                   <row label="501"><cell id="A501" value="x"/></row>
+                 </table>
+               </window>"#,
+        )
+        .unwrap();
+        let view = agent_view(&tree, "awsheet", 2);
+        assert!(view.contains("id=\"A501\""), "the window is not in the view: {view}");
+        assert!(!view.contains("id=\"A1\""), "a row nobody sent appeared: {view}");
+        // And the window says it is one. Without these an agent cannot tell
+        // one row of a thousand from a sheet with one row in it, and has
+        // nothing to aim `query rows` with.
+        assert!(view.contains("rows=\"1000\""), "the sheet's size is missing: {view}");
+        assert!(view.contains("first-row=\"500\""), "the window's start is missing: {view}");
     }
 }

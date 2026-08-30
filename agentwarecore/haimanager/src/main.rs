@@ -12,6 +12,7 @@
 //! file descriptor, so the process sleeps whenever nothing is happening.
 
 mod awml;
+mod clipboard;
 mod client;
 mod cursor;
 mod document;

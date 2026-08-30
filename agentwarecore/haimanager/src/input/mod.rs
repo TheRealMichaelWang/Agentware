@@ -35,6 +35,19 @@ pub enum Key {
     Right,
     Up,
     Down,
+    /// The clipboard chords, named by what they do rather than by the keys
+    /// that produce them.
+    ///
+    /// A modifier never leaves this module. Control is tracked here exactly
+    /// as shift is, and what comes out is the intention, so nothing
+    /// downstream reasons about held keys and no application can be told one
+    /// was held: cut, copy and paste happen against the compositor's own copy
+    /// of a text control, and what an application hears is the value it ended
+    /// up with.
+    Copy,
+    Cut,
+    Paste,
+    SelectAll,
     Other(u16),
 }
 
@@ -98,6 +111,8 @@ const BTN_LEFT: u16 = 0x110;
 const BTN_RIGHT: u16 = 0x111;
 const BTN_MIDDLE: u16 = 0x112;
 
+const KEY_LEFTCTRL: u16 = 29;
+const KEY_RIGHTCTRL: u16 = 97;
 const KEY_LEFTSHIFT: u16 = 42;
 const KEY_RIGHTSHIFT: u16 = 54;
 const KEY_CAPSLOCK: u16 = 58;
@@ -111,6 +126,7 @@ pub struct Input {
     width: i32,
     height: i32,
     shift: bool,
+    ctrl: bool,
     caps: bool,
 }
 
@@ -126,6 +142,7 @@ impl Input {
             width,
             height,
             shift: false,
+            ctrl: false,
             caps: false,
         }
     }
@@ -278,6 +295,10 @@ impl Input {
                         self.shift = pressed;
                         return;
                     }
+                    KEY_LEFTCTRL | KEY_RIGHTCTRL => {
+                        self.ctrl = pressed;
+                        return;
+                    }
                     KEY_CAPSLOCK => {
                         if record.value == 1 {
                             self.caps = !self.caps;
@@ -287,7 +308,7 @@ impl Input {
                     _ => {}
                 }
 
-                let key = keymap::decode(record.code, self.shift, self.caps);
+                let key = keymap::decode(record.code, self.shift, self.caps, self.ctrl);
                 events.push(if pressed {
                     Event::KeyPressed(key)
                 } else {

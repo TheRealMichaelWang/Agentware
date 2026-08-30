@@ -93,10 +93,17 @@ impl Document {
             }
         }
 
+        // Against a set rather than a scan. `has_key` walks every key, so
+        // asking it once per old key was quadratic: fine for the two hundred
+        // nodes an application used to hold, and 100M string comparisons per
+        // keystroke for a grid. The map above already exists; this is its
+        // mirror.
+        let fresh: std::collections::HashSet<&str> =
+            self.keys.iter().map(String::as_str).collect();
         diff.removed = previous
             .keys
             .iter()
-            .filter(|key| !self.has_key(key))
+            .filter(|key| !fresh.contains(key.as_str()))
             .count();
 
         diff

@@ -6,12 +6,15 @@
 //! ```text
 //!   query  apps                              agent -> haimanager
 //!   query  view <app>
+//!   query  rows <app> <table> <first-row>
+//!   query  clipboard
 //!   intent <app> <action> <target> [value]
 //!
-//!   apps     <awml>                          haimanager -> agent
-//!   view     <app> <awml>
-//!   done     <app> <target> <action>
-//!   rejected <app> <target> <reason>
+//!   apps      <awml>                         haimanager -> agent
+//!   view      <app> <awml>
+//!   clipboard <kind> <content>
+//!   done      <app> <target> <action>
+//!   rejected  <app> <target> <reason>
 //!   changed  <app>                           haimanager -> agent, unsolicited
 //! ```
 //!
@@ -51,6 +54,37 @@
 //! Because those steps can fail, intents are rejectable. An agent that cannot be
 //! told no acts blind and retries forever.
 //!
+//! ## Reading a collection too large to send
+//!
+//! A table holds a window rather than a sheet: its rows are the ones the
+//! application chose to describe, and ten thousand of them are neither sent
+//! nor wanted. `query rows` is how an agent reads a different part of one.
+//!
+//! It is a query rather than an action because it is a read, and because
+//! there is nothing to act on: a cell outside the window is not in the tree,
+//! so an intent naming it has no target to resolve. The compositor asks the
+//! application to move its window and answers with the view once it has,
+//! within a bounded wait. An application that ignores the request costs the
+//! agent one stale view whose `first-row` says plainly that nothing moved.
+//!
+//! ## Scrolling is not an action
+//!
+//! There is no verb for it. Acting on anything scrolls whatever has to move
+//! first, exactly as acting on an application arranges its window, so an
+//! agent never expresses a scroll and never hears that something was out of
+//! view. Reachability is something the compositor makes true rather than a
+//! question it answers.
+//!
+//! ## The clipboard is read, never written
+//!
+//! Cut, copy and paste are the human's, done with the keyboard against the
+//! compositor's own copy of a text control, and they never appear in the
+//! display protocol at all: a paste is an ordinary `type-text` event, which
+//! is exactly what it would be if the human had typed the words. An agent
+//! reads the clipboard because what the human copied is context it may need;
+//! it has no way to write one, because it has no need of a place to put text
+//! it already holds. `type-text` says what it wants said.
+//!
 //! ## Scoping is not a field on this wire
 //!
 //! Every answer is scoped to the agent's own workspace, and there is no
@@ -69,6 +103,9 @@ pub const MSG_QUERY: &str = "query";
 pub const MSG_INTENT: &str = "intent";
 pub const MSG_APPS: &str = "apps";
 pub const MSG_VIEW: &str = "view";
+pub const MSG_CLIPBOARD: &str = "clipboard";
+/// Read a different window of a table. Answered with a `view`.
+pub const MSG_ROWS: &str = "rows";
 pub const MSG_DONE: &str = "done";
 pub const MSG_REJECTED: &str = "rejected";
 /// An application's tree changed since it was last read. Unsolicited, and
@@ -80,10 +117,15 @@ pub const REASON_NO_SUCH_APP: &str = "no-such-app";
 /// The application is open, but nothing in it answers to that id.
 pub const REASON_NO_SUCH_NODE: &str = "no-such-node";
 pub const REASON_DISABLED: &str = "disabled";
-/// Scrolled out of its container, which `scroll-into-view` remedies. Being
-/// behind another window is not a reason an agent can ever receive: acting on
-/// an app arranges its window to the front first.
-pub const REASON_NOT_VISIBLE: &str = "not-visible";
+/// The compositor could not make the node reachable.
+///
+/// This is a fault, not an instruction. Acting on a node scrolls whatever has
+/// to move and arranges whatever has to be arranged, so every ordinary reason
+/// a node might be off screen is dealt with before an agent hears anything.
+/// What is left is a node the compositor tried to reveal and could not, which
+/// means a bug here rather than a step the agent missed: there is nothing it
+/// could usefully do differently, and the compositor says so in the log.
+pub const REASON_UNREACHABLE: &str = "unreachable";
 /// Behind an open dialog. The control is fine and the application did not
 /// disable it; something modal is in front, and answering that is what brings
 /// it back. Told apart from `disabled` so the agent knows to look for the
@@ -98,6 +140,15 @@ pub const REASON_NEEDS_APPROVAL: &str = "needs-approval";
 /// and the agentdesk's own chrome. Enforced by which connection the request
 /// arrived on, never by a claim the agent makes about itself.
 pub const REASON_NOT_ADDRESSABLE: &str = "not-addressable";
+
+/// Nothing has been copied yet.
+pub const CLIPBOARD_NONE: &str = "none";
+/// Words. The content is the text itself.
+pub const CLIPBOARD_TEXT: &str = "text";
+/// A picture, as base64. Nothing produces one yet; the kind exists so that
+/// the day something does, an agent that only understands text says so
+/// instead of reading the bytes as words.
+pub const CLIPBOARD_IMAGE: &str = "image";
 
 /// What became of an intent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,6 +252,30 @@ impl Link {
     pub fn view(&mut self, app: &str) -> io::Result<String> {
         let reply = self.round_trip(&[MSG_QUERY, MSG_VIEW, app])?;
         Ok(reply.get(2).cloned().unwrap_or_default())
+    }
+
+    /// Read a table from a given row, moving its window if it has to.
+    ///
+    /// Answered with the application's view once the window has moved, so
+    /// one call both asks and reads. Slower than [`Link::view`], because it
+    /// waits for the application to answer; the reply says which rows it got.
+    pub fn rows(&mut self, app: &str, table: &str, first_row: u32) -> io::Result<String> {
+        let reply =
+            self.round_trip(&[MSG_QUERY, MSG_ROWS, app, table, &first_row.to_string()])?;
+        Ok(reply.get(2).cloned().unwrap_or_default())
+    }
+
+    /// What the human last copied, as a kind and its content.
+    ///
+    /// The kind is `none` when nothing has been copied, `text` for words. It
+    /// exists so that a kind this agent does not understand is something it
+    /// can say it cannot read, rather than something it misreads as text.
+    pub fn clipboard(&mut self) -> io::Result<(String, String)> {
+        let reply = self.round_trip(&[MSG_QUERY, MSG_CLIPBOARD])?;
+        Ok((
+            reply.get(1).cloned().unwrap_or_else(|| CLIPBOARD_NONE.to_owned()),
+            reply.get(2).cloned().unwrap_or_default(),
+        ))
     }
 
     /// Name a node and an action, and wait to be told what happened.

@@ -192,6 +192,15 @@ fn checkbox_size() -> i32 { sc(14) }
 const DIVIDER: i32 = 1;
 /// An editor is this many lines tall.
 const EDITOR_LINES: i32 = 4;
+/// A column with no declared width is this many characters wide, which is
+/// about what a spreadsheet gives an untouched column.
+const DEFAULT_COLUMN_CHARS: i32 = 10;
+/// The narrowest a column may be dragged, in characters, so one cannot be
+/// pulled shut and then be impossible to find again.
+const MIN_COLUMN_CHARS: i32 = 2;
+/// How close to a column's trailing edge a press takes hold of it.
+pub fn column_grip() -> i32 { sc(5) }
+
 /// Width of the indicator drawn beside overflowing scroll content.
 fn scrollbar_w() -> i32 { sc(5) }
 /// How far one notch of the wheel moves a scroll container.
@@ -219,7 +228,14 @@ fn label_of(node: &Node) -> &str {
 /// password by forgetting to, and the agent's view is built from the same
 /// string, so it cannot see one either.
 fn value_of(node: &Node) -> String {
-    let value = node.attr("value").unwrap_or("");
+    let value = match node.attr("value") {
+        Some(value) => value,
+        // A cell may carry its content as text, which is what a table full of
+        // words reads like in markup. A field with no value is empty, and its
+        // placeholder is a separate thing.
+        None if node.tag == Tag::Cell => node.text.as_str(),
+        None => "",
+    };
     if node.attr("kind") == Some("password") {
         return "*".repeat(value.chars().count());
     }
@@ -385,13 +401,36 @@ impl Regions {
 }
 
 /// A scroll container that was placed, and how much of it did not fit.
+///
+/// A table produces these too, and its vertical one is not like the others:
+/// the content it reports is the whole sheet, which was never laid out and
+/// mostly never sent. That is what lets a bar be drawn against ten thousand
+/// rows while the tree holds forty. Dragging it is therefore a question for
+/// the application rather than an offset to change, which [`Scroller::asks`]
+/// is what marks.
 pub struct Scroller {
     pub node: usize,
-    /// Total height the children wanted.
+    /// Total extent the content wanted, along this scroller's axis.
     pub content: i32,
-    /// How much of them is visible.
+    /// How much of it is visible.
     pub viewport: i32,
     pub offset: i32,
+    /// Across rather than down.
+    pub horizontal: bool,
+    /// Moving this does not move anything here: it asks the application to
+    /// describe a different window, and the answer arrives as a new tree.
+    pub asks: bool,
+    /// What one unit of this scroller is worth in pixels: a row's height for
+    /// a table, one pixel for everything else. It is what turns a thumb's
+    /// position back into the row number the application is asked for.
+    pub step: i32,
+}
+
+impl Scroller {
+    /// How far this can travel: zero when everything already fits.
+    pub fn furthest(&self) -> i32 {
+        (self.content - self.viewport).max(0)
+    }
 }
 
 /// Where the compositor believes the caret is, and in which node.
@@ -404,6 +443,10 @@ pub struct Focus {
     pub node: Option<usize>,
     /// Position in characters within the focused control's value.
     pub caret: usize,
+    /// Where a selection started, when the human is holding one. The
+    /// selected run is everything between this and the caret, in either
+    /// order. `None` means nothing is selected and the caret is a point.
+    pub anchor: Option<usize>,
     /// A control being pressed right now.
     ///
     /// Kept apart from focus because they answer different questions: focus is
@@ -503,7 +546,7 @@ impl Layout {
     /// The innermost scroll container under a point, for routing the wheel.
     ///
     /// The agent never addresses one of these, which is why `scroll` needs no
-    /// id: `scroll-into-view` names the node it wants seen and the compositor
+    /// id: acting on a node inside one scrolls it, and the compositor
     /// works out what to move.
     pub fn scroller_at(&self, x: i32, y: i32) -> Option<&Scroller> {
         self.scrollers_at(x, y).next()
@@ -532,11 +575,30 @@ impl Layout {
 /// The clamp belongs here because only layout knows how tall the content turned
 /// out to be. A container whose content shrank should not stay scrolled past its
 /// own end.
+/// Lay out a document that cannot hold a table: the compositor's own chrome.
+///
+/// The navigation bar and the start menu are built here rather than by any
+/// application, so they have neither an offset across nor a dragged column,
+/// and saying that once is better than every caller carrying two maps that
+/// stay empty.
+pub fn layout_chrome(
+    fonts: &Fonts,
+    doc: &Document,
+    frame: &Frame,
+    scroll: &mut HashMap<String, i32>,
+) -> Layout {
+    let mut across = HashMap::new();
+    let columns = HashMap::new();
+    layout(fonts, doc, frame, scroll, &mut across, &columns)
+}
+
 pub fn layout(
     fonts: &Fonts,
     doc: &Document,
     frame: &Frame,
     scroll: &mut HashMap<String, i32>,
+    scroll_x: &mut HashMap<String, i32>,
+    columns: &HashMap<String, i32>,
 ) -> Layout {
     let count = doc.tree.nodes.len();
     let bounds = match frame {
@@ -548,6 +610,8 @@ pub fn layout(
         fonts,
         doc,
         scroll,
+        scroll_x,
+        columns,
         rects: vec![Rect::new(0, 0, 0, 0); count],
         clips: vec![bounds; count],
         scrollers: Vec::new(),
@@ -640,6 +704,21 @@ fn measure(fonts: &Fonts, tree: &Tree, index: usize, width: i32) -> i32 {
             tile_pad() * 2 + tile_icon() + sc(6) + line_height(fonts, tree, index)
         }
         Tag::Button | Tag::Field | Tag::Item | Tag::Select => control_height(fonts, tree, index),
+
+        // A table is its header plus the rows it was given. It only ever
+        // holds the window the application sent, so this is a small number
+        // however large the sheet is; `grow` is how one asks for the room to
+        // show more, and the row count it reports is what the bar is drawn
+        // against.
+        Tag::Table => {
+            let row = control_height(fonts, tree, index);
+            let header = if tree.columns(index).is_empty() { 0 } else { row };
+            let body = (tree.rows(index).len() as i32).max(1) * row;
+            header + body
+        }
+        // Rows and cells are placed by their table, which knows the grid;
+        // asking them how tall they would like to be is meaningless.
+        Tag::Row | Tag::Cell | Tag::Column => 0,
         // Options take no room in the flow: they float below their dropdown
         // while it is open and are nowhere while it is not.
         Tag::Option => 0,
@@ -730,6 +809,14 @@ struct Placer<'a> {
     fonts: &'a Fonts,
     doc: &'a Document,
     scroll: &'a mut HashMap<String, i32>,
+    /// Offsets across, for the one thing that scrolls that way.
+    scroll_x: &'a mut HashMap<String, i32>,
+    /// Column widths the human has dragged, in pixels, keyed by the column's
+    /// identity. Ephemeral state like scroll and focus: the application
+    /// declares what a column should start at and never hears that it moved,
+    /// because where a column's edge sits is no more its business than where
+    /// its window is.
+    columns: &'a HashMap<String, i32>,
     rects: Vec<Rect>,
     clips: Vec<Rect>,
     scrollers: Vec<Scroller>,
@@ -861,6 +948,11 @@ impl Placer<'_> {
             return;
         }
 
+        if tag == Tag::Table {
+            self.place_table(index, inner, inside);
+            return;
+        }
+
         if tag == Tag::HStack {
             self.place_row(&children, inner, gap, inside);
             return;
@@ -957,6 +1049,127 @@ impl Placer<'_> {
             .collect()
     }
 
+    /// Place a grid: a header that does not scroll down, a row-label gutter
+    /// that does not scroll across, and the window of rows the application
+    /// sent.
+    ///
+    /// Two axes with two different owners, which is the whole of the design.
+    /// Across is the compositor's, an offset over columns that are all
+    /// present in the tree, and it works exactly as a scroll container does.
+    /// Down is the application's: the `row` children *are* the window,
+    /// `first-row` says which row the first of them is, and `rows` says how
+    /// many exist. Nothing here translates rows by an offset, because the
+    /// rows to show are not the compositor's to choose. The bar is drawn
+    /// against the whole sheet and dragging it asks the application for a
+    /// different window, the way pressing a dropdown asks it to open.
+    ///
+    /// That split is what lets ten thousand rows cost a tree of forty.
+    fn place_table(&mut self, index: usize, area: Rect, clip: Rect) {
+        // The document reference is copied out so that reading the tree and
+        // writing the rectangles are borrows of different things.
+        let doc = self.doc;
+        let tree = &doc.tree;
+
+        let columns = tree.columns(index);
+        let rows = tree.rows(index);
+        let row_h = control_height(self.fonts, tree, index);
+        let header_h = if columns.is_empty() { 0 } else { row_h };
+        let gutter = gutter_width(self.fonts, tree, index);
+
+        let widths: Vec<i32> = columns
+            .iter()
+            .map(|&column| {
+                let dragged = self.columns.get(doc.key(column)).copied();
+                column_width(self.fonts, tree, column, dragged)
+            })
+            .collect();
+        let total_w: i32 = widths.iter().sum();
+
+        self.rects[index] = area;
+        self.clips[index] = clip;
+
+        let body = Rect::new(area.x, area.y + header_h, area.w, (area.h - header_h).max(0));
+        let across = Rect::new(area.x + gutter, area.y, (area.w - gutter).max(0), area.h);
+        let empty = Rect::new(area.x, area.y, 0, 0);
+
+        // Across: ours, and clamped here because only layout knows how wide
+        // the columns turned out to be.
+        let key = doc.key(index).to_owned();
+        let furthest_x = (total_w - across.w).max(0);
+        let offset_x = self.scroll_x.get(&key).copied().unwrap_or(0).clamp(0, furthest_x);
+        self.scroll_x.insert(key, offset_x);
+
+        // Down: theirs. A sheet cannot be smaller than the window it sent.
+        let sent = rows.len() as i32;
+        let total_rows = tree
+            .node(index)
+            .attr("rows")
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or(sent)
+            .max(sent);
+        let first_row = tree
+            .node(index)
+            .attr("first-row")
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or(0)
+            .clamp(0, (total_rows - sent).max(0));
+
+        self.scrollers.push(Scroller {
+            node: index,
+            content: total_rows * row_h,
+            viewport: body.h,
+            offset: first_row * row_h,
+            horizontal: false,
+            asks: true,
+            step: row_h,
+        });
+        if total_w > across.w {
+            self.scrollers.push(Scroller {
+                node: index,
+                content: total_w,
+                viewport: across.w,
+                offset: offset_x,
+                horizontal: true,
+                asks: false,
+                step: 1,
+            });
+        }
+
+        let header_clip = Rect::new(across.x, area.y, across.w, header_h)
+            .intersect(&clip)
+            .unwrap_or(empty);
+        let body_clip = body.intersect(&clip).unwrap_or(empty);
+        let cell_clip = Rect::new(across.x, body.y, across.w, body.h)
+            .intersect(&clip)
+            .unwrap_or(empty);
+
+        let left = area.x + gutter - offset_x;
+        let mut x = left;
+        for (at, &column) in columns.iter().enumerate() {
+            self.rects[column] = Rect::new(x, area.y, widths[at], header_h);
+            self.clips[column] = header_clip;
+            x += widths[at];
+        }
+
+        // Rows run from the top of the body, one after another. Any that fall
+        // past the bottom get rectangles outside the clip, which is exactly
+        // what an out-of-view node is everywhere else in the system: not
+        // painted, not hit, not reachable by an intent.
+        let mut y = body.y;
+        for &row in &rows {
+            self.rects[row] = Rect::new(area.x, y, area.w, row_h);
+            self.clips[row] = body_clip;
+            let mut cx = left;
+            for (at, &cell) in tree.cells(row).iter().enumerate() {
+                let width = widths.get(at).copied().unwrap_or(0);
+                self.rects[cell] = Rect::new(cx, y, width, row_h);
+                self.clips[cell] = cell_clip;
+                cx += width;
+            }
+            y += row_h;
+        }
+    }
+
     /// Content is laid out at its natural height and translated up by the offset,
     /// so every rectangle in the arena is already in screen coordinates. Hit
     /// testing then needs no special case for scrolled content, and neither does
@@ -993,6 +1206,9 @@ impl Placer<'_> {
             content,
             viewport: inner.h,
             offset,
+            horizontal: false,
+            asks: false,
+            step: 1,
         });
 
         let mut y = inner.y - offset;
@@ -1076,6 +1292,19 @@ fn wanted_width(fonts: &Fonts, tree: &Tree, index: usize) -> i32 {
             natural_width(fonts, tree, index)
         }
         Tag::Option => 0,
+        // Everything the grid needs across: the row-label gutter plus every
+        // column. Wider than a window often is, which is what the horizontal
+        // bar is for; `document_width` is clamped to the workspace anyway.
+        Tag::Table => {
+            let gutter = gutter_width(fonts, tree, index);
+            let columns: i32 = tree
+                .columns(index)
+                .into_iter()
+                .map(|column| column_width(fonts, tree, column, None))
+                .sum();
+            gutter + columns
+        }
+        Tag::Row | Tag::Cell | Tag::Column => 0,
         Tag::HStack => {
             let gaps = gap_of(node) * (node.children.len().saturating_sub(1)) as i32;
             children(false).sum::<i32>() + gaps
@@ -1137,7 +1366,52 @@ fn natural_width(fonts: &Fonts, tree: &Tree, index: usize) -> i32 {
         // A text entry that is not told to grow is the width of a search box:
         // room for a sentence, which is what one in a row is for.
         Tag::Field | Tag::Editor => sc(260),
+        Tag::Table => wanted_width(fonts, tree, index),
+        Tag::Row | Tag::Cell | Tag::Column => 0,
         _ => sc(160),
+    }
+}
+
+/// How wide one column is: what it declared, in characters, or a default.
+///
+/// Characters rather than pixels, because a column width is a property of the
+/// data in it and a pixel count would be a different column on a different
+/// display. `dragged` is what the human pulled it to, which wins over both.
+pub fn column_width(fonts: &Fonts, tree: &Tree, column: usize, dragged: Option<i32>) -> i32 {
+    if let Some(width) = dragged {
+        return width.max(character_width(fonts, tree, column) * MIN_COLUMN_CHARS);
+    }
+    let chars = tree
+        .node(column)
+        .attr("chars")
+        .and_then(|value| value.parse::<i32>().ok())
+        .unwrap_or(DEFAULT_COLUMN_CHARS)
+        .clamp(MIN_COLUMN_CHARS, 200);
+    character_width(fonts, tree, column) * chars + control_pad() * 2
+}
+
+/// The width of one character in a node's own style. A digit's, because a
+/// spreadsheet column is mostly numbers and `0` is a fair average anyway.
+fn character_width(fonts: &Fonts, tree: &Tree, index: usize) -> i32 {
+    fonts.measure("0", &style_at(tree, index)).max(1)
+}
+
+/// The frozen strip down a table's left, holding row labels.
+///
+/// Zero when no row carries a label, so a plain table has no gutter at all
+/// and a spreadsheet, whose rows are all numbered, gets one sized to the
+/// widest number it is currently showing.
+pub fn gutter_width(fonts: &Fonts, tree: &Tree, table: usize) -> i32 {
+    let style = style_at(tree, table);
+    let widest = tree
+        .rows(table)
+        .into_iter()
+        .filter_map(|row| tree.node(row).attr("label"))
+        .map(|label| fonts.measure(label, &style))
+        .max();
+    match widest {
+        Some(width) => width + control_pad() * 2,
+        None => 0,
     }
 }
 
@@ -1195,6 +1469,52 @@ fn prefix(text: &str, caret: usize) -> &str {
     match text.char_indices().nth(caret) {
         Some((at, _)) => &text[..at],
         None => text,
+    }
+}
+
+/// The selected run, low to high, or `None` when the caret is a point.
+fn selection(focus: &Focus) -> Option<(usize, usize)> {
+    let anchor = focus.anchor?;
+    let (from, to) = (anchor.min(focus.caret), anchor.max(focus.caret));
+    (from != to).then_some((from, to))
+}
+
+/// Where a text control's content sits: the left edge it starts at, the top
+/// of its first line, and how far apart its lines are.
+#[derive(Clone, Copy)]
+struct TextBox {
+    left: i32,
+    top: i32,
+    step: i32,
+}
+
+/// Paint the highlight behind a selected run.
+///
+/// Behind, so the text stays the text: a selection that covered the words
+/// would be a selection nobody could read. Walked a line at a time, because
+/// an editor's run can cross newlines and each line starts again at the left.
+fn paint_selection(
+    canvas: &mut Canvas,
+    fonts: &Fonts,
+    value: &str,
+    style: &Style,
+    box_: TextBox,
+    (from, to): (usize, usize),
+) {
+    let TextBox { left, top, step } = box_;
+    let mut at = 0;
+    for (row, line) in value.split('\n').enumerate() {
+        let length = line.chars().count();
+        let start = at.max(from);
+        let end = (at + length).min(to);
+        if start < end {
+            let x0 = left + fonts.measure(prefix(line, start - at), style);
+            let x1 = left + fonts.measure(prefix(line, end - at), style);
+            canvas.fill_rect(Rect::new(x0, top + row as i32 * step, (x1 - x0).max(1), step), selected());
+        }
+        // The newline the split consumed counts too, so a run that crosses
+        // lines lands on the right characters of the next one.
+        at += length + 1;
     }
 }
 
@@ -1258,6 +1578,20 @@ pub fn scrollbar_geometry(rect: Rect, scroller: &Scroller) -> Option<(Rect, Rect
     if scroller.content <= scroller.viewport || scroller.viewport <= 0 {
         return None;
     }
+    let furthest = scroller.furthest().max(1);
+
+    if scroller.horizontal {
+        let track = Rect::new(
+            rect.x + sc(2),
+            rect.y + rect.h - scrollbar_w() - sc(2),
+            rect.w - sc(4),
+            scrollbar_w(),
+        );
+        let span = (track.w * scroller.viewport / scroller.content).max(sc(24));
+        let travel = track.w - span;
+        let left = track.x + travel * scroller.offset / furthest;
+        return Some((track, Rect::new(left, track.y, span, track.h)));
+    }
 
     let track = Rect::new(
         rect.x + rect.w - scrollbar_w() - sc(2),
@@ -1267,7 +1601,6 @@ pub fn scrollbar_geometry(rect: Rect, scroller: &Scroller) -> Option<(Rect, Rect
     );
     let span = (track.h * scroller.viewport / scroller.content).max(sc(24));
     let travel = track.h - span;
-    let furthest = (scroller.content - scroller.viewport).max(1);
     let top = track.y + travel * scroller.offset / furthest;
     Some((track, Rect::new(track.x, top, track.w, span)))
 }
@@ -1279,18 +1612,21 @@ pub fn scrollbar_geometry(rect: Rect, scroller: &Scroller) -> Option<(Rect, Rect
 /// bar hugs the content's edge, so earning its keep means leaving when the
 /// scrolling stops.
 fn paint_scrollbar(canvas: &mut Canvas, layout: &Layout, index: usize, lit: Option<usize>) {
-    if lit != Some(index) {
-        return;
+    for scroller in layout.scrollers.iter().filter(|s| s.node == index) {
+        // A scroll container's bar appears while its content is moving and
+        // leaves after. A table's stays: how much sheet there is below the
+        // window is something a spreadsheet has to say all the time, and it
+        // is the only thing saying it.
+        if !scroller.asks && !scroller.horizontal && lit != Some(index) {
+            continue;
+        }
+        let Some((track, thumb)) = scrollbar_geometry(layout.rects[index], scroller) else {
+            continue;
+        };
+        // No track drawn, only the thumb. A permanent groove down the side of
+        // every scrollable thing is most of what makes a list look heavy.
+        canvas.fill_round_rect(thumb, track.w.min(track.h) / 2, muted());
     }
-    let Some(scroller) = layout.scrollers.iter().find(|s| s.node == index) else {
-        return;
-    };
-    let Some((track, thumb)) = scrollbar_geometry(layout.rects[index], scroller) else {
-        return;
-    };
-    // No track drawn, only the thumb. A permanent groove down the side of
-    // every scrollable thing is most of what makes a list look heavy.
-    canvas.fill_round_rect(thumb, track.w / 2, muted());
 }
 
 /// An open dropdown's options: a raised panel hanging off the box, over
@@ -1521,6 +1857,12 @@ fn paint_node(
             let step = fonts.line_height(&style);
 
             canvas.clipped(rect.inset(1), |inner| {
+                // The highlight goes down first, so the words sit on top of
+                // it rather than under it.
+                if focused && !empty && let Some(range) = selection(focus) {
+                    paint_selection(inner, fonts, &value, &style, TextBox { left: x, top, step }, range);
+                }
+
                 // An editor is multi-line, so its value is drawn a line at a
                 // time. A field is one line and any newline in it would be a
                 // client bug, so it is drawn as it stands.
@@ -1654,6 +1996,95 @@ fn paint_node(
             );
         }
 
+        // The grid itself: the surface under it, the frozen gutter down its
+        // left, and the row labels in that gutter. The gutter is painted here
+        // rather than by each row because it is one strip that happens to
+        // hold one label per row, and because a row does not know how wide it
+        // is: that is a property of the table's widest label.
+        Tag::Table => {
+            canvas.fill_rect(rect, background());
+            let gutter = gutter_width(fonts, tree, index);
+            if gutter > 0 {
+                let strip = Rect::new(rect.x, rect.y, gutter, rect.h);
+                canvas.fill_round_rect_vgrad(strip, 0, lift(surface(), 4), surface());
+                let label_style = Style { size: style.size * 0.9, ..style };
+                for row in tree.rows(index) {
+                    let Some(label) = tree.node(row).attr("label") else { continue };
+                    let at = layout.rects[row];
+                    // Only the rows actually on screen: the rest were placed
+                    // past the bottom of the body and clipped away.
+                    if at.y + at.h <= rect.y || at.y >= rect.y + rect.h {
+                        continue;
+                    }
+                    let width = fonts.measure(label, &label_style);
+                    canvas.draw_text(
+                        fonts,
+                        label,
+                        strip.x + (gutter - width) / 2,
+                        at.y + (at.h - fonts.line_height(&label_style)) / 2,
+                        &label_style,
+                        muted(),
+                    );
+                }
+                canvas.fill_rect(Rect::new(rect.x + gutter - 1, rect.y, 1, rect.h), border());
+            }
+            canvas.stroke_round_rect(rect, radius_small(), 1, border());
+        }
+
+        // One heading over one column, on the raised surface every header in
+        // the system wears.
+        Tag::Column => {
+            canvas.fill_round_rect_vgrad(rect, 0, lift(raised(), 6), raised());
+            canvas.fill_rect(Rect::new(rect.x + rect.w - 1, rect.y, 1, rect.h), border());
+            canvas.fill_rect(Rect::new(rect.x, rect.y + rect.h - 1, rect.w, 1), border());
+            let label = label_of(node);
+            let width = fonts.measure(label, &style);
+            canvas.draw_text(
+                fonts,
+                label,
+                rect.x + ((rect.w - width) / 2).max(control_pad()),
+                centred(rect.h),
+                &style,
+                if disabled { muted() } else { text() },
+            );
+        }
+
+        Tag::Row => {
+            if node.flag("selected") {
+                canvas.fill_rect(rect, selected());
+            }
+            canvas.fill_rect(Rect::new(rect.x, rect.y + rect.h - 1, rect.w, 1), border());
+        }
+
+        // One cell. The ring around the focused one is the grid's cursor, and
+        // it is drawn rather than filled so that what is selected and what is
+        // being typed into stay two visibly different things.
+        Tag::Cell => {
+            if node.flag("selected") {
+                canvas.fill_rect(rect, selected());
+            }
+            canvas.fill_rect(Rect::new(rect.x + rect.w - 1, rect.y, 1, rect.h), border());
+
+            let value = value_of(node);
+            let x = rect.x + control_pad();
+            let step = fonts.line_height(&style);
+            let top = centred(rect.h);
+            canvas.clipped(rect.inset(1), |inner| {
+                if focused && let Some(range) = selection(focus) {
+                    paint_selection(inner, fonts, &value, &style, TextBox { left: x, top, step }, range);
+                }
+                inner.draw_text(fonts, &value, x, top, &style, ink);
+                if focused && focus.caret_visible && node.flag("editable") {
+                    let column = focus.caret.min(value.chars().count());
+                    let caret_x = x + fonts.measure(prefix(&value, column), &style);
+                    inner.fill_rect(Rect::new(caret_x, top, sc(2).max(2), step), accent());
+                }
+            });
+            if focused {
+                canvas.stroke_rect(rect, sc(2).max(2), accent());
+            }
+        }
+
         // Pure arrangement draws nothing at all.
         Tag::VStack | Tag::HStack | Tag::Scroll => {}
     });
@@ -1687,7 +2118,7 @@ fn paint_node(
         }
     }
 
-    if node.tag == Tag::Scroll {
+    if matches!(node.tag, Tag::Scroll | Tag::Table) {
         canvas.clipped(clip, |canvas| paint_scrollbar(canvas, layout, index, focus.scrollbar));
     }
 }
@@ -1837,4 +2268,120 @@ pub fn caret_at_point(
     let row = (((y - top) / step).max(0) as usize).min(lines.len().saturating_sub(1));
     let column = caret_from_x(fonts, lines[row], style, left, x);
     lines[..row].iter().map(|line| line.chars().count() + 1).sum::<usize>() + column
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A document laid out into a known rectangle, for asking where things
+    /// landed. The scale is fixed at 1 so the numbers below are the logical
+    /// ones; `set_scale` is a `OnceLock`, so the first test to run sets it
+    /// and the rest agree with it.
+    fn placed(source: &str, area: Rect) -> (Document, Layout) {
+        set_scale(1.0);
+        let fonts = Fonts::load().expect("the faces are compiled in");
+        let doc = Document::parse(source, 1).expect("valid markup");
+        let mut down = HashMap::new();
+        let mut across = HashMap::new();
+        let columns = HashMap::new();
+        let layout = layout(&fonts, &doc, &Frame::Whole(area), &mut down, &mut across, &columns);
+        (doc, layout)
+    }
+
+    const SHEET: &str = r#"<window title="Sheet" pad="none">
+        <table id="sheet" rows="1000" first-row="0" description="The grid">
+          <column label="A" chars="8"/>
+          <column label="B" chars="8"/>
+          <row label="1"><cell id="A1" value="one"/><cell id="B1" value="two"/></row>
+          <row label="2"><cell id="A2" value="three"/><cell id="B2" value="four"/></row>
+        </table>
+      </window>"#;
+
+    /// The grid's shape: a header across the top, a gutter down the left, and
+    /// cells that line up with the columns they belong to.
+    #[test]
+    fn a_table_places_a_header_a_gutter_and_its_rows() {
+        let area = Rect::new(0, 0, 400, 300);
+        let (doc, layout) = placed(SHEET, area);
+        let column_a = doc.index_of("#sheet").map(|table| doc.tree.columns(table)[0]).unwrap();
+        let a1 = doc.index_of("#A1").unwrap();
+        let a2 = doc.index_of("#A2").unwrap();
+        let b1 = doc.index_of("#B1").unwrap();
+
+        let header = layout.rect_of(column_a);
+        let first = layout.rect_of(a1);
+        let second = layout.rect_of(a2);
+
+        // The header sits above the rows, and the rows below it in order.
+        assert!(header.y < first.y, "header {header:?} is not above {first:?}");
+        assert_eq!(first.h, second.h, "rows are not one height");
+        assert_eq!(second.y, first.y + first.h, "rows are not stacked");
+
+        // A cell is under its own column, and the next column is to its right.
+        assert_eq!(first.x, header.x, "the cell is not under its column");
+        assert!(layout.rect_of(b1).x > first.x, "column B is not right of A");
+
+        // The gutter is real: the row labels pushed the first column right of
+        // the table's own left edge.
+        assert!(header.x > area.x, "no gutter was reserved");
+    }
+
+    /// The bar is drawn against the sheet, not against the window. This is
+    /// what lets ten thousand rows cost a tree of two.
+    #[test]
+    fn the_bar_measures_the_whole_sheet_not_the_window() {
+        let (doc, layout) = placed(SHEET, Rect::new(0, 0, 400, 300));
+        let table = doc.index_of("#sheet").unwrap();
+        let down = layout
+            .scrollers
+            .iter()
+            .find(|scroller| scroller.node == table && !scroller.horizontal)
+            .expect("a table reports its extent");
+
+        assert!(down.asks, "a table's rows are the application's to choose");
+        assert_eq!(down.content, 1000 * down.step, "the bar is not drawn against the sheet");
+        assert!(down.viewport < down.content, "a thousand rows fitted in 300 pixels");
+    }
+
+    /// A row past the bottom of the body is not visible, which is the same
+    /// thing here as anywhere else: not painted, not clickable, and an intent
+    /// naming it is refused rather than acted on.
+    #[test]
+    fn rows_past_the_bottom_are_not_reachable() {
+        let mut source = String::from(
+            r#"<window title="Sheet" pad="none">
+                 <table id="sheet" rows="100" first-row="0" description="The grid">
+                   <column label="A" chars="8"/>"#,
+        );
+        for row in 1..=40 {
+            source.push_str(&format!(
+                r#"<row label="{row}"><cell id="A{row}" value="{row}"/></row>"#
+            ));
+        }
+        source.push_str("</table></window>");
+
+        // Room for a handful of rows, and forty were sent.
+        let (doc, layout) = placed(&source, Rect::new(0, 0, 400, 120));
+        let first = doc.index_of("#A1").unwrap();
+        let last = doc.index_of("#A40").unwrap();
+        assert!(layout.is_visible(first), "the first row is not on screen");
+        assert!(!layout.is_visible(last), "the fortieth row is somehow on screen");
+    }
+
+    /// The offset across is the compositor's, and clamped by layout, because
+    /// only layout knows how wide the columns turned out to be.
+    #[test]
+    fn the_offset_across_is_clamped_to_the_columns() {
+        set_scale(1.0);
+        let fonts = Fonts::load().unwrap();
+        let doc = Document::parse(SHEET, 1).unwrap();
+        let mut down = HashMap::new();
+        let mut across = HashMap::new();
+        across.insert("#sheet".to_owned(), 100_000);
+        let columns = HashMap::new();
+        let _ = layout(&fonts, &doc, &Frame::Whole(Rect::new(0, 0, 400, 300)), &mut down, &mut across, &columns);
+        let held = across.get("#sheet").copied().unwrap();
+        assert!(held < 400, "an offset past the last column survived: {held}");
+    }
 }

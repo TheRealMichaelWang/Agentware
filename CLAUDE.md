@@ -105,8 +105,9 @@ workspace, **arrange the stage** (the target's window comes to the front
 maximized and the workspace's other windows are minimized, so a covered target
 is impossible rather than rejected), find the node, check it is enabled and not
 scrolled away, move the fake cursor there so the human sees it, and only then
-synthesize the event. `not-visible` now means exactly one thing, scrolled out of
-view inside the app, and `scroll-into-view` remains its remedy. The reverse can
+synthesize the event. Scrolling happens on the way: every container above the
+target is moved so that it is reachable, so no rejection mentions the screen.
+The reverse can
 never happen: there is no move, resize, raise or arrange in the intent
 vocabulary, so arrangement is done *for* an agent, never *by* one. A human's click and an agent's intent go through one
 `Client::act`, so an application cannot tell them apart and the two paths cannot
@@ -316,7 +317,7 @@ one streamed exchange, and every tool call executed over the compositor link
 as intents. The model gets four tools that map one to one onto the agent
 surface: `list_apps`, `read_app`, `act` (the fourteen-verb vocabulary as an
 enum), and `open_app` (up the turn channel, then polling `apps()` until the
-app appears). A rejection (`blocked`, `disabled`, `not-visible`) goes back as
+app appears). A rejection (`blocked`, `disabled`, `unsupported-action`) goes back as
 a tool result for the model to reason about, which is rejections-as-answers
 carried one level up. The agent wire also carries one unsolicited word,
 `changed <app>`, sent when an application's tree genuinely differed on a
@@ -407,7 +408,7 @@ bottom edge and corner, with double-arrow cursors over the bands. The pointer
 becomes an I-beam over text, and carets blink on a 530ms clock that wakes the
 loop only when a caret exists. Scrollbars hug the content edge, drag (thumb or
 track-jump), and auto-hide 900ms after the content stops moving; the agent's
-`scroll-into-view` lights them the same way.
+revealing a node for an agent lights them the same way.
 
 The start menu's tiles and prompt, the nav bar's `+` and the pane's Send
 button all go through the real broker, so clicking them forks real processes:
@@ -524,9 +525,20 @@ is the list so it does not get relitigated.
 * A human's click and an agent's intent end in **one function**. Nothing else may
   synthesize an event, or the two paths drift and the guarantee that an agent can
   only do what a human could have done stops being checkable.
-* `scroll-into-view` is the only remedy for an unreachable node, which since
-  automatic arrangement means scrolled out of view. The agent expresses what
-  should be true, never the steps.
+* **Scrolling is not in the agent's vocabulary and never was a good idea
+  there.** Acting on a node scrolls every container above it, outermost
+  first, and a table across its columns, exactly as acting on an application
+  arranges its window. An agent expresses what should be true and is not told
+  about pixels. `not-visible` is gone with it: every case it named was either
+  a bug here (a nested container not walked, a table walked past) or a
+  different word (a folded option offers no actions, which is what it should
+  say). What is left is `unreachable`, which means the compositor tried and
+  failed, and is logged as the fault it is.
+* **A row nobody sent is not a scrolling problem.** `query rows <app>
+  <table> <first-row>` asks an application to describe a different window and
+  answers with the view once it has. A query rather than an action because it
+  is a read, and because a cell outside the window is not in the tree for an
+  intent to name.
 * The tree version is the **application's own counter**, stamped by it and echoed
   back on every event. Checking one is then a comparison against a number the app
   already holds, not a mapping it has to maintain.
@@ -574,6 +586,57 @@ is the list so it does not get relitigated.
   or to chrome, so the agent sees it in the app's view as controls nested in
   `<dialog>`. The compositor makes it modal for human and agent alike; there
   is no attribute to opt out.
+
+**The grid, and the two things it needed.** `table`, `column`, `row` and
+`cell` are built (`docs/UIElements.md`), which is everything a spreadsheet
+application needs from the compositor. A `cell` is a control rather than
+content, since a cell that cannot be named cannot be read or typed into,
+and it is the one control whose description the compositor writes: meaning
+is positional there, and a sheet cannot carry ten thousand hand-written
+sentences, so the column's label and the row's become one.
+
+Two things had to exist first. A **second scrolling axis**, because a grid
+is the first thing wider than its window; the offset across is the
+compositor's, over columns that are all present, and `Scroller` now carries
+which way it runs. And a **window over content too large to send**: a
+table's `row` children are the rows it chose to describe, `rows` says how
+many exist and `first-row` which one the first child is, so ten thousand
+rows cost a tree of forty. The bar is drawn against the whole sheet, and
+the wheel, the bar and an agent's `query rows` all become one `scroll` event
+asking the application to move its window, answered by a
+new tree the way a dropdown answers `open`. It is the only scroll position
+that crosses the protocol, because it is not one: it is which slice the
+application chose. Offsets inside a `scroll` container remain the
+compositor's and still go nowhere.
+
+Column widths are in `chars`, not pixels, so a column is the same column on
+another display; the human may drag an edge and where they drag it to is
+ephemeral state like a scroll offset, never told to the application.
+Keyboard work in a grid is the compositor's too: arrows move the cursor
+cell, Enter commits and moves down, and typing into a selected cell starts
+a fresh value the way every spreadsheet does. Each move reports `select` on
+the cell it lands on, which is what lets the application keep its window on
+the cursor when the compositor is the one moving it.
+
+**Selection and the clipboard are the human's, and never reach an
+application.** A press anchors, a drag extends, the run paints behind the
+words; Ctrl+A/C/X/V are resolved against the compositor's own copy of a
+text control, so a paste arrives at an application as an ordinary
+`type-text` carrying the value the control now has. No modifier reaches the
+event vocabulary: `input/keymap.rs` turns the chord into an intention
+first. One clipboard per machine, in `haimanager/src/clipboard.rs`, holding
+a kind and its content, text today and base64 images the shape it is
+already written for, so a reader that only understands words can say so
+rather than print base64. An agent may read it (`query clipboard`) and has
+no way to write one: something it wants said, it says with `type-text`.
+
+The bug worth remembering: the anchor is set on every press, because a
+press is where a drag would start, and nothing cleared it when the button
+came up without moving. The second character typed after a click then
+deleted the first, since the caret had walked away from an anchor nobody
+had dragged and the run between looked exactly like a selection to replace.
+Typing "abc" in the pane and reading back "bc" is what found it; no unit
+test would have, because it needs a click and two keystrokes in that order.
 
 `width` and `height` attributes on a control are compositor-internal sizing
 hints in physical pixels (the tab rename field keeps its tab's width; the
@@ -635,7 +698,7 @@ them is part of the application catalogue and none reaches an agent.
   (WSLg's log), and the boot line prints what the host reported so an empty
   answer is visible.
 * **A demonstration that depends on geometry breaks at another resolution.** The
-  agent script proved `not-visible` with a draft scrolled off the end of a list,
+  agent script proved the old `not-visible` with a draft scrolled off the end of a list,
   which stopped being true the moment the display got bigger and the list fitted.
   There is no list length that works at every size. It now proves it with one
   window covering another, which is true at any size.

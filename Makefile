@@ -165,11 +165,16 @@ pack: build
 	# The settings app is built from agentwarecore because what it edits is
 	# system state; the rest come from agentwareapps.
 	rm -f $(FS_DIR)/bin/awnotes $(FS_DIR)/bin/awcalc
-	mkdir -p $(FS_DIR)/apps/awcalc $(FS_DIR)/apps/awfiles $(FS_DIR)/apps/awsettings
+	mkdir -p $(FS_DIR)/apps/awcalc $(FS_DIR)/apps/awfiles $(FS_DIR)/apps/awsettings $(FS_DIR)/apps/awsheet
 	cp $(APPS_BIN_DIR)/awcalc $(FS_DIR)/apps/awcalc/exec
 	cp $(AW_APPS_DIR)/awcalc/icon.svg $(AW_APPS_DIR)/awcalc/description.txt $(AW_APPS_DIR)/awcalc/name.txt $(FS_DIR)/apps/awcalc/
 	cp $(APPS_BIN_DIR)/awfiles $(FS_DIR)/apps/awfiles/exec
 	cp $(AW_APPS_DIR)/awfiles/icon.svg $(AW_APPS_DIR)/awfiles/description.txt $(AW_APPS_DIR)/awfiles/name.txt $(FS_DIR)/apps/awfiles/
+	# A grid to try the table elements against, not the spreadsheet
+	# application: no formulas, no files, no arithmetic. It ships so the
+	# elements can be used before anything is built on them.
+	cp $(APPS_BIN_DIR)/awsheet $(FS_DIR)/apps/awsheet/exec
+	cp $(AW_APPS_DIR)/awsheet/icon.svg $(AW_APPS_DIR)/awsheet/description.txt $(AW_APPS_DIR)/awsheet/name.txt $(FS_DIR)/apps/awsheet/
 	cp $(BIN_DIR)/awsettings $(FS_DIR)/apps/awsettings/exec
 	cp $(AW_CORE_DIR)/awsettings/icon.svg $(AW_CORE_DIR)/awsettings/description.txt $(AW_CORE_DIR)/awsettings/name.txt $(FS_DIR)/apps/awsettings/
 
