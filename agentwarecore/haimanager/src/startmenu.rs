@@ -24,9 +24,11 @@ use std::collections::HashMap;
 
 use awproto::display::escape;
 
+use crate::clipboard::Clipboard;
 use crate::document::Document;
 use crate::images::Images;
 use crate::input::Key;
+use crate::text::{Edit, Editing, MultiPress};
 use crate::paint::font::Fonts;
 use crate::paint::{Canvas, Rect};
 use crate::ui::{self, Focus, Frame, Layout};
@@ -80,7 +82,16 @@ struct Installed {
 /// The menu while it is open: the prompt being typed, and the document it is
 /// drawn from, rebuilt whenever the prompt or the scroll changes.
 pub struct StartMenu {
-    prompt: String,
+    /// The prompt, as the one text box every other text box is. It used to be
+    /// a `String` with `push` and `pop` on it, which is why nothing worked in
+    /// here: no caret, no selection, no clipboard, no arrow keys. A box that
+    /// cannot be pasted into is not a text box, and there is no reason for
+    /// this one to be a different thing from the others.
+    prompt: Editing,
+    /// Presses counted here as well, for the double and triple click.
+    presses: MultiPress,
+    /// Whether a run is being dragged out of the prompt right now.
+    dragging: bool,
     doc: Option<Document>,
     layout: Layout,
     scroll: HashMap<String, i32>,
@@ -97,7 +108,9 @@ pub struct StartMenu {
 impl StartMenu {
     pub fn open() -> StartMenu {
         StartMenu {
-            prompt: String::new(),
+            prompt: Editing::new(String::new()),
+            presses: MultiPress::default(),
+            dragging: false,
             doc: None,
             layout: Layout::empty(),
             scroll: HashMap::new(),
@@ -145,7 +158,7 @@ impl StartMenu {
              placeholder=\"What should the new agentdesk do?\" \
              description=\"The prompt a new agentdesk begins with\"/>\n",
             height = prompt_h(),
-            value = escape(&self.prompt),
+            value = escape(&self.prompt.value),
         ));
         out.push_str(
             "    <hstack gap=\"sm\">\n      <text grow=\"true\"/>\n\
@@ -206,7 +219,7 @@ impl StartMenu {
     }
 
     /// A press inside the panel.
-    pub fn click(&mut self, x: i32, y: i32) -> StartOutcome {
+    pub fn click(&mut self, fonts: &Fonts, x: i32, y: i32) -> StartOutcome {
         let Some(doc) = &self.doc else { return StartOutcome::Nothing };
         let Some(index) = self.layout.hit(&doc.tree, x, y) else { return StartOutcome::Nothing };
         let Some(id) = doc.tree.node(index).id() else { return StartOutcome::Nothing };
@@ -223,29 +236,87 @@ impl StartMenu {
         if let Some(app) = id.strip_prefix("launch-") {
             return StartOutcome::Open(app.to_owned());
         }
-        // The prompt field: focus is already here and the caret sits at the
-        // end, so a press on it changes nothing.
+        if id == "start-prompt" {
+            // The caret goes where the press did, and the press is where a
+            // drag would start. Two in the same place take the word under
+            // them and three take the line, from the same functions every
+            // other text box uses.
+            let at = self.caret_at(fonts, index, x, y);
+            let count = self.presses.press(x, y);
+            if count > 1 {
+                self.prompt.press_again(at, count);
+            } else {
+                self.prompt.press(at);
+            }
+            self.dragging = true;
+            return StartOutcome::Changed;
+        }
         StartOutcome::Nothing
+    }
+
+    /// What the compositor's edit menu would offer over the prompt.
+    pub fn offer(&self) -> crate::editmenu::Offer {
+        crate::editmenu::Offer { selection: self.prompt.selected().is_some(), editable: true }
+    }
+
+    /// Carry the far end of the prompt's selection to here.
+    pub fn drag(&mut self, fonts: &Fonts, x: i32, y: i32) -> bool {
+        if !self.dragging {
+            return false;
+        }
+        let Some(doc) = &self.doc else { return false };
+        let Some(index) = doc.index_of("#start-prompt") else { return false };
+        let at = self.caret_at(fonts, index, x, y);
+        self.prompt.drag(at)
+    }
+
+    /// The press came up. A run that never moved is no run at all, the same
+    /// rule every other text box follows.
+    pub fn end_drag(&mut self) {
+        self.dragging = false;
+        if self.prompt.anchor == Some(self.prompt.caret) {
+            self.prompt.anchor = None;
+        }
+    }
+
+    pub fn dragging(&self) -> bool {
+        self.dragging
+    }
+
+    /// Which character of the prompt a point lands on.
+    fn caret_at(&self, fonts: &Fonts, index: usize, x: i32, y: i32) -> usize {
+        let Some(doc) = &self.doc else { return 0 };
+        ui::caret_at_point(
+            fonts,
+            &self.prompt.value,
+            &ui::style_at(&doc.tree, index),
+            doc.tree.node(index).tag,
+            self.layout.rect_of(index),
+            self.prompt.caret,
+            (x, y),
+        )
     }
 
     /// The prompt becomes a workspace: with the text if there is any, empty
     /// if there is not.
     fn submit(&mut self) -> StartOutcome {
-        let prompt = self.prompt.trim().to_owned();
+        let prompt = self.prompt.value.trim().to_owned();
         StartOutcome::CreateDesk(if prompt.is_empty() { None } else { Some(prompt) })
     }
 
-    pub fn key(&mut self, key: Key) -> StartOutcome {
+    pub fn key(&mut self, key: Key, clipboard: &mut Clipboard) -> StartOutcome {
+        // Enter and Escape are the panel's; everything else about the words
+        // is the text box's, which is the same text box an application's
+        // field is.
         match key {
-            Key::Char(c) => self.prompt.push(c),
-            Key::Backspace => {
-                self.prompt.pop();
-            }
-            Key::Enter => return self.submit(),
+            Key::Enter | Key::ShiftEnter => return self.submit(),
             Key::Escape => return StartOutcome::Close,
-            _ => return StartOutcome::Nothing,
+            _ => {}
         }
-        StartOutcome::Changed
+        match self.prompt.key(key, clipboard, false) {
+            Edit::Ignored => StartOutcome::Nothing,
+            Edit::Moved | Edit::Changed => StartOutcome::Changed,
+        }
     }
 
     /// The wheel over the application grid.
@@ -271,7 +342,8 @@ impl StartMenu {
         let Some(doc) = &self.doc else { return };
         let focus = Focus {
             node: doc.index_of("#start-prompt"),
-            caret: self.prompt.chars().count(),
+            caret: self.prompt.caret,
+            anchor: self.prompt.anchor,
             caret_visible: caret_lit,
             ..Focus::default()
         };

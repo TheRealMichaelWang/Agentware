@@ -16,6 +16,7 @@ mod clipboard;
 mod client;
 mod cursor;
 mod document;
+mod editmenu;
 mod drm;
 mod icons;
 mod images;
@@ -23,6 +24,7 @@ mod input;
 mod paint;
 mod screen;
 mod startmenu;
+mod text;
 mod ui;
 
 use std::collections::VecDeque;

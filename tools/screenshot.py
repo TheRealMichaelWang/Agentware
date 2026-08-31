@@ -126,12 +126,23 @@ def qmp_tablet(path, fx, fy, click=""):
         # "click" is a press and a release; "down" and "up" are the halves of
         # it, which is the only way to drive a drag: the tablet is the one
         # pointer with an absolute position, and a gesture that presses here
-        # and lets go there cannot be expressed as a click.
-        for down in {"click": (True, False), "down": (True,), "up": (False,)}.get(click, ()):
-            time.sleep(0.2)
+        # and lets go there cannot be expressed as a click. "right" is the
+        # other button, which is how a context menu is opened.
+        button = "right" if click == "right" else "left"
+        halves = {"click": (True, False), "right": (True, False),
+                  "double": (True, False, True, False),
+                  "triple": (True, False, True, False, True, False),
+                  "down": (True,), "up": (False,)}.get(click, ())
+        # A double click is two presses close enough together in time that
+        # the guest counts them as one gesture, so the gaps here are the
+        # gesture: two separate "click" commands are hundreds of
+        # milliseconds apart and are two single clicks, correctly.
+        gap = 0.04 if click in ("double", "triple") else 0.2
+        for down in halves:
+            time.sleep(gap)
             execute("input-send-event", {"events": [
-                {"type": "btn", "data": {"down": down, "button": "left"}}]})
-            time.sleep(0.1)
+                {"type": "btn", "data": {"down": down, "button": button}}]})
+            time.sleep(0.05 if click in ("double", "triple") else 0.1)
 
 
 def read_ppm(path):
@@ -234,9 +245,11 @@ def main():
         # Injected input goes through the same monitor connection, so it is
         # ordered against the capture rather than racing it. Commands starting
         # with "abs" drive the tablet instead: "abs 0.5 0.9" points at a screen
-        # fraction, "abs 0.5 0.9 click" also clicks there, and "down" and "up"
-        # in place of "click" are the halves of one, which is how a drag is
-        # driven: press at one place, move, let go at another.
+        # fraction, "abs 0.5 0.9 click" also clicks there, "down" and "up" in
+        # place of "click" are the halves of one, which is how a drag is
+        # driven (press at one place, move, let go at another), and "right"
+        # is the other button, and "double" and "triple" are two and three
+        # presses close enough together to count as one gesture.
         for command in args.do:
             # "sleep N" waits between injected inputs, for gestures that need
             # the guest to catch up: an agent turn, an app being forked.

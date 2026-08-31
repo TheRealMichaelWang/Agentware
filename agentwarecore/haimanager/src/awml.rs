@@ -523,6 +523,26 @@ impl<'a> Parser<'a> {
         if self.nodes[Tree::ROOT].tag != Tag::Window {
             return self.fail("the root element must be <window>");
         }
+
+        // A menu is the window's menu bar, and a menu bar goes across the top
+        // of the window. That is not an application's decision, any more than
+        // where its window goes is, so there is nowhere else to put one: the
+        // compositor gathers a window's menus into the bar and lays the rest
+        // of the content out under it. Refused rather than quietly hoisted,
+        // because a document that says something the vocabulary does not mean
+        // should be told so, and because the first thing anyone did with a
+        // menu that could go anywhere was put one in a strip of tabs, where
+        // it read as a tab that was not one.
+        if self
+            .nodes
+            .iter()
+            .any(|node| node.tag == Tag::Menu && node.parent != Some(Tree::ROOT))
+        {
+            return self.fail(
+                "a <menu> must be a child of <window>: a window's menus are its menu bar,                  and the compositor decides where that goes",
+            );
+        }
+
         Ok(Tree { nodes: self.nodes })
     }
 
@@ -965,6 +985,42 @@ mod tests {
         let view = agent_view(&open, "awsheet", 1);
         let item = view.lines().find(|line| line.contains("id=\"menu-clear\"")).unwrap();
         assert!(item.contains("actions=\"focus click\""), "an open item offered nothing: {item}");
+    }
+
+    /// A menu is the window's menu bar, so it is a child of the window and
+    /// there is nowhere else to put one.
+    ///
+    /// Refused rather than quietly moved: an application that puts a menu in
+    /// a strip of tabs is saying something the vocabulary does not mean, and
+    /// what came out looked like a tab that was not one. The first thing
+    /// anyone did with a menu that could go anywhere was exactly that.
+    #[test]
+    fn a_menu_belongs_to_the_window_and_nowhere_else() {
+        let stray = parse(
+            r#"<window title="Sheet">
+                 <tabs>
+                   <tab id="tab-0" label="Sheet 1" description="Shows sheet 1"/>
+                   <menu id="edit" label="Edit" description="Commands">
+                     <menuitem id="menu-clear" label="Clear" description="Empties it"/>
+                   </menu>
+                 </tabs>
+               </window>"#,
+        );
+        let Err(err) = stray else { panic!("a menu in a tab strip was accepted") };
+        assert!(err.message.contains("<menu>"), "{}", err.message);
+
+        // The same menu, where a menu goes.
+        parse(
+            r#"<window title="Sheet">
+                 <menu id="edit" label="Edit" description="Commands">
+                   <menuitem id="menu-clear" label="Clear" description="Empties it"/>
+                 </menu>
+                 <tabs>
+                   <tab id="tab-0" label="Sheet 1" description="Shows sheet 1"/>
+                 </tabs>
+               </window>"#,
+        )
+        .expect("a menu on the window was refused");
     }
 
     /// A cell the application scrolled past is not in the tree at all, so an

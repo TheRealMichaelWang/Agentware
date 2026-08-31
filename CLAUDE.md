@@ -683,7 +683,18 @@ the cursor when the compositor is the one moving it.
 
 **A grid is more than cells.** `menu` and `menuitem` are a dropdown by
 another name and share its machinery: items float while open, fold to
-nothing when closed, painted last and hit first. `tabs` and `tab` are a
+nothing when closed, painted last and hit first. **A `menu` is a child of
+`window` and of nothing else**, and a window's menus are its menu bar: the
+compositor lays them across the top of the window under the title bar it
+draws, paints the band, and stacks the content below. Where a menu bar goes
+is not a thing an application gets an opinion about, any more than where its
+window goes is, so a menu anywhere else is a parse error and the document is
+refused whole. That rule was not there at first and it cost the only thing
+that mattered: the strip could hold anything, `awsheet` put its Edit menu in
+its row of sheet tabs, and what came out was a word sitting among things you
+choose that opened instead of choosing. Nothing in the markup was wrong; the
+markup allowed a sentence with no meaning, which is exactly what a closed
+vocabulary is supposed to prevent. `tabs` and `tab` are a
 strip of things you choose, holding no panels, because which content belongs
 to a tab is the application's business. **The navigation bar is built from `tabs` and `tab`**, which is the only
 reason an application's tab strip looks like it: there is one implementation
@@ -780,6 +791,60 @@ a kind and its content, text today and base64 images the shape it is
 already written for, so a reader that only understands words can say so
 rather than print base64. An agent may read it (`query clipboard`) and has
 no way to write one: something it wants said, it says with `type-text`.
+
+**There is one text box on the machine** (`haimanager/src/text.rs`), and an
+application's `field`, an `editor`, a `cell` being typed into, the start
+menu's prompt and the navigation bar's rename field are all it. It was not
+true before: the two chrome boxes had `push` and `pop`, so neither could be
+selected in, copied out of, pasted into, or have its caret moved by an arrow
+key, and nobody would have designed that. It happened because each of the
+three was written where it was needed and a text box is small enough that
+writing it again never feels like the mistake it is. What each caller keeps
+is only what Enter means, which is the one thing that genuinely differs: a
+field submits, an editor breaks the line, the prompt makes a workspace, the
+rename field commits a name. A press puts the caret down and anchors a run,
+a second press in the same place takes the word and a third takes the line,
+shift with an arrow drags a run out from the keyboard whether or not anything
+is selected yet, Home and End go to the ends, Delete eats forward, and the
+four chords do what they do. In one place, for all of them.
+
+The one that is not shared is a cell that is merely chosen. A cell being
+typed into is a text box; a cell that is not has no caret and no selection,
+and any key that started a box for it took the arrow keys away from the
+spreadsheet, which is what `Ctrl+C` over a grid did. Copy there means the
+chosen *cells*, and that is the application's answer to give. **Shift with an
+arrow there means one cell further**, and ends in the same `select-range` a
+drag across the grid sends, with the far corner remembered between
+keystrokes; a plain arrow is how it stops being a run. Over static text the
+same chord reaches further along the words, out from wherever the press
+landed.
+
+**Words on a page are selectable too, and that was the half that was
+missing.** `Layout::hit` only ever answers with controls, because that is
+what a press acts on, so a press on a `text` element landed on nothing: a
+field could always be selected in and an agent's answer, which is the thing
+in this system most worth copying, could not. A run over static text is a
+separate piece of ephemeral state (`Client::text_run`), because static text
+is not a control: it has no value the application tracks, no caret, and
+nothing that can be typed into it, and the compositor knows about it for one
+reason, which is copying. `Layout::text_at` finds the words, `text_offset_at`
+turns a point into a character using the same broken lines the paint uses,
+and Ctrl+C is the whole of what a run answers to. A run stops at one element,
+so a reply is selectable and a reply plus the label above it is not.
+
+**Cut, copy and paste are on the other button, and that menu is the
+compositor's.** It has to be: what is selected and what is on the clipboard
+were never told to anyone. So the other button over a `field`, an `editor` or
+any `text` opens the compositor's own Cut / Copy / Paste
+(`haimanager/src/editmenu.rs`) and the application hears nothing, while over
+a `cell` the press stays the application's, because copying over a grid means
+*cells* and which cells are chosen is the application's state. A cell being
+typed into is a field like any other and the compositor takes it back. The
+menu is AWML through the same parser, layout and painter as everything else,
+one open unlabelled `menu` hung from the press by the same `context_at` an
+application's context menu uses, and what a press on it does is fed back
+through `Client::handle` as the chord it stands for, so the menu is a second
+way to say Ctrl+C and not a second implementation of it.
 
 The bug worth remembering: the anchor is set on every press, because a
 press is where a drag would start, and nothing cleared it when the button

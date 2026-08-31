@@ -52,6 +52,9 @@ const KEY_UP: u16 = 103;
 const KEY_LEFT: u16 = 105;
 const KEY_RIGHT: u16 = 106;
 const KEY_DOWN: u16 = 108;
+const KEY_HOME: u16 = 102;
+const KEY_END: u16 = 107;
+const KEY_DELETE: u16 = 111;
 const KEY_A: u16 = 30;
 const KEY_X: u16 = 45;
 const KEY_C: u16 = 46;
@@ -77,14 +80,21 @@ pub fn decode(code: u16, shift: bool, caps: bool, ctrl: bool) -> Key {
     match code {
         KEY_ESC => return Key::Escape,
         KEY_BACKSPACE => return Key::Backspace,
+        KEY_DELETE => return Key::Delete,
         KEY_TAB => return Key::Tab,
         KEY_ENTER | KEY_KPENTER => {
             return if shift { Key::ShiftEnter } else { Key::Enter };
         }
-        KEY_UP => return Key::Up,
-        KEY_DOWN => return Key::Down,
-        KEY_LEFT => return Key::Left,
-        KEY_RIGHT => return Key::Right,
+        // Held shift turns a movement into a selection, which is the
+        // keyboard's way of dragging one out. Named here rather than passed
+        // on as a modifier, for the reason the clipboard chords are: what is
+        // held down is this module's business and nobody else's.
+        KEY_UP => return if shift { Key::ShiftUp } else { Key::Up },
+        KEY_DOWN => return if shift { Key::ShiftDown } else { Key::Down },
+        KEY_LEFT => return if shift { Key::ShiftLeft } else { Key::Left },
+        KEY_RIGHT => return if shift { Key::ShiftRight } else { Key::Right },
+        KEY_HOME => return if shift { Key::ShiftHome } else { Key::Home },
+        KEY_END => return if shift { Key::ShiftEnd } else { Key::End },
         _ => {}
     }
 
