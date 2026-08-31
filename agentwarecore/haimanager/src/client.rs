@@ -51,12 +51,13 @@ use crate::awml::{self, Tag};
 use crate::clipboard::Clipboard;
 use crate::document::Document;
 use crate::editmenu;
+use crate::sheet::{self, Sheets};
 use crate::text::{self, Edit, Editing, MultiPress};
 use crate::images::Images;
 use crate::input::{Button, Event, Key};
 use crate::paint::font::Fonts;
 use crate::paint::{Canvas, Rect};
-use crate::ui::{self, Focus, Frame, Layout};
+use crate::ui::{self, Focus, Frame, Grid, Layout};
 
 /// How much unsent event traffic a client may accumulate before it is treated as
 /// gone.
@@ -67,7 +68,7 @@ use crate::ui::{self, Focus, Frame, Layout};
 /// memory in the one process that owns the screen.
 const MAX_BACKLOG: usize = 256 * 1024;
 
-/// How many rows one notch of the wheel moves a table.
+/// How many rows one notch of the wheel moves a grid.
 const WHEEL_ROWS: i32 = 3;
 
 /// How long a scrollbar stays on screen after its content last moved.
@@ -158,15 +159,17 @@ pub struct Client {
     text_run: Option<(String, usize, usize)>,
     /// Whether that run is being dragged out right now.
     running: bool,
-    /// A column edge being dragged: which column, where the pointer took
-    /// hold, and how wide it was when it did.
-    column_drag: Option<(String, i32, i32)>,
-    /// A run of cells being dragged out: the corner it started from, by key
-    /// and by id, and the cell the run currently reaches. The id is kept
-    /// because it is what the application is told; the key because it is what
-    /// survives a re-render.
-    cell_drag: Option<(String, String)>,
-    cell_extent: Option<String>,
+    /// A column edge being dragged: which spreadsheet and column, where the
+    /// pointer took hold, and how wide the column was when it did.
+    column_drag: Option<(String, u32, i32, i32)>,
+    /// The sheets behind this client's spreadsheets, by the name each element
+    /// points at. Not in any tree: they arrive as their own frames and the
+    /// compositor paints from them. See [`crate::sheet`].
+    sheets: Sheets,
+    /// A run of cells being dragged out: which spreadsheet, the corner it
+    /// started from, and the cell the run currently reaches.
+    cell_drag: Option<(String, sheet::Ref)>,
+    cell_extent: Option<sheet::Ref>,
     /// A tab being carried to another position: its key, and the slot it was
     /// last told to take. The slot is remembered so that crossing the same
     /// midpoint twice in one burst does not tell the application twice.
@@ -248,6 +251,7 @@ impl Client {
             text_run: None,
             running: false,
             column_drag: None,
+            sheets: Sheets::default(),
             cell_drag: None,
             cell_extent: None,
             tab_drag: None,
@@ -285,7 +289,7 @@ impl Client {
     pub fn agent_view(&self) -> Option<String> {
         self.doc
             .as_ref()
-            .map(|doc| awml::agent_view(&doc.tree, &self.name, self.desk))
+            .map(|doc| awml::agent_view(&doc.tree, &self.sheets, &self.name, self.desk))
     }
 
     /// Drain whatever arrived and apply it.
@@ -338,6 +342,32 @@ impl Client {
                         // count as having arrived.
                         progress.first |= !had_doc && self.doc.is_some();
                         progress.log.push(line);
+                    } else if let Some((source, version, base, at, values)) =
+                        display::parse_sheet(&fields)
+                    {
+                        // Cells, on their own frames. Nothing is compared with
+                        // anything: the application says what to put where and
+                        // the compositor writes it. A run that names a version
+                        // nobody holds is refused rather than half-applied, and
+                        // the answer is to ask for the sheet from the top.
+                        let Some(at) = sheet::parse(at) else {
+                            progress.log.push(format!(
+                                "{}: sheet {source}: {at:?} is not a cell",
+                                self.label()
+                            ));
+                            continue;
+                        };
+                        let source = source.to_owned();
+                        if self.sheets.apply(&source, base, version, at, values) {
+                            progress.dirty = true;
+                        } else {
+                            let have = self.sheets.version(&source).to_string();
+                            progress.log.push(format!(
+                                "{}: sheet {source}: v{base} does not follow v{have}, asking again",
+                                self.label()
+                            ));
+                            self.send(&[display::MSG_SHEET_RESEND, &source, &have]);
+                        }
                     } else if self.kind == Kind::Agent {
                         progress.requests.push(fields);
                     } else {
@@ -461,7 +491,16 @@ impl Client {
         }
 
         self.scroll.retain(|key, _| next.has_key(key));
-        self.editing.retain(|key, _| next.has_key(key));
+        // A cell being typed into is keyed by its element and its name, not by
+        // a node, because it is not one. What has to still exist is the
+        // element; the cell is a coordinate inside it and cannot go away on
+        // its own. Pruning these as if they were node keys threw the edit away
+        // on every re-render, which the application does after every
+        // keystroke: typing `42` into a cell left `2` in it.
+        self.editing.retain(|key, _| match key.split_once('!') {
+            Some((element, _)) => next.has_key(element),
+            None => next.has_key(key),
+        });
         // A run of words whose element the application stopped sending is a
         // run over nothing.
         if let Some((key, ..)) = &self.text_run
@@ -556,7 +595,15 @@ impl Client {
     /// consecutively.
     pub fn draw_region(&self, canvas: &mut Canvas, fonts: &Fonts, images: &Images, name: &str) {
         let (Some(doc), Some(index)) = (&self.doc, self.region(name)) else { return };
-        ui::paint_subtree(canvas, fonts, images, &doc.tree, &self.layout, index, &self.focus_state());
+        ui::paint_subtree(
+            canvas,
+            fonts,
+            &ui::Content { images, sheets: &self.sheets },
+            &doc.tree,
+            &self.layout,
+            index,
+            &self.focus_state(),
+        );
     }
 
     /// Where the compositor believes focus and the caret are, in this tree.
@@ -586,12 +633,38 @@ impl Client {
             None => (None, 0),
         };
         let anchor = self.focus.as_ref().and_then(|key| self.editing.get(key)?.anchor);
+        // A cell being typed into: the element holds focus, the tree says
+        // which cell the cursor is on, and the compositor's copy of what is
+        // in it is what gets painted.
+        let cell = self.focus.as_ref().and_then(|key| {
+            let index = doc.index_of(key)?;
+            if doc.tree.node(index).tag != Tag::Spreadsheet {
+                return None;
+            }
+            let at = doc.tree.node(index).attr("cursor").and_then(sheet::parse)?;
+            let state = self.editing.get(&cell_key(key, at))?;
+            Some((at, state.value.clone()))
+        });
+        let caret = cell
+            .as_ref()
+            .and_then(|(at, _)| {
+                let key = self.focus.as_deref()?;
+                Some(self.editing.get(&cell_key(key, *at))?.caret)
+            })
+            .unwrap_or(caret);
         let run = self.text_run.as_ref().and_then(|(key, ..)| {
             let index = doc.index_of(key)?;
             let (from, to) = self.run_of(key)?;
             Some((index, from, to))
         });
-        Focus { node, caret, anchor, pressed, caret_visible: self.caret_on, scrollbar, run }
+        let anchor = cell
+            .as_ref()
+            .and_then(|(at, _)| {
+                let key = self.focus.as_deref()?;
+                self.editing.get(&cell_key(key, *at))?.anchor
+            })
+            .or(anchor);
+        Focus { node, caret, anchor, pressed, caret_visible: self.caret_on, scrollbar, run, cell }
     }
 
     /// Whether keystrokes to this client would land in a text control, which is
@@ -631,11 +704,11 @@ impl Client {
         let Some(doc) = &self.doc else { return false };
         // Only a visible bar is grabbable. An invisible one that still caught
         // clicks would make the content's right edge mysteriously dead. A
-        // table's bars are always visible, so they are always grabbable.
+        // grid's bars never fade, so they are always grabbable.
         let lit = self.focus_state().scrollbar;
 
         for scroller in self.layout.scrollers.iter().rev() {
-            if !scroller.asks && !scroller.horizontal && lit != Some(scroller.node) {
+            if !scroller.permanent && !scroller.horizontal && lit != Some(scroller.node) {
                 continue;
             }
             let rect = self.layout.rect_of(scroller.node);
@@ -692,24 +765,12 @@ impl Client {
         let furthest = scroller.furthest();
         let offset = ((along - grab - start) * furthest / travel).clamp(0, furthest);
 
-        // A table's bar is drawn against the whole sheet, so dragging it is a
-        // question rather than a move: what comes back is a tree holding a
-        // different window.
-        if scroller.asks {
-            let step = scroller.step.max(1);
-            let row = offset / step;
-            if row == scroller.offset / step {
-                return false;
-            }
-            let id = doc.tree.node(node).id().unwrap_or_default().to_owned();
-            if id.is_empty() {
-                return false;
-            }
-            self.note = format!("asked {id} for row {row}");
-            self.emit(&id, display::ACTION_SCROLL, &row.to_string());
-            return true;
-        }
-
+        // Every bar moves an offset now, a grid's included. It used to be the
+        // one exception: it was drawn against a sheet the compositor did not
+        // hold, so dragging it asked the application for a different window.
+        // The compositor holds the sheet, so there is nothing to ask, and the
+        // flag that marked the exception now marks the only thing still true
+        // of it, which is that its bar does not fade.
         if offset != scroller.offset {
             if scroller.horizontal {
                 self.scroll_x.insert(key.clone(), offset);
@@ -728,7 +789,14 @@ impl Client {
 
     pub fn draw(&self, canvas: &mut Canvas, fonts: &Fonts, images: &Images) {
         let Some(doc) = &self.doc else { return };
-        ui::paint(canvas, fonts, images, &doc.tree, &self.layout, &self.focus_state());
+        ui::paint(
+            canvas,
+            fonts,
+            &ui::Content { images, sheets: &self.sheets },
+            &doc.tree,
+            &self.layout,
+            &self.focus_state(),
+        );
     }
 
     /// A one-line description of the focused node as an agent would see it.
@@ -798,20 +866,10 @@ impl Client {
             // "paste as values". Once a cell is being typed into it is a
             // field like any other, and then the words in it are the
             // compositor's to offer.
-            if node.tag == Tag::Cell
-                && !(self.focus.as_deref() == Some(key.as_str())
-                    && self.editing.contains_key(&key))
-            {
-                return None;
-            }
-            let editable = node.tag != Tag::Cell || node.flag("editable");
+            let editable = true;
             if self.focus.as_deref() != Some(key.as_str()) {
                 let caret = self.caret_at(fonts, index, x, y);
-                let value = match node.attr("value") {
-                    Some(value) => value.to_owned(),
-                    None if node.tag == Tag::Cell => node.text.clone(),
-                    None => String::new(),
-                };
+                let value = node.attr("value").unwrap_or_default().to_owned();
                 self.focus = Some(key.clone());
                 self.text_run = None;
                 let state = self.editing.entry(key.clone()).or_insert(Editing {
@@ -890,35 +948,42 @@ impl Client {
         true
     }
 
+    /// The grid an element's key names.
+    fn grid_of(&self, key: &str) -> Option<&Grid> {
+        let doc = self.doc.as_ref()?;
+        let index = doc.index_of(key)?;
+        self.layout.grids.iter().find(|grid| grid.node == index)
+    }
+
+    /// The id an application knows a spreadsheet by, from its key.
+    fn grid_id(&self, key: &str) -> String {
+        self.doc
+            .as_ref()
+            .and_then(|doc| doc.index_of(key))
+            .and_then(|index| self.doc.as_ref()?.tree.node(index).id())
+            .unwrap_or_default()
+            .to_owned()
+    }
+
     /// Carry a run of cells out under the pointer.
     ///
     /// One event per cell the run reaches, in the same spirit as one event
     /// per keystroke: what the application hears is what the hand did, as it
     /// does it, and the highlight it paints in answer is its own.
     pub fn drag_cells(&mut self, x: i32, y: i32) -> bool {
-        let Some((anchor_key, anchor_id)) = self.cell_drag.clone() else { return false };
-        let Some(doc) = &self.doc else { return false };
-        let Some(index) = self.layout.hit(&doc.tree, x, y) else { return false };
-        if doc.tree.node(index).tag != Tag::Cell {
-            return false;
-        }
+        let Some((key, anchor)) = self.cell_drag.clone() else { return false };
         // Both corners must be in the same grid: a run that started in one
-        // table and ended in another is not a run of anything.
-        let same = doc
-            .index_of(&anchor_key)
-            .and_then(|anchor| Some((doc.tree.table_of(anchor)?, doc.tree.table_of(index)?)))
-            .is_some_and(|(from, to)| from == to);
-        if !same {
+        // sheet and ended in another is not a run of anything.
+        let Some(grid) = self.grid_of(&key) else { return false };
+        let Some(reached) = grid.cell_at(x, y) else { return false };
+        if self.cell_extent == Some(reached) {
             return false;
         }
-
-        let reached = doc.tree.node(index).id().unwrap_or_default().to_owned();
-        if reached.is_empty() || self.cell_extent.as_deref() == Some(reached.as_str()) {
-            return false;
-        }
-        self.cell_extent = Some(reached.clone());
-        self.note = format!("{anchor_id} through {reached}");
-        self.emit(&anchor_id, display::ACTION_SELECT_RANGE, &reached);
+        self.cell_extent = Some(reached);
+        let id = self.grid_id(&key);
+        let (from, to) = (sheet::name(anchor), sheet::name(reached));
+        self.note = format!("{from} through {to}");
+        self.emit_cell(&id, display::ACTION_SELECT_RANGE, &to, &from);
         true
     }
 
@@ -1071,11 +1136,7 @@ impl Client {
     fn caret_at(&self, fonts: &Fonts, index: usize, x: i32, y: i32) -> usize {
         let Some(doc) = &self.doc else { return 0 };
         let node = doc.tree.node(index);
-        let value = match node.attr("value") {
-            Some(value) => value.to_owned(),
-            None if node.tag == Tag::Cell => node.text.clone(),
-            None => String::new(),
-        };
+        let value = node.attr("value").unwrap_or_default().to_owned();
         let style = ui::style_at(&doc.tree, index);
         let key = doc.key(index);
         let current = self.editing.get(key).map_or(0, |state| state.caret);
@@ -1090,18 +1151,26 @@ impl Client {
         )
     }
 
-    /// Take hold of a column's trailing edge, if the point is on one.
+    /// Take hold of a column's trailing edge in a header, if the point is on
+    /// one.
     fn grab_column(&mut self, x: i32, y: i32) -> bool {
         let Some(doc) = &self.doc else { return false };
-        for table in (0..doc.tree.nodes.len()).filter(|&i| doc.tree.node(i).tag == Tag::Table) {
-            for column in doc.tree.columns(table) {
-                let rect = self.layout.rect_of(column);
-                if rect.w == 0 || !self.layout.is_visible(column) {
-                    continue;
-                }
-                let edge = Rect::new(rect.x + rect.w - ui::column_grip(), rect.y, ui::column_grip() * 2, rect.h);
-                if edge.contains(x, y) {
-                    self.column_drag = Some((doc.key(column).to_owned(), x, rect.w));
+        let grip = ui::column_grip();
+        for grid in &self.layout.grids {
+            if !grid.header.contains(x, y) {
+                continue;
+            }
+            let (first, last) = (grid.visible().0.0, grid.visible().1.0);
+            for column in first..=last {
+                let edge = grid.body.x + grid.column_x(column) + grid.column_w(column)
+                    - grid.offset.0;
+                if (x - edge).abs() <= grip {
+                    self.column_drag = Some((
+                        doc.key(grid.node).to_owned(),
+                        column,
+                        x,
+                        grid.column_w(column),
+                    ));
                     return true;
                 }
             }
@@ -1111,12 +1180,16 @@ impl Client {
 
     /// Carry a column's edge with the pointer.
     pub fn drag_column(&mut self, fonts: &Fonts, x: i32) -> bool {
-        let Some((key, from, width)) = self.column_drag.clone() else { return false };
-        let next = (width + (x - from)).max(ui::sc(24));
-        if self.columns.get(&key) == Some(&next) {
+        let Some((key, column, from, width)) = self.column_drag.clone() else { return false };
+        let Some(doc) = &self.doc else { return false };
+        let Some(index) = doc.index_of(&key) else { return false };
+        let floor = ui::column_floor(fonts, &doc.tree, index);
+        let next = (width + (x - from)).max(floor);
+        let at = format!("{key}#{column}");
+        if self.columns.get(&at) == Some(&next) {
             return false;
         }
-        self.columns.insert(key, next);
+        self.columns.insert(at, next);
         self.relayout(fonts);
         true
     }
@@ -1191,12 +1264,7 @@ impl Client {
         let tag = node.tag;
         let id = node.id().unwrap_or_default().to_owned();
         let key = doc.key(index).to_owned();
-        let editable = node.flag("editable");
-        let value = match node.attr("value") {
-            Some(value) => value.to_owned(),
-            None if tag == Tag::Cell => node.text.clone(),
-            None => String::new(),
-        };
+        let value = node.attr("value").unwrap_or_default().to_owned();
 
         if node.disabled() {
             // Not reported to the application at all. A disabled control has no
@@ -1207,7 +1275,6 @@ impl Client {
         }
 
         let rect = self.layout.rect_of(index);
-        let already = self.focus.as_deref() == Some(key.as_str());
         self.focus = Some(key.clone());
         // A press with the ordinary button ends whatever the other one had
         // standing, so a menu bar's items hang from the menu and not from
@@ -1216,24 +1283,43 @@ impl Client {
 
         // A click on a text control places the caret and reports nothing: where
         // the caret is inside a value is not the application's business.
-        if tag.is_text() {
-            // A cell is chosen before it is edited. The first press selects
-            // it, which is the event a person pressing it produces; a second,
-            // once it already carries the ring, puts the caret in. That is
-            // what a double click means elsewhere, spread over two presses,
-            // because there is no double click in the event vocabulary and
-            // adding one would be a second way to produce an event.
-            if tag == Tag::Cell && !(already && editable) {
-                // The press is also where a run of cells would start. Whether
-                // it becomes one is decided by whether the pointer moves,
-                // exactly as it is for a run of text.
-                let id = doc.tree.node(index).id().unwrap_or_default().to_owned();
-                self.cell_drag = Some((key.clone(), id));
+        // A press on a grid: which cell it landed on is arithmetic, and what
+        // it means is choosing that cell. It is also where a run of cells
+        // would start; whether it becomes one is decided by whether the
+        // pointer moves, exactly as it is for a run of text.
+        if tag == Tag::Spreadsheet {
+            let at = self.grid_of(&key).and_then(|grid| grid.cell_at(x, y));
+            if let Some(at) = at {
+                let source = self.grid_of(&key).map(|grid| grid.source.clone()).unwrap_or_default();
+                let editing = cell_key(&key, at);
+                let name = sheet::name(at);
+
+                // A second press in the same place opens the cell for
+                // editing, which is what a double click means everywhere
+                // else. It starts from what is in the cell rather than from
+                // nothing: the first press already chose it, so this one is
+                // the human saying they want to change what is there rather
+                // than replace it.
+                if self.presses.press(x, y) > 1 {
+                    let value = self.published(&source, at);
+                    self.editing.insert(editing, Editing::new(value));
+                    self.note = format!("editing {name} in {id}");
+                    return true;
+                }
+
+                self.cell_drag = Some((key.clone(), at));
                 self.cell_extent = None;
-                let _ = self.act(fonts, index, "select", "");
+                self.editing.remove(&editing);
+                self.note = format!("{name} chosen in {id}");
+                self.emit_cell(&id, display::ACTION_SELECT, "", &name);
+                self.press = Some((key, Instant::now()));
                 return true;
             }
+            self.note = format!("{id}: nothing under {x},{y}");
+            return true;
+        }
 
+        if tag.is_text() {
             let caret = self.caret_at(fonts, index, x, y);
             let count = self.presses.press(x, y);
             let state = self.editing.entry(key.clone()).or_insert(Editing::new(value));
@@ -1284,9 +1370,9 @@ impl Client {
             Tag::Tab if node.flag("closable") && x >= rect.x + rect.w - ui::tab_close_w() => {
                 display::ACTION_CLOSE
             }
-            // A header, a row's gutter, a tab: pressing any of them means
-            // choosing it, so the event is the one a person produced.
-            Tag::Option | Tag::Row | Tag::Column | Tag::Tab => "select",
+            // An option or a tab: pressing either means choosing it, so the
+            // event is the one a person produced.
+            Tag::Option | Tag::Tab => "select",
             _ => display::ACTION_CLICK,
         };
         if let Some(slot) = carried {
@@ -1312,6 +1398,20 @@ impl Client {
         index: usize,
         action: &str,
         value: &str,
+    ) -> Result<(), &'static str> {
+        self.act_cell(fonts, index, action, value, "")
+    }
+
+    /// The same, naming a cell of a spreadsheet. Everything an agent does to
+    /// a grid comes through here, because a cell is not a node and cannot be
+    /// the thing an intent names.
+    pub fn act_cell(
+        &mut self,
+        fonts: &Fonts,
+        index: usize,
+        action: &str,
+        value: &str,
+        cell: &str,
     ) -> Result<(), &'static str> {
         let Some(doc) = &self.doc else { return Err(agent::REASON_NO_SUCH_NODE) };
         let node = doc.tree.node(index);
@@ -1377,18 +1477,79 @@ impl Client {
             // other corner's id, which is checked here rather than passed on
             // trust: an application told about a corner that does not exist
             // would be told about a run that is not one.
-            "select-range" => {
-                let Some(other) = self.node_by_id(value) else {
+            "select-range" if tag == Tag::Spreadsheet => {
+                // Both corners are cells of this grid, checked here rather
+                // than passed on trust: an application told about a corner
+                // outside its own sheet has been told about a run that is not
+                // one.
+                let Some(far) = sheet::parse(value) else {
                     return Err(agent::REASON_NO_SUCH_NODE);
                 };
-                let Some(doc) = &self.doc else { return Err(agent::REASON_NO_SUCH_NODE) };
-                if doc.tree.node(other).tag != Tag::Cell {
+                let Some(near) = sheet::parse(cell) else {
+                    return Err(agent::REASON_NO_SUCH_NODE);
+                };
+                let Some(grid) = self.grid_of(&key) else {
                     return Err(agent::REASON_UNSUPPORTED);
+                };
+                if far.0 >= grid.columns
+                    || far.1 >= grid.rows
+                    || near.0 >= grid.columns
+                    || near.1 >= grid.rows
+                {
+                    return Err(agent::REASON_NO_SUCH_NODE);
                 }
-                if doc.tree.table_of(index) != doc.tree.table_of(other) {
+                self.emit_cell(&id, display::ACTION_SELECT_RANGE, value, cell);
+            }
+
+            // Everything else a grid takes. All of it names a cell, because
+            // the cell is where it happens and the element is only the frame
+            // around it; the checks are the same ones a press goes through,
+            // and the events are the same events a press produces.
+            "select" | "type-text" | "clear" | "submit" if tag == Tag::Spreadsheet => {
+                let Some(at) = sheet::parse(cell) else {
+                    return Err(agent::REASON_NO_SUCH_NODE);
+                };
+                let Some(grid) = self.grid_of(&key) else {
                     return Err(agent::REASON_UNSUPPORTED);
+                };
+                if at.0 >= grid.columns || at.1 >= grid.rows {
+                    return Err(agent::REASON_NO_SUCH_NODE);
                 }
-                self.emit(&id, display::ACTION_SELECT_RANGE, value);
+                let source = grid.source.clone();
+                let editing = cell_key(&key, at);
+
+                match action {
+                    "select" => {
+                        self.editing.remove(&editing);
+                        self.emit_cell(&id, display::ACTION_SELECT, "", cell);
+                    }
+                    // The compositor's copy of the cell is kept for the same
+                    // reason a field's is: an agent types a character at a
+                    // time, and each one is the value the cell now has.
+                    "type-text" | "clear" => {
+                        let next =
+                            if action == "clear" { String::new() } else { value.to_owned() };
+                        let state = self
+                            .editing
+                            .entry(editing)
+                            .or_insert_with(|| Editing::new(String::new()));
+                        state.value = next.clone();
+                        state.caret = next.chars().count();
+                        self.relayout(fonts);
+                        self.emit_cell(&id, display::ACTION_TYPE_TEXT, &next, cell);
+                    }
+                    _ => {
+                        // Submit settles the edit: what the application hears
+                        // is the value the cell ended up with, and the
+                        // compositor's copy gives way to what it publishes.
+                        let value = self
+                            .editing
+                            .remove(&editing)
+                            .map(|state| state.value)
+                            .unwrap_or_else(|| self.published(&source, at));
+                        self.emit_cell(&id, display::ACTION_SUBMIT, &value, cell);
+                    }
+                }
             }
 
             // A dropdown's option is always reported when chosen, even the
@@ -1506,6 +1667,12 @@ impl Client {
         (0..doc.tree.nodes.len()).find(|&index| doc.tree.node(index).id() == Some(id))
     }
 
+    /// Where one cell of a spreadsheet is on screen, for the fake cursor.
+    pub fn cell_rect(&self, index: usize, at: sheet::Ref) -> Option<Rect> {
+        let grid = self.layout.grids.iter().find(|grid| grid.node == index)?;
+        Some(grid.cell_rect(at))
+    }
+
     pub fn rect_of(&self, index: usize) -> Rect {
         self.layout.rect_of(index)
     }
@@ -1530,17 +1697,6 @@ impl Client {
     pub fn offers(&self, index: usize, action: &str) -> bool {
         let Some(doc) = &self.doc else { return false };
         awml::actions_of(&doc.tree, index).contains(&action)
-    }
-
-    /// One numeric attribute, for the compositor's own arithmetic about a
-    /// table's window.
-    pub fn number(&self, index: usize, name: &str) -> Option<i32> {
-        self.doc
-            .as_ref()?
-            .tree
-            .node(index)
-            .attr(name)
-            .and_then(|value| value.parse().ok())
     }
 
     /// Whether the application declared that a human must approve this control
@@ -1579,7 +1735,7 @@ impl Client {
         let mut containers: Vec<usize> = Vec::new();
         let mut at = doc.tree.node(index).parent;
         while let Some(node) = at {
-            if matches!(doc.tree.node(node).tag, Tag::Scroll | Tag::Table) {
+            if doc.tree.node(node).tag == Tag::Scroll {
                 containers.push(node);
             }
             at = doc.tree.node(node).parent;
@@ -1590,33 +1746,56 @@ impl Client {
             self.reveal_within(fonts, index, container);
         }
 
-        if self.layout.is_visible(index) {
-            return true;
+        self.layout.is_visible(index)
+    }
+
+    /// Move a grid so that one of its cells is on screen.
+    ///
+    /// The compositor can do this itself now, which it could not when the
+    /// rows on screen were the ones the application chose to describe: it
+    /// holds the sheet, so bringing a cell into view is two offsets and a
+    /// relayout rather than a question and an answer.
+    pub fn reveal_cell(&mut self, fonts: &Fonts, index: usize, at: sheet::Ref) -> bool {
+        let Some(doc) = &self.doc else { return false };
+        let key = doc.key(index).to_owned();
+        let Some(grid) = self.grid_of(&key) else { return false };
+        if at.0 >= grid.columns || at.1 >= grid.rows {
+            return false;
         }
 
-        // Still out of sight, which for a cell means the application placed
-        // it below the body of its own table. Ask for a window that starts
-        // there, so the next attempt finds it on screen.
-        if let Some(doc) = &self.doc
-            && let Some(table) = doc.tree.table_of(index)
-            && let Some((down, _)) = doc.tree.cell_position(index)
-        {
-            let first = doc
-                .tree
-                .node(table)
-                .attr("first-row")
-                .and_then(|value| value.parse::<i32>().ok())
-                .unwrap_or(0);
-            self.ask_for_row(table, first + down as i32);
+        let (content_w, content_h) = grid.content();
+        let (mut across, mut down) = grid.offset;
+        let left = grid.column_x(at.0);
+        let right = left + grid.column_w(at.0);
+        if left < across {
+            across = left;
+        } else if right > across + grid.body.w {
+            across = right - grid.body.w;
         }
-        false
+        let top = at.1 as i32 * grid.row_h;
+        if top < down {
+            down = top;
+        } else if top + grid.row_h > down + grid.body.h {
+            down = top + grid.row_h - grid.body.h;
+        }
+        let across = across.clamp(0, (content_w - grid.body.w).max(0));
+        let down = down.clamp(0, (content_h - grid.body.h).max(0));
+
+        if (across, down) == grid.offset {
+            return true;
+        }
+        self.scroll_x.insert(key.clone(), across);
+        self.scroll.insert(key.clone(), down);
+        self.scroll_shown = Some((key, Instant::now()));
+        self.relayout(fonts);
+        true
     }
 
     /// Move one container so that a node inside it comes into view.
     fn reveal_within(&mut self, fonts: &Fonts, index: usize, container: usize) {
         let Some(doc) = &self.doc else { return };
         let key = doc.key(container).to_owned();
-        let horizontal = doc.tree.node(container).tag == Tag::Table;
+        let horizontal = false;
 
         let rect = self.layout.rect_of(index);
         let view = self.layout.rect_of(container);
@@ -1628,20 +1807,10 @@ impl Client {
         let Some(scroller) = held else { return };
         let (offset, furthest) = (scroller.offset, scroller.furthest());
 
-        // A table is moved across, over the columns it holds; everything else
-        // is moved down, over content laid out in full.
-        let shift = if horizontal {
-            // The gutter is frozen, so the room a cell has to be inside of
-            // starts after it rather than at the table's edge.
-            let left = view.x + ui::gutter_width(fonts, &doc.tree, container);
-            if rect.x < left {
-                rect.x - left
-            } else if rect.x + rect.w > view.x + view.w {
-                rect.x + rect.w - (view.x + view.w)
-            } else {
-                return;
-            }
-        } else if rect.y < view.y {
+        // Everything scrolls down, over content laid out in full. A grid is
+        // the one thing that also moves across, and it does it in
+        // `reveal_cell`, which knows about cells; this one knows about nodes.
+        let shift = if rect.y < view.y {
             rect.y - view.y
         } else if rect.y + rect.h > view.y + view.h {
             rect.y + rect.h - (view.y + view.h)
@@ -1666,27 +1835,41 @@ impl Client {
         self.note = format!("scrolled to reveal {}", self.label());
     }
 
-    /// Ask an application to bring a row of a table into its window.
-    /// Ask an application to bring a row of a table into its window.
+    /// A rectangle of one of this client's sheets, as rows of values.
     ///
-    /// The compositor cannot scroll a table itself: the rows on screen are
-    /// the ones the application chose to describe, and no offset here can
-    /// conjure the ones it did not send. So an agent that wants row five
-    /// hundred asks for it, and the application answers with a tree. This is
-    /// the same promise kept at a larger scale: the agent
-    /// says what should be true and never how to bring it about.
-    pub fn ask_for_row(&mut self, index: usize, row: i32) -> bool {
-        let Some(doc) = &self.doc else { return false };
-        if doc.tree.node(index).tag != Tag::Table {
-            return false;
+    /// Tab-separated, one line per row, and nothing else: no elements, no
+    /// descriptions, no action lists. All three of those are the same for
+    /// every cell in a sheet, so they are said once on the element and this
+    /// carries what is actually in there.
+    ///
+    /// A range that runs past the sheet is cut to it rather than refused: an
+    /// agent asking for A1:Z100 of a small sheet is asking to see the sheet.
+    pub fn cells(&self, id: &str, range: &str) -> String {
+        let Some(doc) = &self.doc else { return String::new() };
+        let Some(index) = self.node_by_id(id) else { return String::new() };
+        if doc.tree.node(index).tag != Tag::Spreadsheet {
+            return String::new();
         }
-        let id = doc.tree.node(index).id().unwrap_or_default().to_owned();
-        if id.is_empty() {
-            return false;
+        let source = doc.tree.node(index).attr("source").unwrap_or_default();
+        let Some(sheet) = self.sheets.get(source) else { return String::new() };
+        let Some(((x0, y0), (x1, y1))) = sheet::parse_range(range) else {
+            return String::new();
+        };
+        let grid = self.layout.grids.iter().find(|grid| grid.node == index);
+        let (columns, rows) = grid.map_or((x1 + 1, y1 + 1), |grid| (grid.columns, grid.rows));
+        let (x1, y1) = (x1.min(columns.saturating_sub(1)), y1.min(rows.saturating_sub(1)));
+
+        let mut out = String::new();
+        for row in y0..=y1 {
+            for column in x0..=x1 {
+                if column > x0 {
+                    out.push('\t');
+                }
+                out.push_str(sheet.get((column, row)).unwrap_or_default());
+            }
+            out.push('\n');
         }
-        self.note = format!("asked {id} for row {row}");
-        self.emit(&id, display::ACTION_SCROLL, &row.max(0).to_string());
-        true
+        out
     }
 
     /// Queue one frame for this client.
@@ -1698,46 +1881,31 @@ impl Client {
     fn wheel(&mut self, fonts: &Fonts, delta: i32, x: i32, y: i32) -> bool {
         let Some(doc) = &self.doc else { return false };
 
-        // A table does not scroll: it asks. Its rows are the window the
-        // application chose, so moving is a question for the application and
-        // the answer is a new tree. Checked before the ordinary containers so
-        // that a table inside a scrolling page takes the notch itself.
-        // Read out of the iterator before anything is emitted: the borrow it
-        // holds on the layout cannot outlive the write to the socket.
-        let asking = self
-            .layout
-            .scrollers_at(x, y)
-            .find(|scroller| scroller.asks)
-            .map(|scroller| {
-                let step = scroller.step.max(1);
-                (
-                    scroller.offset / step,
-                    scroller.content / step,
-                    (scroller.viewport / step).max(1),
-                    doc.tree.node(scroller.node).id().unwrap_or_default().to_owned(),
-                )
-            });
-        if let Some((first, total, visible, id)) = asking {
-            let next = (first - delta * WHEEL_ROWS).clamp(0, (total - visible).max(0));
-            if next == first || id.is_empty() {
-                return false;
-            }
-            self.note = format!("asked {id} for row {next}");
-            self.emit(&id, display::ACTION_SCROLL, &next.to_string());
-            return true;
-        }
-
+        // A grid scrolls like anything else now: the compositor holds the
+        // sheet, so a notch is an offset rather than a question. Its two
+        // scrollers share a node, so the one down is the one taken here and
+        // the one across belongs to the bar.
+        //
         // Innermost first, and the first that can still move takes the
         // notch: a container at its end, or one that never overflowed, hands
         // it outward rather than swallowing it. Positive delta is a push away
         // from the human, which moves the content down and the viewport up.
+        //
+        // A grid moves by whole rows, because half a row of a spreadsheet
+        // showing is not a thing anybody wants; everything else moves by
+        // pixels, because its content has no unit.
         let Some((key, next, furthest)) = self
             .layout
             .scrollers_at(x, y)
             .filter(|scroller| !scroller.horizontal)
             .find_map(|scroller| {
                 let furthest = scroller.furthest();
-                let next = (scroller.offset - delta * ui::wheel_step()).clamp(0, furthest);
+                let step = if scroller.step > 1 {
+                    scroller.step * WHEEL_ROWS
+                } else {
+                    ui::wheel_step()
+                };
+                let next = (scroller.offset - delta * step).clamp(0, furthest);
                 (next != scroller.offset).then(|| (doc.key(scroller.node).to_owned(), next, furthest))
             })
         else {
@@ -1776,18 +1944,15 @@ impl Client {
 
         let node = doc.tree.node(index);
         let tag = node.tag;
+        if tag == Tag::Spreadsheet && !node.disabled() {
+            return self.grid_key(fonts, index, key, clipboard);
+        }
         if !tag.is_text() || node.disabled() {
             return false;
         }
-        // A cell takes text only when the application says it does; a field
-        // and an editor always do.
-        let editable = tag != Tag::Cell || node.flag("editable");
+        let editable = true;
         let id = node.id().unwrap_or_default().to_owned();
-        let seed = match node.attr("value") {
-            Some(value) => value.to_owned(),
-            None if tag == Tag::Cell => node.text.clone(),
-            None => String::new(),
-        };
+        let seed = node.attr("value").unwrap_or_default().to_owned();
         // A compositor-internal attribute for chat-shaped editors: Enter
         // submits and Shift+Enter breaks the line, the convention every
         // messenger keeps. Without it an editor keeps the catalogue's rule,
@@ -1795,61 +1960,9 @@ impl Client {
         let enter_submits = node.flag("enter-submits");
         let typing = self.editing.contains_key(&focus_key);
 
-        // Moving about the grid comes first, because in a cell the arrows
-        // mean the grid until something is being typed into it, and then
-        // they mean the caret. Up and down always leave: a spreadsheet that
-        // trapped the selection in a half-typed cell would be unusable.
-        if tag == Tag::Cell {
-            match key {
-                Key::Up => return self.move_cell(fonts, 0, -1),
-                Key::Down | Key::Enter => return self.move_cell(fonts, 0, 1),
-                Key::Left if !typing => return self.move_cell(fonts, -1, 0),
-                Key::Right if !typing => return self.move_cell(fonts, 1, 0),
-                // Shift and an arrow reach one cell further instead of
-                // moving, which is what they do in every spreadsheet. Up and
-                // down do it even mid-edit, exactly as the plain ones leave a
-                // half-typed cell; left and right mean the caret once there
-                // is one to move.
-                Key::ShiftUp => return self.extend_cells(0, -1),
-                Key::ShiftDown => return self.extend_cells(0, 1),
-                Key::ShiftLeft if !typing => return self.extend_cells(-1, 0),
-                Key::ShiftRight if !typing => return self.extend_cells(1, 0),
-                Key::Escape if typing => {
-                    // Give the cell back the value the application last sent.
-                    // Every keystroke was already reported, so undoing has to
-                    // be reported too, as the value it ends on.
-                    self.editing.remove(&focus_key);
-                    self.emit(&id, display::ACTION_TYPE_TEXT, &seed);
-                    if let Some(doc) = &mut self.doc {
-                        doc.tree.nodes[index].set("value", &seed);
-                    }
-                    self.relayout(fonts);
-                    self.note = format!("cancelled the edit in {id}");
-                    return true;
-                }
-                _ => {}
-            }
-            if !editable {
-                return false;
-            }
-        }
-
-        // A cell that is not being typed into yet starts empty, so the first
-        // character replaces what was there rather than appending to it,
-        // which is what every spreadsheet does and what the human expects
-        // when they select a cell and start typing.
-        let fresh = tag == Tag::Cell && !typing;
-        // A cell nobody is typing into has no caret and no selection, so
-        // there is nothing in it for a key to move or copy, and starting a
-        // text box for one would blank the cell: the compositor's copy is
-        // what is painted, and a fresh one is empty. Only a key that puts
-        // characters in begins an edit. Ctrl+C over a grid means the chosen
-        // *cells*, which is the application's to answer and not this.
-        if fresh && !matches!(key, Key::Char(_) | Key::Paste) {
-            return false;
-        }
+        let _ = (editable, typing);
         let state = self.editing.entry(focus_key.clone()).or_insert_with(|| {
-            let mut state = Editing::new(if fresh { String::new() } else { seed.clone() });
+            let mut state = Editing::new(seed.clone());
             // Focus arrived without a press, from Tab or from an agent, so
             // there is no point to put the caret at.
             state.caret = 0;
@@ -1921,111 +2034,134 @@ impl Client {
         true
     }
 
-    /// Move the grid's cursor, committing whatever was being typed.
+    /// Everything the keyboard does over a grid.
     ///
-    /// The destination is told to the application as a `select`, which is the
-    /// same event a press on it would have produced. That matters more than
-    /// it looks: the application, not the compositor, decides which rows it
-    /// has sent, so it can only keep the cursor in view if it is told the
-    /// cursor moved.
-    fn move_cell(&mut self, fonts: &Fonts, across: i32, down: i32) -> bool {
+    /// The cursor is the *application's*: it arrives on the element as
+    /// `cursor` and moves because the application was told to move it, which
+    /// is the same event a press on a cell produces. So an arrow key here is
+    /// a `select` on the cell beside the one the tree named, not a change the
+    /// compositor makes and hopes the application agrees with.
+    ///
+    /// Typing is the other way round. The characters are the compositor's
+    /// until the application echoes them, exactly as they are in a field: the
+    /// local copy is painted so a keystroke shows at once, and what the
+    /// application hears is the value the cell ended up with.
+    fn grid_key(&mut self, fonts: &Fonts, index: usize, key: Key, clipboard: &mut Clipboard) -> bool {
         let Some(doc) = &self.doc else { return false };
-        let Some(key) = self.focus.clone() else { return false };
-        let Some(index) = doc.index_of(&key) else { return false };
-        let Some((row_at, column_at)) = doc.tree.cell_position(index) else { return false };
-        let Some(table) = doc.tree.table_of(index) else { return false };
+        let node = doc.tree.node(index);
+        let id = node.id().unwrap_or_default().to_owned();
+        let element = doc.key(index).to_owned();
+        let Some(cursor) = node.attr("cursor").and_then(sheet::parse) else { return false };
+        let Some(grid) = self.grid_of(&element) else { return false };
+        let (rows, columns) = (grid.rows, grid.columns);
+        let source = grid.source.clone();
+        let editing = cell_key(&element, cursor);
+        let typing = self.editing.contains_key(&editing);
 
-        let rows = doc.tree.rows(table);
-        if rows.is_empty() {
-            return false;
-        }
-        let row = (row_at as i32 + down).clamp(0, rows.len() as i32 - 1) as usize;
-        let cells = doc.tree.cells(rows[row]);
-        if cells.is_empty() {
-            return false;
-        }
-        let column = (column_at as i32 + across).clamp(0, cells.len() as i32 - 1) as usize;
-        let target = cells[column];
-        let target_key = doc.key(target).to_owned();
-        let id = doc.tree.node(index).id().unwrap_or_default().to_owned();
+        let step = |at: sheet::Ref, across: i32, down: i32| -> sheet::Ref {
+            (
+                (at.0 as i32 + across).clamp(0, columns as i32 - 1) as u32,
+                (at.1 as i32 + down).clamp(0, rows as i32 - 1) as u32,
+            )
+        };
 
-        // Whatever was typed is already with the application, keystroke by
-        // keystroke. Leaving the cell is what says it is finished.
-        if self.editing.remove(&key).is_some() {
-            self.emit(&id, display::ACTION_SUBMIT, "");
-        }
-        if target == index {
+        // Enter on a cell nobody is typing into opens it for editing, and
+        // opens it on what is already in it: a human who wanted to replace
+        // the contents would have started typing, which is the other way in
+        // and starts from nothing. Enter *while* editing is the commit, and
+        // it moves down, which is the arm below.
+        if key == Key::Enter && !typing {
+            let was = self.published(&source, cursor);
+            // The caret goes to the end, not over the whole value: opening a
+            // cell to edit it is not the same as opening it to replace it,
+            // and replacing is what typing straight into a chosen cell does.
+            self.editing.insert(editing, Editing::new(was));
+            self.note = format!("editing {} in {id}", sheet::name(cursor));
             return true;
         }
 
-        self.focus = Some(target_key);
-        // A plain arrow is how a run of cells stops being one: the cursor
-        // moves and the next shift starts again from where it landed.
-        self.cell_extent = None;
-        let _ = self.act(fonts, target, "select", "");
+        // Where the arrows take the cursor, and where shift and an arrow
+        // reach instead. Up and down always leave a cell, exactly as they do
+        // in every spreadsheet; left and right mean the caret once there is
+        // one to move.
+        let moved = match key {
+            Key::Up => Some((step(cursor, 0, -1), false)),
+            Key::Down | Key::Enter => Some((step(cursor, 0, 1), false)),
+            Key::Left if !typing => Some((step(cursor, -1, 0), false)),
+            Key::Right if !typing => Some((step(cursor, 1, 0), false)),
+            Key::ShiftUp => Some((step(self.reached(cursor), 0, -1), true)),
+            Key::ShiftDown => Some((step(self.reached(cursor), 0, 1), true)),
+            Key::ShiftLeft if !typing => Some((step(self.reached(cursor), -1, 0), true)),
+            Key::ShiftRight if !typing => Some((step(self.reached(cursor), 1, 0), true)),
+            _ => None,
+        };
+        if let Some((at, extend)) = moved {
+            // Whatever was being typed is already with the application,
+            // keystroke by keystroke, so leaving the cell is not a commit:
+            // there is nothing left to say.
+            self.editing.remove(&editing);
+            if extend {
+                if self.cell_extent == Some(at) {
+                    return false;
+                }
+                self.cell_extent = Some(at);
+                self.note = format!("{} through {}", sheet::name(cursor), sheet::name(at));
+                self.emit_cell(&id, display::ACTION_SELECT_RANGE, &sheet::name(at), &sheet::name(cursor));
+            } else {
+                if at == cursor {
+                    return false;
+                }
+                self.cell_extent = None;
+                self.note = format!("{} chosen in {id}", sheet::name(at));
+                self.emit_cell(&id, display::ACTION_SELECT, "", &sheet::name(at));
+            }
+            self.reveal_cell(fonts, index, at);
+            return true;
+        }
+
+        if key == Key::Escape && typing {
+            // Give the cell back what the application last published. Every
+            // keystroke was already reported, so undoing has to be reported
+            // too, as the value it ends on.
+            self.editing.remove(&editing);
+            let was = self.published(&source, cursor);
+            self.note = format!("cancelled the edit in {}", sheet::name(cursor));
+            self.emit_cell(&id, display::ACTION_TYPE_TEXT, &was, &sheet::name(cursor));
+            return true;
+        }
+
+        // A cell nobody is typing into has no caret and no selection, so
+        // there is nothing in it for a key to move or copy. Only a key that
+        // puts characters in begins an edit, and when one does the cell
+        // starts empty: the first character replaces what was there, which is
+        // what every spreadsheet does. Ctrl+C over a grid means the chosen
+        // *cells*, which is the application's to answer and not this.
+        if !typing && !matches!(key, Key::Char(_) | Key::Paste) {
+            return false;
+        }
+        let state = self.editing.entry(editing).or_insert_with(|| Editing::new(String::new()));
+        if state.key(key, clipboard, false) != Edit::Changed {
+            return true;
+        }
+        let value = state.value.clone();
+        self.note = format!("typed into {}", sheet::name(cursor));
+        self.emit_cell(&id, display::ACTION_TYPE_TEXT, &value, &sheet::name(cursor));
         true
     }
 
-    /// Carry the far corner of a run of cells with the keyboard.
-    ///
-    /// Shift and an arrow over a grid mean what they mean in every
-    /// spreadsheet: the chosen cell stays where it is and the run reaches one
-    /// cell further. The near corner is the focused cell and the far corner
-    /// is remembered between keystrokes, so holding shift and pressing right
-    /// twice reaches two cells rather than the same one twice.
-    ///
-    /// It ends in the same `select-range` a drag across the grid does,
-    /// because it is the same gesture said with the other hand: the
-    /// application hears one event naming two corners and paints the run
-    /// itself.
-    fn extend_cells(&mut self, across: i32, down: i32) -> bool {
-        let Some(doc) = &self.doc else { return false };
-        let Some(key) = self.focus.clone() else { return false };
-        let Some(anchor) = doc.index_of(&key) else { return false };
-        if doc.tree.node(anchor).tag != Tag::Cell {
-            return false;
-        }
-        let anchor_id = doc.tree.node(anchor).id().unwrap_or_default().to_owned();
+    /// The far corner of a run being reached out with the keyboard, or the
+    /// cursor when there is not one yet.
+    fn reached(&self, cursor: sheet::Ref) -> sheet::Ref {
+        self.cell_extent.unwrap_or(cursor)
+    }
 
-        // Where the run reaches now: the last cell it was carried to, or the
-        // chosen one when this is the first keystroke of a run.
-        let reached = self
-            .cell_extent
-            .as_ref()
-            .and_then(|id| self.node_by_id(id))
-            .filter(|&index| self.doc.as_ref().is_some_and(|doc| doc.tree.node(index).tag == Tag::Cell))
-            .unwrap_or(anchor);
-
-        let Some(doc) = &self.doc else { return false };
-        let Some((row_at, column_at)) = doc.tree.cell_position(reached) else { return false };
-        let Some(table) = doc.tree.table_of(reached) else { return false };
-        if doc.tree.table_of(anchor) != Some(table) {
-            return false;
-        }
-
-        let rows = doc.tree.rows(table);
-        if rows.is_empty() {
-            return false;
-        }
-        let row = (row_at as i32 + down).clamp(0, rows.len() as i32 - 1) as usize;
-        let cells = doc.tree.cells(rows[row]);
-        if cells.is_empty() {
-            return false;
-        }
-        let column = (column_at as i32 + across).clamp(0, cells.len() as i32 - 1) as usize;
-        let target = cells[column];
-        let target_id = doc.tree.node(target).id().unwrap_or_default().to_owned();
-        if target_id.is_empty() || self.cell_extent.as_deref() == Some(target_id.as_str()) {
-            // Already at the edge of what the application sent. A row past
-            // the window is not in the tree to name, which is the same
-            // answer a drag gets there.
-            return false;
-        }
-
-        self.cell_extent = Some(target_id.clone());
-        self.note = format!("{anchor_id} through {target_id}");
-        self.emit(&anchor_id, display::ACTION_SELECT_RANGE, &target_id);
-        true
+    /// What the application last published for a cell.
+    fn published(&self, source: &str, at: sheet::Ref) -> String {
+        self.sheets
+            .get(source)
+            .and_then(|sheet| sheet.get(at))
+            .unwrap_or_default()
+            .to_owned()
     }
 
     /// Move focus to the next enabled control, wrapping.
@@ -2058,11 +2194,17 @@ impl Client {
     /// Send one event, stamped with the version of the tree it was generated
     /// against.
     fn emit(&mut self, target: &str, action: &str, value: &str) {
+        self.emit_cell(target, action, value, "");
+    }
+
+    /// The same, naming a cell of a spreadsheet as well.
+    fn emit_cell(&mut self, target: &str, action: &str, value: &str, cell: &str) {
         let event = display::Event {
             version: self.version(),
             target: target.to_owned(),
             action: action.to_owned(),
             value: value.to_owned(),
+            cell: cell.to_owned(),
         };
         self.pending.extend_from_slice(&event.encode());
         self.flush();
@@ -2096,6 +2238,17 @@ impl Client {
         }
     }
 }
+
+/// Where the compositor's copy of one cell being typed into is kept.
+///
+/// Cells are not nodes, so there is no document key to use. This is the
+/// element's key and the cell's name, which is stable in exactly the same way:
+/// it survives a re-render, and it names a different thing the moment the
+/// element does.
+fn cell_key(element: &str, at: sheet::Ref) -> String {
+    format!("{element}!{}", sheet::name(at))
+}
+
 
 
 
@@ -2178,93 +2331,6 @@ mod tests {
         assert!(client.layout.is_visible(index), "a nested container was not moved");
     }
 
-    /// A cell off the right-hand edge of a table. The table is not a scroll
-    /// container and the old reveal walked straight past it, so this is the
-    /// second of the two gaps that made `not-visible` look unavoidable.
-    #[test]
-    fn a_cell_off_the_side_of_a_table_is_revealed_across() {
-        let mut source = String::from(
-            "<window pad=\"none\"><table id=\"sheet\" grow=\"true\" rows=\"100\"              first-row=\"0\" description=\"The grid\">",
-        );
-        for name in ["A", "B", "C", "D", "E", "F", "G", "H"] {
-            source.push_str(&format!("<column label=\"{name}\" chars=\"12\"/>"));
-        }
-        source.push_str("<row label=\"1\">");
-        for name in ["A", "B", "C", "D", "E", "F", "G", "H"] {
-            source.push_str(&format!("<cell id=\"{name}1\" value=\"x\"/>"));
-        }
-        source.push_str("</row></table></window>");
-
-        // Narrow on purpose: the last columns are off the side.
-        let (fonts, mut client, _peer) = framed(&source, Rect::new(0, 0, 300, 200));
-        let index = client.node_by_id("H1").expect("the last cell exists");
-        assert!(!client.layout.is_visible(index), "eight columns fitted in 300 pixels");
-        assert!(client.reveal(&fonts, index), "reveal did not report success");
-        assert!(client.layout.is_visible(index), "the table was not moved across");
-    }
-
-    fn window(first: i32, rows: &[i32]) -> String {
-        let mut out = format!(
-            "<window pad=\"none\"><table id=\"sheet\" grow=\"true\" rows=\"1000\"              first-row=\"{first}\" description=\"The grid\">             <column label=\"A\" chars=\"8\"/><column label=\"B\" chars=\"8\"/>"
-        );
-        for &row in rows {
-            out.push_str(&format!(
-                "<row label=\"{row}\"><cell id=\"A{row}\" value=\"v\" editable=\"true\"/>                 <cell id=\"B{row}\" value=\"w\"/></row>"
-            ));
-        }
-        out.push_str("</table></window>");
-        out
-    }
-
-    /// An agent typing into an editable cell.
-    ///
-    /// `Tag::actions` cannot know whether a cell is editable, so it answers
-    /// for one that is not, and this went through it: every keystroke an
-    /// agent sent to a perfectly ordinary cell came back
-    /// `unsupported-action`. It never showed up by hand because typing goes
-    /// through the keyboard path, which consults no action list at all.
-    #[test]
-    fn an_agent_may_type_into_an_editable_cell() {
-        let (fonts, mut client, _peer) = framed(&window(0, &[1, 2, 3]), Rect::new(0, 0, 400, 300));
-        let editable = client.node_by_id("A1").expect("the cell exists");
-        let plain = client.node_by_id("B1").expect("the cell exists");
-
-        assert_eq!(client.act(&fonts, editable, "type-text", "42"), Ok(()));
-        assert_eq!(client.act(&fonts, editable, "submit", ""), Ok(()));
-        assert_eq!(client.act(&fonts, editable, "select", ""), Ok(()));
-
-        // A cell the application did not mark editable still takes neither,
-        // which is the other half of the same question being asked properly.
-        assert_eq!(
-            client.act(&fonts, plain, "type-text", "42"),
-            Err(awproto::agent::REASON_UNSUPPORTED)
-        );
-    }
-
-    /// The cell cursor survives the window moving past it and back.
-    ///
-    /// A row outside a table's window has not been removed; it is not being
-    /// described. Forgetting focus for anything absent from the incoming tree
-    /// meant scrolling away from a selected cell lost it for good.
-    #[test]
-    fn the_cell_cursor_survives_a_window_that_moved_past_it() {
-        let (fonts, mut client, _peer) = framed(&window(0, &[1, 2, 3]), Rect::new(0, 0, 400, 300));
-        let cell = client.node_by_id("A2").expect("the cell exists");
-        client.act(&fonts, cell, "select", "").expect("selected");
-        assert!(client.focus_state().node.is_some(), "nothing was selected to begin with");
-
-        // The application describes a window far below. The cell is nowhere
-        // in this tree.
-        client.apply(&fonts, &window(500, &[501, 502, 503]), 2);
-        assert!(client.node_by_id("A2").is_none(), "the row is somehow still here");
-        assert!(client.focus_state().node.is_none(), "a ring on a row nobody sent");
-
-        // And back. The cursor is where it was left.
-        client.apply(&fonts, &window(0, &[1, 2, 3]), 3);
-        let back = client.node_by_id("A2").expect("the row is described again");
-        assert_eq!(client.focus_state().node, Some(back), "the cell cursor did not come back");
-    }
-
     /// Whatever the client has said to its application, without waiting for
     /// more. Non-blocking, so a test that expected an event and got none
     /// fails rather than hanging.
@@ -2288,77 +2354,20 @@ mod tests {
         out
     }
 
-    /// Dragging across cells is one gesture, so it is one kind of event, sent
-    /// as the run grows. The application paints the highlight; the compositor
-    /// only says what the hand did.
-    #[test]
-    fn dragging_across_cells_reports_a_run() {
-        let (fonts, mut client, mut peer) =
-            framed(&window(0, &[1, 2, 3]), Rect::new(0, 0, 400, 300));
-        let mut clipboard = Clipboard::default();
-
-        // Press on A1, which selects it and arms the drag.
-        let a1 = client.layout.rect_of(client.node_by_id("A1").unwrap());
-        client.handle(
-            &fonts,
-            Event::ButtonPressed { button: Button::Left, x: a1.x + 2, y: a1.y + 2 },
-            &mut clipboard,
-        );
-        assert!(client.selecting_cells(), "the press did not arm a run");
-        let opening = said(&mut peer);
-        assert!(
-            opening.iter().any(|fields| fields[3] == display::ACTION_SELECT && fields[2] == "A1"),
-            "the press did not choose the cell it landed on: {opening:?}"
-        );
-
-        // Carry it to B3.
-        let b3 = client.layout.rect_of(client.node_by_id("B3").unwrap());
-        client.drag_cells(b3.x + 2, b3.y + 2);
-        let dragged = said(&mut peer);
-        let run = dragged
-            .iter()
-            .find(|fields| fields[3] == display::ACTION_SELECT_RANGE)
-            .unwrap_or_else(|| panic!("no run was reported: {dragged:?}"));
-        assert_eq!(run[2], "A1", "the run does not start where the press did");
-        assert_eq!(run[4], "B3", "the run does not reach where the pointer is");
-
-        // The same cell again says nothing: one event per cell reached, not
-        // one per pixel of pointer motion.
-        client.drag_cells(b3.x + 3, b3.y + 3);
-        assert!(said(&mut peer).is_empty(), "a run was reported twice for one cell");
-    }
-
-    /// An agent naming both corners, and the two ways that can be wrong.
-    #[test]
-    fn an_agent_names_both_corners_of_a_run() {
-        let (fonts, mut client, mut peer) =
-            framed(&window(0, &[1, 2, 3]), Rect::new(0, 0, 400, 300));
-        let a1 = client.node_by_id("A1").unwrap();
-
-        assert_eq!(client.act(&fonts, a1, "select-range", "B3"), Ok(()));
-        let said = said(&mut peer);
-        let run = said.iter().find(|f| f[3] == display::ACTION_SELECT_RANGE).expect("a run");
-        assert_eq!((run[2].as_str(), run[4].as_str()), ("A1", "B3"));
-
-        // A corner that does not exist is not a corner.
-        assert_eq!(
-            client.act(&fonts, a1, "select-range", "Z99"),
-            Err(awproto::agent::REASON_NO_SUCH_NODE)
-        );
-    }
-
     /// The other button says where it landed and on what, and nothing else.
     /// What it means is the application's to decide.
     #[test]
     fn the_other_button_reports_what_was_under_it() {
-        let (fonts, mut client, mut peer) =
-            framed(&window(0, &[1, 2, 3]), Rect::new(0, 0, 400, 300));
+        let source = r#"<window pad="none">
+             <button id="go" label="Go" description="Does the thing"/>
+           </window>"#;
+        let (fonts, mut client, mut peer) = framed(source, Rect::new(0, 0, 400, 300));
         let mut clipboard = Clipboard::default();
-        let b2 = client.layout.rect_of(client.node_by_id("B2").unwrap());
+        let go = client.layout.rect_of(client.node_by_id("go").unwrap());
 
         client.handle(
             &fonts,
-            Event::ButtonPressed { button: Button::Right, x: b2.x + 2, y: b2.y + 2 },
+            Event::ButtonPressed { button: Button::Right, x: go.x + 2, y: go.y + 2 },
             &mut clipboard,
         );
         let said = said(&mut peer);
@@ -2366,9 +2375,249 @@ mod tests {
             .iter()
             .find(|fields| fields[3] == display::ACTION_CONTEXT)
             .unwrap_or_else(|| panic!("nothing was reported: {said:?}"));
-        assert_eq!(context[2], "B2", "reported on the wrong node");
+        assert_eq!(context[2], "go", "reported on the wrong node");
         // And it is remembered, because a menu opened in answer hangs from it.
-        assert_eq!(client.context_at, Some((b2.x + 2, b2.y + 2)));
+        assert_eq!(client.context_at, Some((go.x + 2, go.y + 2)));
+    }
+
+    /// A grid, with the cells published the way an application publishes
+    /// them: on their own frames, before the tree that claims their version.
+    fn grid(client: &mut Client, fonts: &Fonts, cursor: &str) {
+        let markup = format!(
+            r#"<window pad="none"><spreadsheet id="sheet" grow="true" source="book"
+                 version="3" rows="1000" columns="26" cursor="{cursor}"
+                 description="The grid"/></window>"#
+        );
+        client.sheets.apply("book", 0, 1, (0, 0), &["Region".into(), "Q1".into()]);
+        client.sheets.apply("book", 1, 2, (0, 1), &["North".into(), "1240".into()]);
+        client.sheets.apply("book", 2, 3, (0, 499), &["far down".into()]);
+        client.apply(fonts, &markup, client.version() + 1);
+        client.set_frame(fonts, Frame::Whole(Rect::new(0, 0, 400, 300)));
+    }
+
+    /// A run of cells arrives as a run, applies to the version it names, and
+    /// is refused when it names one nobody holds. The compositor never works
+    /// out what changed; it is told, and what it is told is checked.
+    #[test]
+    fn cells_arrive_as_runs_against_a_version() {
+        let (fonts, mut client, _peer) =
+            framed(r#"<window pad="none"><text>x</text></window>"#, Rect::new(0, 0, 400, 300));
+        grid(&mut client, &fonts, "A1");
+
+        assert_eq!(client.cells("sheet", "A1:B2"), "Region	Q1
+North	1240
+");
+        // Past what was published is empty rather than missing: an agent
+        // asking for a rectangle is asking about the rectangle.
+        assert_eq!(client.cells("sheet", "A3:B3"), "	
+");
+        // A range that runs past the sheet is cut to it.
+        assert!(!client.cells("sheet", "A1:ZZ2000").is_empty());
+    }
+
+    /// A press on a grid chooses the cell it landed on, a drag reports a run,
+    /// and both name the cell beside the action, because a cell is a
+    /// coordinate rather than a node.
+    #[test]
+    fn a_press_on_a_grid_names_the_cell_it_landed_on() {
+        let (fonts, mut client, mut peer) =
+            framed(r#"<window pad="none"><text>x</text></window>"#, Rect::new(0, 0, 400, 300));
+        grid(&mut client, &fonts, "A1");
+        let mut clipboard = Clipboard::default();
+        let _ = said(&mut peer);
+
+        let index = client.node_by_id("sheet").unwrap();
+        let b2 = client.cell_rect(index, (1, 1)).unwrap();
+        client.handle(
+            &fonts,
+            Event::ButtonPressed { button: Button::Left, x: b2.x + 2, y: b2.y + 2 },
+            &mut clipboard,
+        );
+        let heard = said(&mut peer);
+        let chosen = heard
+            .iter()
+            .find(|fields| fields[3] == display::ACTION_SELECT)
+            .unwrap_or_else(|| panic!("nothing was chosen: {heard:?}"));
+        assert_eq!(chosen[2], "sheet", "the event does not name the element");
+        assert_eq!(chosen[5], "B2", "the event does not name the cell");
+
+        // Carried to another cell: one run, two corners.
+        let d3 = client.cell_rect(index, (3, 2)).unwrap();
+        assert!(client.drag_cells(d3.x + 2, d3.y + 2), "the drag reported nothing");
+        let heard = said(&mut peer);
+        let run = heard
+            .iter()
+            .find(|fields| fields[3] == display::ACTION_SELECT_RANGE)
+            .unwrap_or_else(|| panic!("no run: {heard:?}"));
+        assert_eq!(run[5], "B2", "the run does not start where the press did");
+        assert_eq!(run[4], "D3", "the run does not reach where the pointer is");
+    }
+
+    /// Typing into a cell is the compositor's until the application echoes
+    /// it: the keystroke shows at once and what the application hears is the
+    /// value the cell ended up with, exactly as in a field.
+    #[test]
+    fn typing_into_a_cell_reports_the_value_it_ended_up_with() {
+        let (fonts, mut client, mut peer) =
+            framed(r#"<window pad="none"><text>x</text></window>"#, Rect::new(0, 0, 400, 300));
+        grid(&mut client, &fonts, "B2");
+        let mut clipboard = Clipboard::default();
+        client.focus = Some(client.doc.as_ref().unwrap().key(client.node_by_id("sheet").unwrap()).to_owned());
+        let _ = said(&mut peer);
+
+        for character in ['4', '2'] {
+            client.handle(&fonts, Event::KeyPressed(Key::Char(character)), &mut clipboard);
+        }
+        let heard = said(&mut peer);
+        let typed: Vec<&Vec<String>> =
+            heard.iter().filter(|fields| fields[3] == display::ACTION_TYPE_TEXT).collect();
+        assert_eq!(typed.len(), 2, "one event per keystroke: {heard:?}");
+        assert_eq!(typed[1][4], "42", "the value is not what the cell ended up with");
+        assert_eq!(typed[1][5], "B2", "the event does not name the cell");
+
+        // An arrow leaves the cell and chooses the next one, which is the
+        // same event a press on it produces.
+        client.handle(&fonts, Event::KeyPressed(Key::Down), &mut clipboard);
+        let heard = said(&mut peer);
+        let moved = heard
+            .iter()
+            .find(|fields| fields[3] == display::ACTION_SELECT)
+            .unwrap_or_else(|| panic!("the cursor did not move: {heard:?}"));
+        assert_eq!(moved[5], "B3");
+
+        // Shift and an arrow reach further instead of moving.
+        client.handle(&fonts, Event::KeyPressed(Key::ShiftRight), &mut clipboard);
+        let heard = said(&mut peer);
+        let run = heard
+            .iter()
+            .find(|fields| fields[3] == display::ACTION_SELECT_RANGE)
+            .unwrap_or_else(|| panic!("shift and right reached nothing: {heard:?}"));
+        assert_eq!(run[5], "B2", "the run does not start at the chosen cell");
+        assert_eq!(run[4], "C2", "the run does not reach one cell across");
+    }
+
+    /// A cell far down the sheet is reached by scrolling to it, which the
+    /// compositor can do itself: it holds the sheet, so there is nothing to
+    /// ask the application for.
+    #[test]
+    fn a_cell_below_the_screen_is_scrolled_to_rather_than_asked_for() {
+        let (fonts, mut client, mut peer) =
+            framed(r#"<window pad="none"><text>x</text></window>"#, Rect::new(0, 0, 400, 300));
+        grid(&mut client, &fonts, "A1");
+        let index = client.node_by_id("sheet").unwrap();
+        let _ = said(&mut peer);
+
+        assert!(client.reveal_cell(&fonts, index, (0, 499)), "A500 could not be reached");
+        let grid = client.layout.grids.iter().find(|grid| grid.node == index).unwrap();
+        let ((_, first), (_, last)) = grid.visible();
+        assert!(
+            (first..=last).contains(&499),
+            "A500 is still off screen: rows {first} to {last}"
+        );
+        // Nothing was asked of the application. There is nothing to ask.
+        assert!(said(&mut peer).is_empty(), "the application was asked for a row");
+    }
+
+    /// Opening a cell to *edit* it is a different thing from choosing it and
+    /// typing over it, and both ways in have to exist: a second press, or
+    /// Enter on the cell already chosen. Either starts from what is in the
+    /// cell, because a human who wanted to replace it would have just typed.
+    #[test]
+    fn a_second_press_or_enter_opens_a_cell_on_what_is_in_it() {
+        let (fonts, mut client, mut peer) =
+            framed(r#"<window pad="none"><text>x</text></window>"#, Rect::new(0, 0, 400, 300));
+        grid(&mut client, &fonts, "A1");
+        let mut clipboard = Clipboard::default();
+        let index = client.node_by_id("sheet").unwrap();
+        let element = client.doc.as_ref().unwrap().key(index).to_owned();
+        let a1 = client.cell_rect(index, (0, 0)).unwrap();
+        let _ = said(&mut peer);
+
+        // One press chooses it and opens nothing.
+        client.handle(
+            &fonts,
+            Event::ButtonPressed { button: Button::Left, x: a1.x + 2, y: a1.y + 2 },
+            &mut clipboard,
+        );
+        assert!(!client.editing.contains_key(&cell_key(&element, (0, 0))));
+
+        // A second in the same place opens it, on what was published.
+        client.handle(
+            &fonts,
+            Event::ButtonPressed { button: Button::Left, x: a1.x + 2, y: a1.y + 2 },
+            &mut clipboard,
+        );
+        let state = client
+            .editing
+            .get(&cell_key(&element, (0, 0)))
+            .unwrap_or_else(|| panic!("a double press did not open the cell"));
+        assert_eq!(state.value, "Region", "the cell did not open on what is in it");
+        assert_eq!(state.caret, 6, "the caret is not at the end of it");
+
+        // Enter does the same from the keyboard, and Enter again commits and
+        // moves down, which is the other half of what Enter means here.
+        client.focus = Some(element.clone());
+        client.editing.remove(&cell_key(&element, (0, 0)));
+        let _ = said(&mut peer);
+        client.handle(&fonts, Event::KeyPressed(Key::Enter), &mut clipboard);
+        assert_eq!(
+            client.editing.get(&cell_key(&element, (0, 0))).map(|state| state.value.as_str()),
+            Some("Region"),
+            "Enter did not open the cell"
+        );
+        assert!(said(&mut peer).is_empty(), "opening a cell told the application something");
+
+        client.handle(&fonts, Event::KeyPressed(Key::Enter), &mut clipboard);
+        let heard = said(&mut peer);
+        assert!(
+            heard.iter().any(|fields| fields[3] == display::ACTION_SELECT && fields[5] == "A2"),
+            "Enter while editing did not commit and move down: {heard:?}"
+        );
+    }
+
+    /// A grid's bar moves the compositor's own offset. It used to be the one
+    /// bar that did not: it was drawn against a sheet the compositor did not
+    /// hold, so dragging it asked the application for a different window. The
+    /// compositor holds the sheet now, and the flag that marked the exception
+    /// kept sending an event nothing answered, so the bar could be seen and
+    /// not dragged.
+    #[test]
+    fn dragging_a_grids_bar_moves_it_rather_than_asking() {
+        let (fonts, mut client, mut peer) =
+            framed(r#"<window pad="none"><text>x</text></window>"#, Rect::new(0, 0, 400, 300));
+        grid(&mut client, &fonts, "A1");
+        let mut clipboard = Clipboard::default();
+        let index = client.node_by_id("sheet").unwrap();
+        let key = client.doc.as_ref().unwrap().key(index).to_owned();
+        let _ = said(&mut peer);
+
+        let scroller = client
+            .layout
+            .scrollers
+            .iter()
+            .find(|scroller| scroller.node == index && !scroller.horizontal)
+            .expect("a bar down the side");
+        assert!(scroller.permanent, "a grid's bar fades");
+        let rect = client.layout.rect_of(index);
+        let (track, thumb) = ui::scrollbar_geometry(rect, scroller).expect("a thumb");
+
+        client.handle(
+            &fonts,
+            Event::ButtonPressed {
+                button: Button::Left,
+                x: thumb.x + thumb.w / 2,
+                y: thumb.y + thumb.h / 2,
+            },
+            &mut clipboard,
+        );
+        assert!(client.scroll_dragging(), "the press did not take hold of the thumb");
+
+        client.drag_scroll(&fonts, thumb.x, track.y + track.h);
+        assert!(
+            client.scroll.get(&key).copied().unwrap_or(0) > 0,
+            "the drag moved nothing"
+        );
+        assert!(said(&mut peer).is_empty(), "the drag asked the application for rows");
     }
 
     fn editing(value: &str, anchor: Option<usize>, caret: usize) -> Editing {
@@ -2576,152 +2825,6 @@ mod tests {
             "the agent said something worth keeping".contains(&word),
             "a double click took {word:?}, which is not part of the words"
         );
-    }
-
-    /// A key that cannot edit a cell must not start editing it.
-    ///
-    /// A cell being typed into is a different thing from a cell that is
-    /// merely chosen: the arrows stop meaning the grid and start meaning the
-    /// caret, which is right. So a key that starts an edit nobody asked for
-    /// takes the arrow keys away from the spreadsheet. Ctrl+C found it, and
-    /// copy over a grid is the one that should least have done it: what it
-    /// means is the chosen *cells*, which is the application's answer to
-    /// give and not the compositor's.
-    #[test]
-    fn a_key_that_cannot_edit_a_cell_does_not_start_editing_it() {
-        let (fonts, mut client, mut peer) = framed(&window(0, &[1]), Rect::new(0, 0, 400, 300));
-        let mut clipboard = Clipboard::default();
-        // An editable cell: a cell the application will not take text for
-        // never starts a box at all, so it could not have shown this.
-        let a1 = client.layout.rect_of(client.node_by_id("A1").unwrap());
-        client.handle(
-            &fonts,
-            Event::ButtonPressed { button: Button::Left, x: a1.x + 2, y: a1.y + 2 },
-            &mut clipboard,
-        );
-        let _ = said(&mut peer);
-
-        for key in [Key::Copy, Key::SelectAll, Key::Home] {
-            client.handle(&fonts, Event::KeyPressed(key), &mut clipboard);
-        }
-        assert!(said(&mut peer).is_empty(), "the application was told about a key that did nothing");
-
-        // The arrows still mean the grid. They stop meaning it the moment a
-        // cell is being typed into, which is right, so a key that starts an
-        // edit nobody asked for takes the arrow keys away from the
-        // spreadsheet: pressing an arrow after Ctrl+C moved a caret inside
-        // the cell instead of moving to the cell beside it.
-        client.handle(&fonts, Event::KeyPressed(Key::Right), &mut clipboard);
-        let moved = said(&mut peer);
-        assert!(
-            moved.iter().any(|fields| fields[3] == display::ACTION_SELECT),
-            "the arrows stopped moving around the grid: {moved:?}"
-        );
-    }
-
-    /// Shift and an arrow over a grid reach one cell further, which is what
-    /// they do in every spreadsheet and what they did nowhere here: a chosen
-    /// cell has no caret, so the keystroke fell through the text box and out
-    /// the bottom. It ends in the same `select-range` a drag across the grid
-    /// does, because it is the same gesture said with the other hand.
-    #[test]
-    fn shift_and_an_arrow_reach_further_across_a_grid() {
-        let (fonts, mut client, mut peer) = framed(&window(0, &[1, 2]), Rect::new(0, 0, 400, 300));
-        let mut clipboard = Clipboard::default();
-        let a1 = client.layout.rect_of(client.node_by_id("A1").unwrap());
-        client.handle(
-            &fonts,
-            Event::ButtonPressed { button: Button::Left, x: a1.x + 2, y: a1.y + 2 },
-            &mut clipboard,
-        );
-        let _ = said(&mut peer);
-
-        client.handle(&fonts, Event::KeyPressed(Key::ShiftRight), &mut clipboard);
-        let run = said(&mut peer);
-        let event = run
-            .iter()
-            .find(|fields| fields[3] == display::ACTION_SELECT_RANGE)
-            .unwrap_or_else(|| panic!("shift and right reached nothing: {run:?}"));
-        assert_eq!(event[2], "A1", "the run does not start at the chosen cell");
-        assert_eq!(event[4], "B1", "the run does not reach one cell across");
-
-        // The far corner is remembered, so a second keystroke reaches further
-        // rather than the same place again.
-        client.handle(&fonts, Event::KeyPressed(Key::ShiftDown), &mut clipboard);
-        let run = said(&mut peer);
-        let event = run
-            .iter()
-            .find(|fields| fields[3] == display::ACTION_SELECT_RANGE)
-            .unwrap_or_else(|| panic!("the second keystroke reached nothing: {run:?}"));
-        assert_eq!(event[4], "B2", "the run did not carry on from where it had got to");
-
-        // At the edge of what the application sent there is nothing to name,
-        // which is the same answer a drag gets there.
-        client.handle(&fonts, Event::KeyPressed(Key::ShiftDown), &mut clipboard);
-        assert!(said(&mut peer).is_empty(), "a run past the last row was reported anyway");
-
-        // A plain arrow is how it stops being a run: the cursor moves and the
-        // next shift starts again from where it landed.
-        client.handle(&fonts, Event::KeyPressed(Key::Right), &mut clipboard);
-        let moved = said(&mut peer);
-        assert!(
-            moved.iter().any(|fields| fields[3] == display::ACTION_SELECT && fields[2] == "B1"),
-            "a plain arrow did not move the cursor: {moved:?}"
-        );
-        client.handle(&fonts, Event::KeyPressed(Key::ShiftDown), &mut clipboard);
-        let run = said(&mut peer);
-        let event = run
-            .iter()
-            .find(|fields| fields[3] == display::ACTION_SELECT_RANGE)
-            .unwrap_or_else(|| panic!("the run did not start again: {run:?}"));
-        assert_eq!(event[2], "B1", "the new run does not start where the cursor landed");
-        assert_eq!(event[4], "B2", "the new run kept the old corner");
-    }
-
-    /// Which presses the compositor's edit menu takes, and which it leaves to
-    /// the application.
-    ///
-    /// The rule is about what cut, copy and paste would mean. Over a field or
-    /// an editor they mean the characters in it, which are the compositor's.
-    /// Over a cell they mean cells, which are the application's: a run across
-    /// a grid is its state, reported to it and painted by it, and the
-    /// compositor could not copy one if it wanted to. So the other button on
-    /// a cell stays the spreadsheet's, until the cell is being typed into and
-    /// is a field like any other.
-    #[test]
-    fn the_edit_menu_takes_text_and_leaves_the_grid_alone() {
-        let (fonts, mut client, _peer) = framed(&window(0, &[1, 2]), Rect::new(0, 0, 400, 300));
-        let a1 = client.layout.rect_of(client.node_by_id("A1").unwrap());
-        assert!(
-            client.arm_edit(&fonts, a1.x + 2, a1.y + 2).is_none(),
-            "the compositor took the other button on a cell nobody is typing into"
-        );
-
-        // Typing into it makes it a field, and then the words in it are the
-        // compositor's to offer.
-        let mut clipboard = Clipboard::default();
-        client.handle(
-            &fonts,
-            Event::ButtonPressed { button: Button::Left, x: a1.x + 2, y: a1.y + 2 },
-            &mut clipboard,
-        );
-        client.handle(&fonts, Event::KeyPressed(Key::Char('x')), &mut clipboard);
-        assert!(
-            client.arm_edit(&fonts, a1.x + 2, a1.y + 2).is_some(),
-            "a cell being typed into offered nothing"
-        );
-
-        // An editor always does, and a press on it that lands somewhere new
-        // takes focus so a paste has a caret to land at.
-        let source = r#"<window pad="none"><editor id="note" value="hello"
-                          description="Somewhere to write"/></window>"#;
-        let (fonts, mut client, _peer) = framed(source, Rect::new(0, 0, 400, 200));
-        let note = client.layout.rect_of(client.node_by_id("note").unwrap());
-        let offer = client
-            .arm_edit(&fonts, note.x + 4, note.y + 4)
-            .expect("an editor offered nothing");
-        assert!(offer.editable, "an editor was not offered a paste");
-        assert!(!offer.selection, "nothing was selected and copy was offered anyway");
     }
 
     /// A strip is a cap, the tabs, a foot and a hairline.

@@ -127,7 +127,7 @@ impl EditMenu {
         ui::paint_subtree(
             canvas,
             fonts,
-            images,
+            &ui::Content { images, sheets: &crate::sheet::Sheets::default() },
             &self.doc.tree,
             &self.layout,
             menu,

@@ -40,6 +40,7 @@ use crate::document::Document;
 use crate::images::Images;
 use crate::paint::font::{Family, Fonts, Style, Weight};
 use crate::paint::{Canvas, Color, Rect};
+use crate::sheet::{self, Sheets};
 
 // The palette an application names colours out of. An app may also give a hex
 // value; these exist so the common cases stay consistent between applications
@@ -237,6 +238,14 @@ const DIVIDER: i32 = 1;
 const DIALOG_SHADOW: i32 = 18;
 /// An editor is this many lines tall.
 const EDITOR_LINES: i32 = 4;
+/// The furthest a spreadsheet may run in either direction.
+///
+/// A ceiling rather than a limit anyone should reach: these are numbers a
+/// client chose, and the geometry is computed from them once a frame.
+const MAX_SHEET_SIDE: u32 = 100_000;
+/// How much of a sheet a window opens showing, when nothing else decides.
+const SHEET_ROWS_MIN: i32 = 12;
+const SHEET_COLUMNS_MIN: i32 = 5;
 /// A column with no declared width is this many characters wide, which is
 /// about what a spreadsheet gives an untouched column.
 const DEFAULT_COLUMN_CHARS: i32 = 10;
@@ -273,14 +282,8 @@ fn label_of(node: &Node) -> &str {
 /// password by forgetting to, and the agent's view is built from the same
 /// string, so it cannot see one either.
 fn value_of(node: &Node) -> String {
-    let value = match node.attr("value") {
-        Some(value) => value,
-        // A cell may carry its content as text, which is what a table full of
-        // words reads like in markup. A field with no value is empty, and its
-        // placeholder is a separate thing.
-        None if node.tag == Tag::Cell => node.text.as_str(),
-        None => "",
-    };
+    // A control with no value is empty; its placeholder is a separate thing.
+    let value = node.attr("value").unwrap_or_default();
     if node.attr("kind") == Some("password") {
         return "*".repeat(value.chars().count());
     }
@@ -451,13 +454,6 @@ impl Regions {
 }
 
 /// A scroll container that was placed, and how much of it did not fit.
-///
-/// A table produces these too, and its vertical one is not like the others:
-/// the content it reports is the whole sheet, which was never laid out and
-/// mostly never sent. That is what lets a bar be drawn against ten thousand
-/// rows while the tree holds forty. Dragging it is therefore a question for
-/// the application rather than an offset to change, which [`Scroller::asks`]
-/// is what marks.
 pub struct Scroller {
     pub node: usize,
     /// Total extent the content wanted, along this scroller's axis.
@@ -467,12 +463,16 @@ pub struct Scroller {
     pub offset: i32,
     /// Across rather than down.
     pub horizontal: bool,
-    /// Moving this does not move anything here: it asks the application to
-    /// describe a different window, and the answer arrives as a new tree.
-    pub asks: bool,
+    /// Whether the bar stays on screen instead of fading after the content
+    /// stops moving.
+    ///
+    /// A grid's does. How much sheet there is below the screen is something a
+    /// spreadsheet has to say all the time, and its bar is the only thing
+    /// saying it; everywhere else a permanent groove down the side of the
+    /// content is most of what makes a list look heavy.
+    pub permanent: bool,
     /// What one unit of this scroller is worth in pixels: a row's height for
-    /// a table, one pixel for everything else. It is what turns a thumb's
-    /// position back into the row number the application is asked for.
+    /// a grid, one pixel for everything else. What a wheel notch moves.
     pub step: i32,
 }
 
@@ -483,12 +483,142 @@ impl Scroller {
     }
 }
 
+/// What there is to draw from, besides the tree: pictures the compositor
+/// loaded, and sheets an application published.
+///
+/// One parameter rather than two because they are the same kind of thing. The
+/// tree names a wallpaper and the compositor holds the pixels; the tree names
+/// a sheet and the compositor holds the cells. Neither is in the markup, and
+/// both are what the markup points at.
+pub struct Content<'a> {
+    pub images: &'a Images,
+    pub sheets: &'a Sheets,
+}
+
+/// A spreadsheet's geometry, worked out once by layout and read by everything
+/// else: painting, hit testing, the fake cursor, the scrollbars.
+///
+/// A grid has no nodes, so there are no rectangles in the arena to ask. This
+/// is what replaces them, and it is arithmetic rather than storage: a
+/// thousand columns cost one record, not a thousand.
+pub struct Grid {
+    pub node: usize,
+    /// The sheet this element points at.
+    pub source: String,
+    /// Where cells are drawn: below the column header, right of the row
+    /// gutter, and clipped to the element.
+    pub body: Rect,
+    /// The band of column letters across the top.
+    pub header: Rect,
+    /// The strip of row numbers down the left.
+    pub gutter: Rect,
+    pub row_h: i32,
+    pub rows: u32,
+    pub columns: u32,
+    /// How far the content is scrolled, across and down, in pixels. Both are
+    /// the compositor's: the application publishes cells and is never told
+    /// where the window onto them is, exactly as it is never told where its
+    /// own window is.
+    pub offset: (i32, i32),
+    /// What a column is wide when nobody has dragged it.
+    pub width: i32,
+    /// The ones somebody has, sorted. Almost always empty, which is why the
+    /// arithmetic below can afford to walk it.
+    pub wide: Vec<(u32, i32)>,
+}
+
+impl Grid {
+    pub fn column_w(&self, column: u32) -> i32 {
+        self.wide
+            .iter()
+            .find(|(at, _)| *at == column)
+            .map_or(self.width, |&(_, w)| w)
+    }
+
+    /// How far along the content a column starts, before scrolling.
+    pub fn column_x(&self, column: u32) -> i32 {
+        let mut x = column as i32 * self.width;
+        for &(at, w) in &self.wide {
+            if at < column {
+                x += w - self.width;
+            }
+        }
+        x
+    }
+
+    /// The whole content's size, for the scrollbars.
+    pub fn content(&self) -> (i32, i32) {
+        (self.column_x(self.columns), self.rows as i32 * self.row_h)
+    }
+
+    /// Which column a point along the content lands in.
+    fn column_at(&self, x: i32) -> Option<u32> {
+        if x < 0 {
+            return None;
+        }
+        // Uniform until proven otherwise, which is the usual case; the walk
+        // is only for the columns somebody has dragged.
+        if self.wide.is_empty() {
+            let column = (x / self.width.max(1)) as u32;
+            return (column < self.columns).then_some(column);
+        }
+        let mut at = 0;
+        for column in 0..self.columns {
+            let next = at + self.column_w(column);
+            if x < next {
+                return Some(column);
+            }
+            at = next;
+        }
+        None
+    }
+
+    /// Where a cell is on screen. Outside the body when it is scrolled away,
+    /// which is what the clip is for.
+    pub fn cell_rect(&self, at: sheet::Ref) -> Rect {
+        Rect::new(
+            self.body.x + self.column_x(at.0) - self.offset.0,
+            self.body.y + at.1 as i32 * self.row_h - self.offset.1,
+            self.column_w(at.0),
+            self.row_h,
+        )
+    }
+
+    /// Which cell a point on screen lands on, or `None` when it is not over
+    /// the cells at all.
+    pub fn cell_at(&self, x: i32, y: i32) -> Option<sheet::Ref> {
+        if !self.body.contains(x, y) {
+            return None;
+        }
+        let column = self.column_at(x - self.body.x + self.offset.0)?;
+        let row = (y - self.body.y + self.offset.1) / self.row_h.max(1);
+        let row = u32::try_from(row).ok()?;
+        (row < self.rows).then_some((column, row))
+    }
+
+    /// The rectangle of cells currently on screen, as two corners. What
+    /// painting walks, and the only thing that decides how much work a frame
+    /// is: a sheet of a million cells and one of ten paint the same screenful.
+    pub fn visible(&self) -> (sheet::Ref, sheet::Ref) {
+        let first_column = self.column_at(self.offset.0.max(0)).unwrap_or(0);
+        let last_column = self
+            .column_at(self.offset.0 + self.body.w)
+            .unwrap_or(self.columns.saturating_sub(1));
+        let first_row = (self.offset.1 / self.row_h.max(1)).max(0) as u32;
+        let last_row = ((self.offset.1 + self.body.h) / self.row_h.max(1)) as u32;
+        (
+            (first_column, first_row.min(self.rows.saturating_sub(1))),
+            (last_column, last_row.min(self.rows.saturating_sub(1))),
+        )
+    }
+}
+
 /// Where the compositor believes the caret is, and in which node.
 ///
 /// Both halves are ephemeral state the application never sees. Keeping them out
 /// of the tree is what stops a full-tree resend from moving the human's cursor
 /// on every keystroke.
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone)]
 pub struct Focus {
     pub node: Option<usize>,
     /// Position in characters within the focused control's value.
@@ -517,6 +647,14 @@ pub struct Focus {
     /// lingers briefly after, which is what lets it sit over the content's edge
     /// without permanently covering anything.
     pub scrollbar: Option<usize>,
+    /// The cell of a spreadsheet being typed into, and the compositor's copy
+    /// of what is in it.
+    ///
+    /// A cell is not a node, so it cannot be `node`; and what is being typed
+    /// is not yet what the application published, so it cannot come from the
+    /// sheet. Painting it from here is what makes a keystroke in a grid show
+    /// at once, exactly as one in a field does.
+    pub cell: Option<(sheet::Ref, String)>,
     /// A run of static text the human has dragged out: which node, and the
     /// two character offsets into it.
     ///
@@ -534,12 +672,20 @@ pub struct Layout {
     /// container above it.
     pub clips: Vec<Rect>,
     pub scrollers: Vec<Scroller>,
+    /// The geometry of every spreadsheet in the document. Almost always
+    /// empty, and never more than a handful.
+    pub grids: Vec<Grid>,
 }
 
 impl Layout {
     /// A layout for a client that has not sent anything yet.
     pub fn empty() -> Layout {
-        Layout { rects: Vec::new(), clips: Vec::new(), scrollers: Vec::new() }
+        Layout {
+            rects: Vec::new(),
+            clips: Vec::new(),
+            scrollers: Vec::new(),
+            grids: Vec::new(),
+        }
     }
 
     /// The innermost node at a point that an agent or a human could act on.
@@ -659,9 +805,10 @@ impl Layout {
 pub struct Ephemeral<'a> {
     /// Offsets down, one per scroll container.
     pub scroll: &'a mut HashMap<String, i32>,
-    /// Offsets across, which only a table has.
+    /// Offsets across, which only a spreadsheet has.
     pub scroll_x: &'a mut HashMap<String, i32>,
-    /// Column widths the human dragged.
+    /// Column widths the human dragged, keyed by the element and the column's
+    /// number in it.
     pub columns: &'a HashMap<String, i32>,
     /// Where the last right-press landed, while it still stands. An open menu
     /// hangs from here, which is what makes a context menu appear under the
@@ -683,8 +830,12 @@ pub fn layout_chrome(
 ) -> Layout {
     let mut across = HashMap::new();
     let columns = HashMap::new();
-    let mut state =
-        Ephemeral { scroll, scroll_x: &mut across, columns: &columns, context_at: None };
+    let mut state = Ephemeral {
+        scroll,
+        scroll_x: &mut across,
+        columns: &columns,
+        context_at: None,
+    };
     layout(fonts, doc, frame, &mut state)
 }
 
@@ -723,6 +874,7 @@ pub fn layout(fonts: &Fonts, doc: &Document, frame: &Frame, state: &mut Ephemera
         rects: vec![Rect::new(0, 0, 0, 0); count],
         clips: vec![bounds; count],
         scrollers: Vec::new(),
+        grids: Vec::new(),
     };
 
     match frame {
@@ -731,6 +883,7 @@ pub fn layout(fonts: &Fonts, doc: &Document, frame: &Frame, state: &mut Ephemera
     }
 
     Layout {
+        grids: placer.grids,
         rects: placer.rects,
         clips: placer.clips,
         scrollers: placer.scrollers,
@@ -831,15 +984,11 @@ fn measure(fonts: &Fonts, tree: &Tree, index: usize, width: i32) -> i32 {
         // however large the sheet is; `grow` is how one asks for the room to
         // show more, and the row count it reports is what the bar is drawn
         // against.
-        Tag::Table => {
-            let row = control_height(fonts, tree, index);
-            let header = if tree.columns(index).is_empty() { 0 } else { row };
-            let body = (tree.rows(index).len() as i32).max(1) * row;
-            header + body
-        }
-        // Rows and cells are placed by their table, which knows the grid;
-        // asking them how tall they would like to be is meaningless.
-        Tag::Row | Tag::Cell | Tag::Column => 0,
+        // A grid is as tall as there is room for it. It has no children to
+        // measure and no natural height of its own: what it shows is however
+        // much of the sheet fits, so a window opens with a screenful and
+        // `grow` is how one asks for more.
+        Tag::Spreadsheet => control_height(fonts, tree, index) * (SHEET_ROWS_MIN + 1),
         // Options take no room in the flow: they float below their dropdown
         // while it is open and are nowhere while it is not.
         Tag::Option => 0,
@@ -949,6 +1098,7 @@ struct Placer<'a> {
     rects: Vec<Rect>,
     clips: Vec<Rect>,
     scrollers: Vec<Scroller>,
+    grids: Vec<Grid>,
 }
 
 impl Placer<'_> {
@@ -1153,8 +1303,8 @@ impl Placer<'_> {
             return;
         }
 
-        if tag == Tag::Table {
-            self.place_table(index, inner, inside);
+        if tag == Tag::Spreadsheet {
+            self.place_sheet(index, inner, inside);
             return;
         }
 
@@ -1271,133 +1421,119 @@ impl Placer<'_> {
     /// sent.
     ///
     /// Two axes with two different owners, which is the whole of the design.
-    /// Across is the compositor's, an offset over columns that are all
-    /// present in the tree, and it works exactly as a scroll container does.
-    /// Down is the application's: the `row` children *are* the window,
-    /// `first-row` says which row the first of them is, and `rows` says how
-    /// many exist. Nothing here translates rows by an offset, because the
-    /// rows to show are not the compositor's to choose. The bar is drawn
-    /// against the whole sheet and dragging it asks the application for a
-    /// different window, the way pressing a dropdown asks it to open.
+    /// A spreadsheet: a header of column letters, a gutter of row numbers,
+    /// and a grid of cells that are not nodes.
     ///
-    /// That split is what lets ten thousand rows cost a tree of forty.
-    fn place_table(&mut self, index: usize, area: Rect, clip: Rect) {
-        // The document reference is copied out so that reading the tree and
-        // writing the rectangles are borrows of different things.
+    /// Nothing here is placed in the arena except the element itself. What
+    /// comes out instead is one [`Grid`], which is arithmetic: where a cell is
+    /// and which cell a point is over are both computed from it, by painting
+    /// and by hit testing, from the same numbers. That is what makes a sheet
+    /// of a million cells cost the same as a sheet of ten.
+    fn place_sheet(&mut self, index: usize, area: Rect, clip: Rect) {
         let doc = self.doc;
         let tree = &doc.tree;
+        let node = tree.node(index);
 
-        let columns = tree.columns(index);
-        let rows = tree.rows(index);
+        let source = node.attr("source").unwrap_or_default().to_owned();
         let row_h = control_height(self.fonts, tree, index);
-        let header_h = if columns.is_empty() { 0 } else { row_h };
-        let gutter = gutter_width(self.fonts, tree, index);
+        let number = |name: &str, fallback: u32| {
+            node.attr(name).and_then(|value| value.parse::<u32>().ok()).unwrap_or(fallback)
+        };
+        // Bounded, because these are numbers a client chose and the arithmetic
+        // below runs per frame. A sheet wider than this is not a sheet.
+        let rows = number("rows", 1).clamp(1, MAX_SHEET_SIDE);
+        let columns = number("columns", 1).clamp(1, MAX_SHEET_SIDE);
 
-        let widths: Vec<i32> = columns
-            .iter()
-            .map(|&column| {
-                let dragged = self.columns.get(doc.key(column)).copied();
-                column_width(self.fonts, tree, column, dragged)
-            })
-            .collect();
-        let total_w: i32 = widths.iter().sum();
+        // The gutter is as wide as the largest row number it will ever show,
+        // so it does not change width as the sheet is scrolled.
+        let label_style = Style { size: style_at(tree, index).size * 0.9, ..style_at(tree, index) };
+        let gutter_w = self.fonts.measure(&rows.to_string(), &label_style) + control_pad() * 2;
+        let width = character_width(self.fonts, tree, index) * DEFAULT_COLUMN_CHARS
+            + control_pad() * 2;
+
+        let key = doc.key(index).to_owned();
+        let wide: Vec<(u32, i32)> = {
+            let mut wide: Vec<(u32, i32)> = self
+                .columns
+                .iter()
+                .filter_map(|(at, &w)| {
+                    let column = at.strip_prefix(&format!("{key}#"))?.parse::<u32>().ok()?;
+                    (column < columns).then_some((column, w))
+                })
+                .collect();
+            wide.sort_unstable();
+            wide
+        };
 
         self.rects[index] = area;
         self.clips[index] = clip;
 
-        let body = Rect::new(area.x, area.y + header_h, area.w, (area.h - header_h).max(0));
-        let across = Rect::new(area.x + gutter, area.y, (area.w - gutter).max(0), area.h);
-        let empty = Rect::new(area.x, area.y, 0, 0);
+        let header = Rect::new(area.x + gutter_w, area.y, (area.w - gutter_w).max(0), row_h);
+        let body = Rect::new(
+            area.x + gutter_w,
+            area.y + row_h,
+            (area.w - gutter_w).max(0),
+            (area.h - row_h).max(0),
+        );
+        let gutter = Rect::new(area.x, area.y + row_h, gutter_w, body.h);
 
-        // Across: ours, and clamped here because only layout knows how wide
-        // the columns turned out to be.
-        let key = doc.key(index).to_owned();
-        let furthest_x = (total_w - across.w).max(0);
-        let offset_x = self.scroll_x.get(&key).copied().unwrap_or(0).clamp(0, furthest_x);
-        self.scroll_x.insert(key, offset_x);
-
-        // Down: theirs. A sheet cannot be smaller than the window it sent.
-        let sent = rows.len() as i32;
-        let total_rows = tree
-            .node(index)
-            .attr("rows")
-            .and_then(|value| value.parse::<i32>().ok())
-            .unwrap_or(sent)
-            .max(sent);
-        let first_row = tree
-            .node(index)
-            .attr("first-row")
-            .and_then(|value| value.parse::<i32>().ok())
-            .unwrap_or(0)
-            .clamp(0, (total_rows - sent).max(0));
-
-        self.scrollers.push(Scroller {
+        let mut grid = Grid {
             node: index,
-            content: total_rows * row_h,
-            viewport: body.h,
-            offset: first_row * row_h,
-            horizontal: false,
-            asks: true,
-            step: row_h,
-        });
-        if total_w > across.w {
+            source,
+            body,
+            header,
+            gutter,
+            row_h,
+            rows,
+            columns,
+            offset: (0, 0),
+            width,
+            wide,
+        };
+
+        // Both offsets are the compositor's, and both are clamped here
+        // because only layout knows how big the content turned out to be.
+        let (content_w, content_h) = grid.content();
+        let across = self
+            .scroll_x
+            .get(&key)
+            .copied()
+            .unwrap_or(0)
+            .clamp(0, (content_w - body.w).max(0));
+        let down = self
+            .scroll
+            .get(&key)
+            .copied()
+            .unwrap_or(0)
+            .clamp(0, (content_h - body.h).max(0));
+        self.scroll_x.insert(key.clone(), across);
+        self.scroll.insert(key, down);
+        grid.offset = (across, down);
+
+        if content_h > body.h {
             self.scrollers.push(Scroller {
                 node: index,
-                content: total_w,
-                viewport: across.w,
-                offset: offset_x,
+                content: content_h,
+                viewport: body.h,
+                offset: down,
+                horizontal: false,
+                permanent: true,
+                step: row_h,
+            });
+        }
+        if content_w > body.w {
+            self.scrollers.push(Scroller {
+                node: index,
+                content: content_w,
+                viewport: body.w,
+                offset: across,
                 horizontal: true,
-                asks: false,
-                step: 1,
+                permanent: false,
+                step: width,
             });
         }
 
-        let header_clip = Rect::new(across.x, area.y, across.w, header_h)
-            .intersect(&clip)
-            .unwrap_or(empty);
-        let body_clip = body.intersect(&clip).unwrap_or(empty);
-        let cell_clip = Rect::new(across.x, body.y, across.w, body.h)
-            .intersect(&clip)
-            .unwrap_or(empty);
-
-        let left = area.x + gutter - offset_x;
-        let mut x = left;
-        for (at, &column) in columns.iter().enumerate() {
-            self.rects[column] = Rect::new(x, area.y, widths[at], header_h);
-            self.clips[column] = header_clip;
-            x += widths[at];
-        }
-
-        // Rows run from the top of the body, one after another. Any that fall
-        // past the bottom get rectangles outside the clip, which is exactly
-        // what an out-of-view node is everywhere else in the system: not
-        // painted, not hit, not reachable by an intent.
-        let mut y = body.y;
-        for &row in &rows {
-            self.rects[row] = Rect::new(area.x, y, area.w, row_h);
-            self.clips[row] = body_clip;
-            let mut cx = left;
-            for (at, &cell) in tree.cells(row).iter().enumerate() {
-                // A cell past the last declared column takes the width of the
-                // last one, or a default when a table declared no columns at
-                // all. Zero would be a cell nobody could see or reach, which
-                // is a silent hole rather than an answer: what the
-                // application got wrong is the header, and the way to say so
-                // is to draw the cell it forgot to name.
-                let width = widths
-                    .get(at)
-                    .copied()
-                    .or_else(|| widths.last().copied())
-                    .unwrap_or_else(|| {
-                        character_width(self.fonts, tree, index) * DEFAULT_COLUMN_CHARS
-                            + control_pad() * 2
-                    });
-                self.rects[cell] = Rect::new(cx, y, width, row_h);
-                self.clips[cell] = cell_clip;
-                cx += width;
-            }
-            y += row_h;
-        }
+        self.grids.push(grid);
     }
 
     /// Content is laid out at its natural height and translated up by the offset,
@@ -1437,7 +1573,7 @@ impl Placer<'_> {
             viewport: inner.h,
             offset,
             horizontal: false,
-            asks: false,
+            permanent: false,
             step: 1,
         });
 
@@ -1648,19 +1784,12 @@ fn wanted_width(fonts: &Fonts, tree: &Tree, index: usize) -> i32 {
             natural_width(fonts, tree, index)
         }
         Tag::Option => 0,
-        // Everything the grid needs across: the row-label gutter plus every
-        // column. Wider than a window often is, which is what the horizontal
-        // bar is for; `document_width` is clamped to the workspace anyway.
-        Tag::Table => {
-            let gutter = gutter_width(fonts, tree, index);
-            let columns: i32 = tree
-                .columns(index)
-                .into_iter()
-                .map(|column| column_width(fonts, tree, column, None))
-                .sum();
-            gutter + columns
+        // A screenful of columns, not the whole sheet: a grid is wider than
+        // any window and the bar across the bottom is what says so.
+        Tag::Spreadsheet => {
+            (character_width(fonts, tree, index) * DEFAULT_COLUMN_CHARS + control_pad() * 2)
+                * SHEET_COLUMNS_MIN
         }
-        Tag::Row | Tag::Cell | Tag::Column => 0,
         Tag::MenuItem => 0,
         Tag::Menu | Tag::Tab | Tag::Tabs => natural_width(fonts, tree, index),
         Tag::HStack => {
@@ -1752,53 +1881,19 @@ fn natural_width(fonts: &Fonts, tree: &Tree, index: usize) -> i32 {
         // A text entry that is not told to grow is the width of a search box:
         // room for a sentence, which is what one in a row is for.
         Tag::Field | Tag::Editor => sc(260),
-        Tag::Table => wanted_width(fonts, tree, index),
-        Tag::Row | Tag::Cell | Tag::Column => 0,
+        Tag::Spreadsheet => wanted_width(fonts, tree, index),
         _ => sc(160),
     }
 }
-
-/// How wide one column is: what it declared, in characters, or a default.
-///
-/// Characters rather than pixels, because a column width is a property of the
-/// data in it and a pixel count would be a different column on a different
-/// display. `dragged` is what the human pulled it to, which wins over both.
-pub fn column_width(fonts: &Fonts, tree: &Tree, column: usize, dragged: Option<i32>) -> i32 {
-    if let Some(width) = dragged {
-        return width.max(character_width(fonts, tree, column) * MIN_COLUMN_CHARS);
-    }
-    let chars = tree
-        .node(column)
-        .attr("chars")
-        .and_then(|value| value.parse::<i32>().ok())
-        .unwrap_or(DEFAULT_COLUMN_CHARS)
-        .clamp(MIN_COLUMN_CHARS, 200);
-    character_width(fonts, tree, column) * chars + control_pad() * 2
-}
-
 /// The width of one character in a node's own style. A digit's, because a
 /// spreadsheet column is mostly numbers and `0` is a fair average anyway.
 fn character_width(fonts: &Fonts, tree: &Tree, index: usize) -> i32 {
     fonts.measure("0", &style_at(tree, index)).max(1)
 }
 
-/// The frozen strip down a table's left, holding row labels.
-///
-/// Zero when no row carries a label, so a plain table has no gutter at all
-/// and a spreadsheet, whose rows are all numbered, gets one sized to the
-/// widest number it is currently showing.
-pub fn gutter_width(fonts: &Fonts, tree: &Tree, table: usize) -> i32 {
-    let style = style_at(tree, table);
-    let widest = tree
-        .rows(table)
-        .into_iter()
-        .filter_map(|row| tree.node(row).attr("label"))
-        .map(|label| fonts.measure(label, &style))
-        .max();
-    match widest {
-        Some(width) => width + control_pad() * 2,
-        None => 0,
-    }
+/// The narrowest a dragged column may be made.
+pub fn column_floor(fonts: &Fonts, tree: &Tree, index: usize) -> i32 {
+    character_width(fonts, tree, index) * MIN_COLUMN_CHARS
 }
 
 /// Break text into lines no wider than `width`, at spaces where possible.
@@ -1873,12 +1968,12 @@ fn paint_selection(
 pub fn paint(
     canvas: &mut Canvas,
     fonts: &Fonts,
-    images: &Images,
+    content: &Content,
     tree: &Tree,
     layout: &Layout,
     focus: &Focus,
 ) {
-    paint_subtree(canvas, fonts, images, tree, layout, Tree::ROOT, focus);
+    paint_subtree(canvas, fonts, content, tree, layout, Tree::ROOT, focus);
 }
 
 /// Paint one branch of a document.
@@ -1890,13 +1985,13 @@ pub fn paint(
 pub fn paint_subtree(
     canvas: &mut Canvas,
     fonts: &Fonts,
-    images: &Images,
+    content: &Content,
     tree: &Tree,
     layout: &Layout,
     index: usize,
     focus: &Focus,
 ) {
-    paint_node(canvas, fonts, images, tree, layout, index, focus);
+    paint_node(canvas, fonts, content, tree, layout, index, focus);
 
     // The floating options of an open dropdown are painted by a popup pass
     // after everything else, which for a whole document happens in the
@@ -1908,7 +2003,7 @@ pub fn paint_subtree(
     if index != Tree::ROOT {
         for select in tree.open_overlays() {
             if tree.within(select, index) {
-                paint_popup(canvas, fonts, images, tree, layout, select, focus);
+                paint_popup(canvas, fonts, content, tree, layout, select, focus);
             }
         }
     }
@@ -1966,10 +2061,10 @@ pub fn scrollbar_geometry(rect: Rect, scroller: &Scroller) -> Option<(Rect, Rect
 fn paint_scrollbar(canvas: &mut Canvas, layout: &Layout, index: usize, lit: Option<usize>) {
     for scroller in layout.scrollers.iter().filter(|s| s.node == index) {
         // A scroll container's bar appears while its content is moving and
-        // leaves after. A table's stays: how much sheet there is below the
-        // window is something a spreadsheet has to say all the time, and it
+        // leaves after. A grid's stays: how much sheet there is below the
+        // screen is something a spreadsheet has to say all the time, and it
         // is the only thing saying it.
-        if !scroller.asks && !scroller.horizontal && lit != Some(index) {
+        if !scroller.permanent && !scroller.horizontal && lit != Some(index) {
             continue;
         }
         let Some((track, thumb)) = scrollbar_geometry(layout.rects[index], scroller) else {
@@ -1986,7 +2081,7 @@ fn paint_scrollbar(canvas: &mut Canvas, layout: &Layout, index: usize, lit: Opti
 fn paint_popup(
     canvas: &mut Canvas,
     fonts: &Fonts,
-    images: &Images,
+    content: &Content,
     tree: &Tree,
     layout: &Layout,
     select: usize,
@@ -2010,7 +2105,7 @@ fn paint_popup(
         canvas.stroke_round_rect(panel, radius_control(), 1, border());
     });
     for &option in options {
-        paint_node(canvas, fonts, images, tree, layout, option, focus);
+        paint_node(canvas, fonts, content, tree, layout, option, focus);
     }
 }
 
@@ -2074,7 +2169,7 @@ fn footprint(tag: Tag, rect: Rect, clip: Rect) -> Rect {
 fn paint_node(
     canvas: &mut Canvas,
     fonts: &Fonts,
-    images: &Images,
+    content: &Content,
     tree: &Tree,
     layout: &Layout,
     index: usize,
@@ -2178,7 +2273,7 @@ fn paint_node(
         // A picture, fitted to cover its rectangle. A source that cannot be
         // loaded leaves the words meant for an agent: the alt text, muted, so a
         // broken path is visible on screen rather than a silent hole.
-        Tag::Image => match node.attr("src").and_then(|src| images.get(src, rect.w, rect.h)) {
+        Tag::Image => match node.attr("src").and_then(|src| content.images.get(src, rect.w, rect.h)) {
             Some(bitmap) => canvas.blit(&bitmap, rect.x, rect.y),
             None => {
                 canvas.fill_rect(rect, surface());
@@ -2234,7 +2329,7 @@ fn paint_node(
             let label = label_of(node);
             let icon = node
                 .attr("icon")
-                .and_then(|name| images.icons.get(name, if node.flag("tile") { tile_icon() } else { button_icon() }));
+                .and_then(|name| content.images.icons.get(name, if node.flag("tile") { tile_icon() } else { button_icon() }));
             // A named glyph the compositor draws, for chrome-shaped buttons
             // whose meaning is a shape rather than a word: the pane's send
             // and stop. Compositor-internal like `width`; never an agent's
@@ -2441,56 +2536,186 @@ fn paint_node(
         // rather than by each row because it is one strip that happens to
         // hold one label per row, and because a row does not know how wide it
         // is: that is a property of the table's widest label.
-        Tag::Table => {
+        // A grid, drawn from the sheet the element points at. Nothing here
+        // is a node: the geometry comes from the one `Grid` layout produced
+        // and the values from the stream the application published, so a
+        // screenful costs a screenful whatever the sheet is.
+        Tag::Spreadsheet => {
+            let Some(grid) = layout.grids.iter().find(|grid| grid.node == index) else {
+                return;
+            };
+            let sheet = content.sheets.get(&grid.source);
+            let cursor = node.attr("cursor").and_then(sheet::parse);
+            let run = node.attr("selection").and_then(sheet::parse_range);
+            // What is being typed wins over what was published: the local copy
+            // is the one the human is changing, and it becomes the published
+            // one when the application echoes it back.
+            let editing = focus
+                .cell
+                .as_ref()
+                .filter(|(at, _)| focused && Some(*at) == cursor)
+                .map(|(_, value)| value.as_str());
+            let ((first_column, first_row), (last_column, last_row)) = grid.visible();
+            let numbers = Style { size: style.size * 0.9, ..style };
+
             canvas.fill_rect(rect, background());
-            let gutter = gutter_width(fonts, tree, index);
-            if gutter > 0 {
-                let strip = Rect::new(rect.x, rect.y, gutter, rect.h);
-                canvas.fill_round_rect_vgrad(strip, 0, lift(surface(), 4), surface());
-                let label_style = Style { size: style.size * 0.9, ..style };
-                for row in tree.rows(index) {
-                    let Some(label) = tree.node(row).attr("label") else { continue };
-                    let at = layout.rects[row];
-                    // Only the rows actually on screen: the rest were placed
-                    // past the bottom of the body and clipped away.
-                    if at.y + at.h <= rect.y || at.y >= rect.y + rect.h {
-                        continue;
+
+            // The cells, then the lines between them, then what is chosen on
+            // top: a run painted behind the words the way a text selection is.
+            canvas.clipped(grid.body.intersect(&clip).unwrap_or(grid.body), |canvas| {
+                for row in first_row..=last_row {
+                    for column in first_column..=last_column {
+                        let at = (column, row);
+                        let box_ = grid.cell_rect(at);
+                        let chosen = run.is_some_and(|((x0, y0), (x1, y1))| {
+                            (x0..=x1).contains(&column) && (y0..=y1).contains(&row)
+                        });
+                        if chosen {
+                            canvas.fill_rect(box_, selected());
+                        }
+                        canvas.fill_rect(
+                            Rect::new(box_.x + box_.w - 1, box_.y, 1, box_.h),
+                            border(),
+                        );
+                        canvas.fill_rect(
+                            Rect::new(box_.x, box_.y + box_.h - 1, box_.w, 1),
+                            border(),
+                        );
+                        // The cell being typed into is drawn last, over its
+                        // neighbours and as wide as its contents.
+                        if editing.is_some() && Some(at) == cursor {
+                            continue;
+                        }
+                        let Some(value) = sheet.and_then(|s| s.get(at)) else {
+                            continue;
+                        };
+                        canvas.clipped(box_.inset(1), |cell| {
+                            cell.draw_text(
+                                fonts,
+                                value,
+                                box_.x + control_pad(),
+                                box_.y + (box_.h - fonts.line_height(&style)) / 2,
+                                &style,
+                                ink,
+                            );
+                        });
                     }
-                    let width = fonts.measure(label, &label_style);
+                }
+
+                // The cell being typed into, over everything: a box as wide as
+                // what is in it, so a value longer than its column can be read
+                // and edited rather than trimmed at the column's edge. What
+                // every spreadsheet does, and the reason it can be done here
+                // is that the box is the compositor's own copy rather than a
+                // node with a rectangle somebody else decided.
+                if let (Some(value), Some(at)) = (editing, cursor) {
+                    let box_ = grid.cell_rect(at);
+                    let step = fonts.line_height(&style);
+                    let wanted = fonts.measure(value, &style) + control_pad() * 2 + sc(4);
+                    let box_ = Rect::new(
+                        box_.x,
+                        box_.y,
+                        box_.w.max(wanted).min((grid.body.x + grid.body.w - box_.x).max(box_.w)),
+                        box_.h,
+                    );
+                    let left = box_.x + control_pad();
+                    let top = box_.y + (box_.h - step) / 2;
+                    canvas.fill_rect(box_, background());
+                    canvas.clipped(box_.inset(1), |cell| {
+                        if let Some(range) = selection(focus) {
+                            paint_selection(
+                                cell,
+                                fonts,
+                                value,
+                                &style,
+                                TextBox { left, top, step },
+                                range,
+                            );
+                        }
+                        cell.draw_text(fonts, value, left, top, &style, ink);
+                        if focus.caret_visible {
+                            let column = focus.caret.min(value.chars().count());
+                            let caret = left + fonts.measure(prefix(value, column), &style);
+                            cell.fill_rect(Rect::new(caret, top, sc(2).max(2), step), accent());
+                        }
+                    });
+                    canvas.stroke_rect(box_, sc(2).max(2), accent());
+                } else if let Some(at) = cursor {
+                    // The cursor when nothing is being typed: a ring rather
+                    // than a fill, so which cell is current and which cells
+                    // are chosen stay two visibly different things.
+                    canvas.stroke_rect(grid.cell_rect(at), sc(2).max(2), accent());
+                }
+            });
+
+            // The column letters. Frozen: they do not scroll down, and the
+            // cursor's column is lit so a wide sheet still says where you are.
+            canvas.clipped(grid.header.intersect(&clip).unwrap_or(grid.header), |canvas| {
+                canvas.fill_round_rect_vgrad(grid.header, 0, lift(raised(), 6), raised());
+                for column in first_column..=last_column {
+                    let box_ = Rect::new(
+                        grid.body.x + grid.column_x(column) - grid.offset.0,
+                        grid.header.y,
+                        grid.column_w(column),
+                        grid.header.h,
+                    );
+                    if cursor.is_some_and(|(at, _)| at == column) {
+                        canvas.fill_rect(box_, selected());
+                    }
+                    canvas.fill_rect(Rect::new(box_.x + box_.w - 1, box_.y, 1, box_.h), border());
+                    let label = sheet::column_name(column);
+                    let width = fonts.measure(&label, &style);
                     canvas.draw_text(
                         fonts,
-                        label,
-                        strip.x + (gutter - width) / 2,
-                        at.y + (at.h - fonts.line_height(&label_style)) / 2,
-                        &label_style,
+                        &label,
+                        box_.x + ((box_.w - width) / 2).max(control_pad()),
+                        grid.header.y + (grid.header.h - fonts.line_height(&style)) / 2,
+                        &style,
+                        text(),
+                    );
+                }
+            });
+
+            // The row numbers, frozen the other way.
+            canvas.clipped(grid.gutter.intersect(&clip).unwrap_or(grid.gutter), |canvas| {
+                canvas.fill_round_rect_vgrad(grid.gutter, 0, lift(surface(), 4), surface());
+                for row in first_row..=last_row {
+                    let top = grid.body.y + row as i32 * grid.row_h - grid.offset.1;
+                    if cursor.is_some_and(|(_, at)| at == row) {
+                        canvas.fill_rect(
+                            Rect::new(grid.gutter.x, top, grid.gutter.w, grid.row_h),
+                            selected(),
+                        );
+                    }
+                    let label = (row + 1).to_string();
+                    let width = fonts.measure(&label, &numbers);
+                    canvas.draw_text(
+                        fonts,
+                        &label,
+                        grid.gutter.x + (grid.gutter.w - width) / 2,
+                        top + (grid.row_h - fonts.line_height(&numbers)) / 2,
+                        &numbers,
                         muted(),
                     );
                 }
-                canvas.fill_rect(Rect::new(rect.x + gutter - 1, rect.y, 1, rect.h), border());
-            }
-            canvas.stroke_round_rect(rect, radius_small(), 1, border());
-        }
+            });
 
-        // One heading over one column, on the raised surface every header in
-        // the system wears.
-        Tag::Column => {
-            if node.flag("selected") {
-                canvas.fill_rect(rect, selected());
-            } else {
-                canvas.fill_round_rect_vgrad(rect, 0, lift(raised(), 6), raised());
-            }
-            canvas.fill_rect(Rect::new(rect.x + rect.w - 1, rect.y, 1, rect.h), border());
-            canvas.fill_rect(Rect::new(rect.x, rect.y + rect.h - 1, rect.w, 1), border());
-            let label = label_of(node);
-            let width = fonts.measure(label, &style);
-            canvas.draw_text(
-                fonts,
-                label,
-                rect.x + ((rect.w - width) / 2).max(control_pad()),
-                centred(rect.h),
-                &style,
-                if disabled { muted() } else { text() },
+            // The corner where the two frozen strips meet, and the edges.
+            canvas.fill_round_rect_vgrad(
+                Rect::new(rect.x, rect.y, grid.gutter.w, grid.header.h),
+                0,
+                lift(raised(), 6),
+                raised(),
             );
+            canvas.fill_rect(
+                Rect::new(rect.x + grid.gutter.w - 1, rect.y, 1, rect.h),
+                border(),
+            );
+            canvas.fill_rect(
+                Rect::new(rect.x, rect.y + grid.header.h - 1, rect.w, 1),
+                border(),
+            );
+            canvas.stroke_round_rect(rect, radius_small(), 1, border());
         }
 
         // A menu: a label you press, or nothing at all. An unlabelled one is
@@ -2610,42 +2835,6 @@ fn paint_node(
             }
         }
 
-        Tag::Row => {
-            if node.flag("selected") {
-                canvas.fill_rect(rect, selected());
-            }
-            canvas.fill_rect(Rect::new(rect.x, rect.y + rect.h - 1, rect.w, 1), border());
-        }
-
-        // One cell. The ring around the focused one is the grid's cursor, and
-        // it is drawn rather than filled so that what is selected and what is
-        // being typed into stay two visibly different things.
-        Tag::Cell => {
-            if node.flag("selected") {
-                canvas.fill_rect(rect, selected());
-            }
-            canvas.fill_rect(Rect::new(rect.x + rect.w - 1, rect.y, 1, rect.h), border());
-
-            let value = value_of(node);
-            let x = rect.x + control_pad();
-            let step = fonts.line_height(&style);
-            let top = centred(rect.h);
-            canvas.clipped(rect.inset(1), |inner| {
-                if focused && let Some(range) = selection(focus) {
-                    paint_selection(inner, fonts, &value, &style, TextBox { left: x, top, step }, range);
-                }
-                inner.draw_text(fonts, &value, x, top, &style, ink);
-                if focused && focus.caret_visible && node.flag("editable") {
-                    let column = focus.caret.min(value.chars().count());
-                    let caret_x = x + fonts.measure(prefix(&value, column), &style);
-                    inner.fill_rect(Rect::new(caret_x, top, sc(2).max(2), step), accent());
-                }
-            });
-            if focused {
-                canvas.stroke_rect(rect, sc(2).max(2), accent());
-            }
-        }
-
         // Pure arrangement draws nothing at all.
         Tag::VStack | Tag::HStack | Tag::Scroll => {}
     });
@@ -2657,7 +2846,7 @@ fn paint_node(
     if node.tag == Tag::Window {
         for &child in &node.children {
             if tree.node(child).tag != Tag::Dialog {
-                paint_node(canvas, fonts, images, tree, layout, child, focus);
+                paint_node(canvas, fonts, content, tree, layout, child, focus);
             }
         }
         let dialogs: Vec<usize> =
@@ -2666,20 +2855,20 @@ fn paint_node(
             canvas.clipped(clip, |canvas| canvas.dim(rect, 96));
         }
         for child in dialogs {
-            paint_node(canvas, fonts, images, tree, layout, child, focus);
+            paint_node(canvas, fonts, content, tree, layout, child, focus);
         }
         for select in tree.open_overlays() {
-            paint_popup(canvas, fonts, images, tree, layout, select, focus);
+            paint_popup(canvas, fonts, content, tree, layout, select, focus);
         }
     } else if node.tag == Tag::Select {
         // Options are painted by the popup pass, not here.
     } else {
         for &child in &node.children {
-            paint_node(canvas, fonts, images, tree, layout, child, focus);
+            paint_node(canvas, fonts, content, tree, layout, child, focus);
         }
     }
 
-    if matches!(node.tag, Tag::Scroll | Tag::Table) {
+    if matches!(node.tag, Tag::Scroll | Tag::Spreadsheet) {
         canvas.clipped(clip, |canvas| paint_scrollbar(canvas, layout, index, focus.scrollbar));
     }
 }
@@ -2928,211 +3117,54 @@ mod tests {
     }
 
     const SHEET: &str = r#"<window title="Sheet" pad="none">
-        <table id="sheet" rows="1000" first-row="0" description="The grid">
-          <column label="A" chars="8"/>
-          <column label="B" chars="8"/>
-          <row label="1"><cell id="A1" value="one"/><cell id="B1" value="two"/></row>
-          <row label="2"><cell id="A2" value="three"/><cell id="B2" value="four"/></row>
-        </table>
+        <spreadsheet id="sheet" grow="true" source="book" version="1" rows="1000"
+                     columns="26" cursor="A1" description="The grid"/>
       </window>"#;
 
-    /// The grid's shape: a header across the top, a gutter down the left, and
-    /// cells that line up with the columns they belong to.
+    /// A grid has no nodes in it. What layout produces is one record of
+    /// arithmetic, and everything else — painting, hit testing, the fake
+    /// cursor — reads its cells out of that rather than out of the arena.
     #[test]
-    fn a_table_places_a_header_a_gutter_and_its_rows() {
+    fn a_spreadsheet_is_geometry_rather_than_nodes() {
         let area = Rect::new(0, 0, 400, 300);
         let (doc, layout) = placed(SHEET, area);
-        let column_a = doc.index_of("#sheet").map(|table| doc.tree.columns(table)[0]).unwrap();
-        let a1 = doc.index_of("#A1").unwrap();
-        let a2 = doc.index_of("#A2").unwrap();
-        let b1 = doc.index_of("#B1").unwrap();
+        let index = doc.index_of("#sheet").expect("the grid");
 
-        let header = layout.rect_of(column_a);
-        let first = layout.rect_of(a1);
-        let second = layout.rect_of(a2);
+        // Four elements: the window, the grid, and nothing per cell.
+        assert_eq!(doc.tree.nodes.len(), 2, "a grid put nodes in the tree");
+        let grid = layout.grids.iter().find(|grid| grid.node == index).expect("one grid");
+        assert_eq!(grid.source, "book");
+        assert_eq!(grid.rows, 1000);
+        assert_eq!(grid.columns, 26);
 
-        // The header sits above the rows, and the rows below it in order.
-        assert!(header.y < first.y, "header {header:?} is not above {first:?}");
-        assert_eq!(first.h, second.h, "rows are not one height");
-        assert_eq!(second.y, first.y + first.h, "rows are not stacked");
+        // The header is across the top and the gutter down the left, and the
+        // cells begin where the two of them stop.
+        assert_eq!(grid.header.y, area.y, "the header is not at the top");
+        assert_eq!(grid.gutter.x, area.x, "the gutter is not at the left");
+        assert_eq!(grid.body.x, grid.gutter.x + grid.gutter.w);
+        assert_eq!(grid.body.y, grid.header.y + grid.header.h);
 
-        // A cell is under its own column, and the next column is to its right.
-        assert_eq!(first.x, header.x, "the cell is not under its column");
-        assert!(layout.rect_of(b1).x > first.x, "column B is not right of A");
+        // A point in the body is the cell it looks like it is in, and a cell
+        // is where the hit test says it is: one set of numbers, both ways.
+        let a1 = grid.cell_rect((0, 0));
+        assert_eq!(grid.cell_at(a1.x + 2, a1.y + 2), Some((0, 0)));
+        let c3 = grid.cell_rect((2, 2));
+        assert_eq!(grid.cell_at(c3.x + 2, c3.y + 2), Some((2, 2)));
+        assert_eq!(c3.x, a1.x + grid.column_w(0) + grid.column_w(1));
+        assert_eq!(c3.y, a1.y + grid.row_h * 2);
 
-        // The gutter is real: the row labels pushed the first column right of
-        // the table's own left edge.
-        assert!(header.x > area.x, "no gutter was reserved");
-    }
+        // Above the body is the header, not a cell.
+        assert_eq!(grid.cell_at(a1.x + 2, grid.header.y + 1), None);
 
-    /// The bar is drawn against the sheet, not against the window. This is
-    /// what lets ten thousand rows cost a tree of two.
-    #[test]
-    fn the_bar_measures_the_whole_sheet_not_the_window() {
-        let (doc, layout) = placed(SHEET, Rect::new(0, 0, 400, 300));
-        let table = doc.index_of("#sheet").unwrap();
-        let down = layout
-            .scrollers
-            .iter()
-            .find(|scroller| scroller.node == table && !scroller.horizontal)
-            .expect("a table reports its extent");
-
-        assert!(down.asks, "a table's rows are the application's to choose");
-        assert_eq!(down.content, 1000 * down.step, "the bar is not drawn against the sheet");
-        assert!(down.viewport < down.content, "a thousand rows fitted in 300 pixels");
-    }
-
-    /// A row past the bottom of the body is not visible, which is the same
-    /// thing here as anywhere else: not painted, not clickable, and an intent
-    /// naming it is refused rather than acted on.
-    #[test]
-    fn rows_past_the_bottom_are_not_reachable() {
-        let mut source = String::from(
-            r#"<window title="Sheet" pad="none">
-                 <table id="sheet" rows="100" first-row="0" description="The grid">
-                   <column label="A" chars="8"/>"#,
-        );
-        for row in 1..=40 {
-            source.push_str(&format!(
-                r#"<row label="{row}"><cell id="A{row}" value="{row}"/></row>"#
-            ));
-        }
-        source.push_str("</table></window>");
-
-        // Room for a handful of rows, and forty were sent.
-        let (doc, layout) = placed(&source, Rect::new(0, 0, 400, 120));
-        let first = doc.index_of("#A1").unwrap();
-        let last = doc.index_of("#A40").unwrap();
-        assert!(layout.is_visible(first), "the first row is not on screen");
-        assert!(!layout.is_visible(last), "the fortieth row is somehow on screen");
-    }
-
-    /// The offset across is the compositor's, and clamped by layout, because
-    /// only layout knows how wide the columns turned out to be.
-    #[test]
-    fn the_offset_across_is_clamped_to_the_columns() {
-        set_scale(1.0);
-        let fonts = Fonts::load().unwrap();
-        let doc = Document::parse(SHEET, 1).unwrap();
-        let mut down = HashMap::new();
-        let mut across = HashMap::new();
-        across.insert("#sheet".to_owned(), 100_000);
-        let columns = HashMap::new();
-        let mut state = Ephemeral {
-            scroll: &mut down,
-            scroll_x: &mut across,
-            columns: &columns,
-            context_at: None,
-        };
-        {
-            // Scoped, so the borrow ends before the map is read back.
-            let _ = layout(&fonts, &doc, &Frame::Whole(Rect::new(0, 0, 400, 300)), &mut state);
-        }
-        let held = across.get("#sheet").copied().unwrap();
-        assert!(held < 400, "an offset past the last column survived: {held}");
-    }
-
-    const STRIP: &str = r#"<window title="Sheet">
-        <vstack gap="sm" grow="true">
-          <tabs gap="sm">
-            <tab id="one" label="Sheet 1" closable="true" movable="true" selected="true" description="a"/>
-            <tab id="two" label="Sheet 2" closable="true" movable="true" description="b"/>
-            <field id="rename" value="Sheet 1" description="the name being typed"/>
-            <button id="new" label="+" description="adds one"/>
-          </tabs>
-          <text>a note</text>
-        </vstack>
-      </window>"#;
-
-    /// The band a strip paints runs to the edges of what it is clipped to,
-    /// so its tabs have to start from there too. Measured from the strip's
-    /// own box instead, an application's tabs stood a window's padding
-    /// further in than the navigation bar's, which is a margin the bar does
-    /// not have and nobody asked for.
-    #[test]
-    fn tabs_start_where_their_band_does() {
-        let (doc, layout) = placed(STRIP, Rect::new(0, 0, 600, 400));
-        let first = doc.index_of("#one").expect("the first tab");
-        assert_eq!(
-            layout.rect_of(first).x,
-            10,
-            "the first tab did not start at the band's own margin"
-        );
-    }
-
-    /// A tab is deliberately cut off at the bottom by the frame it stands in,
-    /// which is what makes it a tab rather than a button lying on a bar. A
-    /// box with a border all the way round is not, and the navigation bar's
-    /// rename field is one: it lost its bottom edge to the same clip.
-    #[test]
-    fn a_box_in_a_strip_keeps_its_bottom_edge() {
-        let (doc, layout) = placed(STRIP, Rect::new(0, 0, 600, 400));
-        let field = doc.index_of("#rename").expect("the field");
-        let rect = layout.rect_of(field);
-        let clip = layout.clips[field];
+        // Only what fits is ever walked: a thousand rows and a screenful are
+        // the same amount of painting.
+        let ((_, first), (_, last)) = grid.visible();
+        assert_eq!(first, 0);
         assert!(
-            rect.y + rect.h <= clip.y + clip.h,
-            "the field ran past what is visible: {rect:?} in {clip:?}"
+            last < 40,
+            "a screenful of a thousand-row sheet came out as {} rows",
+            last + 1
         );
-    }
-
-    /// The slot a dragged tab belongs in, which the navigation bar and an
-    /// application's strip both ask for. It holds no state on purpose: input
-    /// arrives several motions to one repaint, and every one of them has to
-    /// agree about where the tab is going.
-    #[test]
-    fn a_dragged_tab_takes_the_slot_its_pointer_is_in() {
-        let rects = [
-            Rect::new(0, 0, 100, 20),
-            Rect::new(100, 0, 100, 20),
-            Rect::new(200, 0, 100, 20),
-        ];
-        assert_eq!(tab_slot(&rects, 2, 10), 0, "carried to the front");
-        assert_eq!(tab_slot(&rects, 2, 250), 2, "left where it was");
-        assert_eq!(tab_slot(&rects, 0, 120), 0, "not past the next middle yet");
-        assert_eq!(tab_slot(&rects, 0, 160), 1, "past it now");
-    }
-
-
-    /// A window's menus are a bar across the top of it, and the content it
-    /// stacks starts underneath. The application says it has an Edit menu;
-    /// where a menu bar goes is the compositor's, exactly as where the window
-    /// goes is.
-    #[test]
-    fn a_windows_menus_are_a_bar_across_the_top_of_it() {
-        let source = r#"<window title="Sheet">
-            <menu id="edit" label="Edit" description="Commands">
-              <menuitem id="clear" label="Clear" description="Empties it"/>
-            </menu>
-            <menu id="view" label="View" description="What is shown">
-              <menuitem id="zoom" label="Zoom" description="Bigger"/>
-            </menu>
-            <text>content</text>
-          </window>"#;
-        let (doc, layout) = placed(source, Rect::new(0, 0, 600, 400));
-        let fonts = Fonts::load().unwrap();
-
-        let edit = layout.rect_of(doc.index_of("#edit").expect("the Edit menu"));
-        let view = layout.rect_of(doc.index_of("#view").expect("the View menu"));
-        let text = layout.rect_of(doc.tree.node(Tree::ROOT).children[2]);
-
-        assert_eq!(edit.y, 0, "the bar does not start at the top of the window");
-        assert_eq!(edit.h, menu_band_h(&fonts), "a menu is not the height of the bar");
-        assert_eq!(view.y, edit.y, "the menus are not in one row");
-        assert!(view.x > edit.x + edit.w - 1, "the second menu is not after the first");
-        assert!(
-            text.y >= edit.y + edit.h,
-            "the content did not start under the bar: {text:?} against {edit:?}"
-        );
-
-        // No menus, no bar: a window without one starts its content where it
-        // always did.
-        let (plain, layout) = placed(
-            r#"<window title="Sheet"><text>content</text></window>"#,
-            Rect::new(0, 0, 600, 400),
-        );
-        let only = layout.rect_of(plain.tree.node(Tree::ROOT).children[0]);
-        assert!(only.y < menu_band_h(&fonts), "a window with no menus reserved a bar anyway");
     }
 
     /// Line breaking carries a running width forward instead of measuring the
@@ -3191,12 +3223,13 @@ mod tests {
             // Cold and warm are different questions. Cold is the first time
             // a line is seen, which happens once per line ever; warm is every
             // re-render after it, which is once a second while a turn runs.
+            let sheets = Sheets::default();
             let mut lay = || {
                 let mut state = Ephemeral {
                     scroll: &mut down,
                     scroll_x: &mut across,
                     columns: &columns,
-                    context_at: None,
+                            context_at: None,
                 };
                 layout(&fonts, &doc, &Frame::Whole(area), &mut state)
             };
@@ -3211,7 +3244,7 @@ mod tests {
             let focus = Focus::default();
             let t1 = std::time::Instant::now();
             for _ in 0..10 {
-                paint(&mut canvas, &fonts, &images, &doc.tree, &layout, &focus);
+                paint(&mut canvas, &fonts, &Content { images: &images, sheets: &sheets }, &doc.tree, &layout, &focus);
             }
             let painted = t1.elapsed() / 10;
             eprintln!(

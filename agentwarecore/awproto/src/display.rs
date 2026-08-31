@@ -38,6 +38,26 @@ use crate::{Decoder, HAI_FD_ENV, encode};
 
 /// A client describing its interface.
 pub const MSG_RENDER: &str = "render";
+/// A run of cells put into one of an application's sheets.
+///
+/// `sheet <source> <version> <base> <at> <value>...`
+///
+/// The whole of the spreadsheet wire, and deliberately one shape rather than a
+/// vocabulary of operations: put these values in, starting at this cell and
+/// running across. A single cell is a run of one, a filled row is a run of
+/// many, and emptying a cell is a run carrying an empty string, because in a
+/// sheet an empty cell and a cleared one are the same cell.
+///
+/// `version` is what the sheet becomes; `base` is what it must already be for
+/// this to mean anything. A base of zero says "forget what you have for this
+/// source and start from here", which is what a snapshot is, so there is one
+/// code path rather than two. The compositor never compares one sheet with
+/// another to work out what moved: it is told, and it writes what it is told.
+pub const MSG_SHEET: &str = "sheet";
+/// `sheet-resend <source> <have>`: the compositor could not apply what it was
+/// sent and needs the sheet from the beginning. `have` is the version it holds,
+/// which is enough for an application to know how far behind it is.
+pub const MSG_SHEET_RESEND: &str = "sheet-resend";
 /// The haimanager reporting something that happened to a node.
 pub const MSG_EVENT: &str = "event";
 
@@ -85,16 +105,6 @@ pub const ACTION_CONTEXT: &str = "context";
 /// principle as one event per keystroke.
 pub const ACTION_MOVE: &str = "move";
 
-/// A table asked to move its window: the value is the row that should now be
-/// first. The application owns which rows it has sent, exactly as it owns a
-/// dropdown's `open`, and answers by re-rendering with a new `first-row`.
-///
-/// This is the one place a scroll position crosses the protocol, and it does
-/// so because it is not a scroll position: it is which slice of a thousand
-/// rows the application chose to describe. Offsets inside a `scroll`
-/// container remain the compositor's and are still never sent anywhere.
-pub const ACTION_SCROLL: &str = "scroll";
-
 /// Longest tree the haimanager will accept from one client.
 ///
 /// Far larger than the supervisor's [`crate::MAX_FRAME`], because this carries a
@@ -115,6 +125,15 @@ pub struct Event {
     pub action: String,
     /// The payload, for the actions that carry one. Empty otherwise.
     pub value: String,
+    /// Which cell of a `spreadsheet` it happened to, as `B7`. Empty for
+    /// everything else.
+    ///
+    /// A field of its own rather than folded into `target` because a
+    /// spreadsheet's cells are not nodes: there is one element with one id,
+    /// and the cell is a coordinate inside it. Joining the two into one string
+    /// would mean inventing a separator that no application's id may contain,
+    /// which is a rule nobody would remember.
+    pub cell: String,
 }
 
 impl Event {
@@ -125,6 +144,7 @@ impl Event {
             &self.target,
             &self.action,
             &self.value,
+            &self.cell,
         ])
     }
 
@@ -137,8 +157,24 @@ impl Event {
             target: fields.get(2)?.clone(),
             action: fields.get(3)?.clone(),
             value: fields.get(4).cloned().unwrap_or_default(),
+            cell: fields.get(5).cloned().unwrap_or_default(),
         })
     }
+}
+
+/// A parsed `sheet` message: the source, the version it makes, the version it
+/// applies to, the cell the run starts at, and the values.
+pub fn parse_sheet(fields: &[String]) -> Option<(&str, u64, u64, &str, &[String])> {
+    if fields.first().map(String::as_str) != Some(MSG_SHEET) {
+        return None;
+    }
+    Some((
+        fields.get(1)?.as_str(),
+        fields.get(2)?.parse().ok()?,
+        fields.get(3)?.parse().ok()?,
+        fields.get(4)?.as_str(),
+        fields.get(5..).unwrap_or(&[]),
+    ))
 }
 
 /// A parsed `render` message: the version the client stamped, and the markup.
@@ -158,6 +194,9 @@ pub struct Surface {
     stream: UnixStream,
     decoder: Decoder,
     version: u64,
+    /// Sheets the compositor could not follow and wants from the beginning.
+    /// Drained by [`Surface::resend`].
+    resend: Vec<String>,
 }
 
 impl Surface {
@@ -171,7 +210,7 @@ impl Surface {
         // SAFETY: the supervisor created this descriptor before forking us and
         // named it in our environment. Nothing else in this process owns it.
         let stream = unsafe { UnixStream::from_raw_fd(raw) };
-        Ok(Self { stream, decoder: Decoder::with_limit(MAX_TREE), version: 0 })
+        Ok(Self { stream, decoder: Decoder::with_limit(MAX_TREE), version: 0, resend: Vec::new() })
     }
 
     /// The version of the most recently sent tree.
@@ -183,6 +222,46 @@ impl Surface {
     /// replaced, and should therefore be thrown away rather than acted on.
     pub fn is_stale(&self, event: &Event) -> bool {
         event.version != self.version
+    }
+
+    fn note_resend(&mut self, fields: &[String]) {
+        if fields.first().map(String::as_str) == Some(MSG_SHEET_RESEND)
+            && let Some(source) = fields.get(1)
+        {
+            self.resend.push(source.clone());
+        }
+    }
+
+    /// Sheets the compositor has asked for from the beginning, if any.
+    ///
+    /// It asks when a run named a version it does not hold, which it cannot
+    /// apply without guessing. An application answers by publishing the whole
+    /// sheet again through [`SheetOut::restart`].
+    pub fn resend(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.resend)
+    }
+
+    /// Publish a run of cells into one of this client's sheets.
+    ///
+    /// Prefer [`SheetOut`], which owns the version so it cannot be got wrong.
+    pub fn sheet(
+        &mut self,
+        source: &str,
+        version: u64,
+        base: u64,
+        at: &str,
+        values: &[&str],
+    ) -> io::Result<()> {
+        let mut fields = vec![
+            MSG_SHEET.to_owned(),
+            source.to_owned(),
+            version.to_string(),
+            base.to_string(),
+            at.to_owned(),
+        ];
+        fields.extend(values.iter().map(|value| (*value).to_owned()));
+        let borrowed: Vec<&str> = fields.iter().map(String::as_str).collect();
+        self.stream.write_all(&encode(&borrowed))
     }
 
     /// Send the whole current interface. Returns the version it was stamped
@@ -232,7 +311,10 @@ impl Surface {
             match frame {
                 Some(fields) => match Event::from_fields(&fields) {
                     Some(event) => return Ok(Some(event)),
-                    None => continue,
+                    None => {
+                        self.note_resend(&fields);
+                        continue;
+                    }
                 },
                 None => return Ok(None),
             }
@@ -254,7 +336,10 @@ impl Surface {
             if let Some(fields) = frame {
                 match Event::from_fields(&fields) {
                     Some(event) => return Ok(Some(event)),
-                    None => continue,
+                    None => {
+                        self.note_resend(&fields);
+                        continue;
+                    }
                 }
             }
 
@@ -294,4 +379,51 @@ pub fn escape(text: &str) -> String {
         }
     }
     out
+}
+
+/// One sheet an application publishes, and the version it is up to.
+///
+/// The version is here rather than in the application because getting it
+/// wrong is the one way this protocol can go wrong: a run that names a
+/// version the compositor does not hold is refused, and a run that names the
+/// wrong one silently describes a sheet nobody has. Owning the counter means
+/// an application cannot make either mistake.
+pub struct SheetOut {
+    source: String,
+    version: u64,
+    /// Whether the next run starts the sheet over. True to begin with,
+    /// because the compositor has never heard of this sheet, and again after
+    /// a `sheet-resend`.
+    restart: bool,
+}
+
+impl SheetOut {
+    pub fn new(source: &str) -> SheetOut {
+        SheetOut { source: source.to_owned(), version: 0, restart: true }
+    }
+
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    /// The version the tree should claim. Put this on the element, and send
+    /// the cells before the tree that claims them: one connection, so the
+    /// order is the order they arrive in.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Publish a run of values, starting at `at` and running across.
+    pub fn put(&mut self, surface: &mut Surface, at: &str, values: &[&str]) -> io::Result<()> {
+        let base = if self.restart { 0 } else { self.version };
+        self.restart = false;
+        self.version += 1;
+        surface.sheet(&self.source, self.version, base, at, values)
+    }
+
+    /// Say that the next run starts the sheet over, which is what a
+    /// `sheet-resend` asks for.
+    pub fn restart(&mut self) {
+        self.restart = true;
+    }
 }

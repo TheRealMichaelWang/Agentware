@@ -332,7 +332,8 @@ impl Control {
 
         "create-desk" => {
             let prompt = arg(1).filter(|text| !text.is_empty());
-            desks.create(prompt).map(|(id, ui_end)| {
+            let backend = arg(2).filter(|text| !text.is_empty());
+            desks.create(prompt, backend).map(|(id, ui_end)| {
                 self.attach_to_display(&["desk-attached", &id.to_string()], ui_end, id);
                 vec![id.to_string()]
             })

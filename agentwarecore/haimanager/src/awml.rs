@@ -17,6 +17,8 @@
 
 use std::fmt;
 
+use crate::sheet::{self, Sheets};
+
 /// Every element that exists. Anything else is a parse error, which is the
 /// point: it keeps an agent's action space finite and enumerable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -45,14 +47,13 @@ pub enum Tag {
     Select,
     Option,
     Dialog,
-    /// A grid of cells with named columns. Its `row` children are exactly the
-    /// window the application chose to describe, `first-row` says which row
-    /// the first of them is, and `rows` how many exist altogether; see
-    /// `place_table` for what the compositor does with that.
-    Table,
-    Column,
-    Row,
-    Cell,
+    /// A grid of cells, and the one element whose content is not in the tree.
+    ///
+    /// It names a sheet and the version of it this document was drawn
+    /// against; the cells arrive on the same socket as `sheet` frames and
+    /// live in [`crate::sheet`]. It has no children, because ten thousand
+    /// cells are not ten thousand elements.
+    Spreadsheet,
     /// A menu and its items. The items float while it is open, on the same
     /// machinery a dropdown's options and a dialog use.
     Menu,
@@ -85,10 +86,7 @@ impl Tag {
             "select" => Tag::Select,
             "option" => Tag::Option,
             "dialog" => Tag::Dialog,
-            "table" => Tag::Table,
-            "column" => Tag::Column,
-            "row" => Tag::Row,
-            "cell" => Tag::Cell,
+            "spreadsheet" => Tag::Spreadsheet,
             "menu" => Tag::Menu,
             "menuitem" => Tag::MenuItem,
             "tabs" => Tag::Tabs,
@@ -117,10 +115,7 @@ impl Tag {
             Tag::Select => "select",
             Tag::Option => "option",
             Tag::Dialog => "dialog",
-            Tag::Table => "table",
-            Tag::Column => "column",
-            Tag::Row => "row",
-            Tag::Cell => "cell",
+            Tag::Spreadsheet => "spreadsheet",
             Tag::Menu => "menu",
             Tag::MenuItem => "menuitem",
             Tag::Tabs => "tabs",
@@ -144,9 +139,7 @@ impl Tag {
                 | Tag::Item
                 | Tag::Select
                 | Tag::Option
-                | Tag::Row
-                | Tag::Cell
-                | Tag::Column
+                | Tag::Spreadsheet
                 | Tag::Menu
                 | Tag::MenuItem
                 | Tag::Tab
@@ -160,7 +153,7 @@ impl Tag {
     /// caret goes in it, keystrokes edit the compositor's copy, and the
     /// pointer over it is a beam.
     pub fn is_text(self) -> bool {
-        matches!(self, Tag::Field | Tag::Editor | Tag::Cell)
+        matches!(self, Tag::Field | Tag::Editor)
     }
 
     /// What an agent may do with this element, given its state.
@@ -169,19 +162,9 @@ impl Tag {
     /// their own action lists they could omit `focus`, invent something
     /// nothing implements, or advertise `click` on a disabled control, and the
     /// action space would stop being closed.
-    fn actions_for(self, disabled: bool, editable: bool) -> &'static [&'static str] {
+    fn actions_for(self, disabled: bool) -> &'static [&'static str] {
         if disabled {
             return &[];
-        }
-        if self == Tag::Cell {
-            // A cell is always somewhere the human can put the selection; only
-            // an editable one takes text. There is no `click`: pressing a cell
-            // means choosing it, and the event a person produces is `select`.
-            return if editable {
-                &["focus", "select", "select-range", "type-text", "clear", "submit"]
-            } else {
-                &["focus", "select", "select-range"]
-            };
         }
         match self {
             Tag::Button => &["focus", "click"],
@@ -194,7 +177,13 @@ impl Tag {
             // be true, and one that is already true is a no-op, not an error.
             Tag::Select => &["focus", "open", "close"],
             Tag::Option => &["select"],
-            Tag::Row | Tag::Column => &["focus", "select"],
+            // A spreadsheet takes what its *cells* take, because a cell is
+            // where everything happens in one and the element is only the
+            // frame around them. Which cell travels beside the action, as a
+            // coordinate: there is no node for one to name.
+            Tag::Spreadsheet => {
+                &["focus", "select", "select-range", "type-text", "clear", "submit"]
+            }
             // A tab never arrives here: `actions_of` answers for every one of
             // them, because closable and movable are state and a `Tag` alone
             // cannot see state.
@@ -227,8 +216,7 @@ pub fn actions_of(tree: &Tree, index: usize) -> &'static [&'static str] {
             (false, true) => &["focus", "select", "close"],
             (false, false) => &["focus", "select"],
         },
-        Tag::Cell => node.tag.actions_for(inert, node.flag("editable")),
-        tag => tag.actions_for(inert, false),
+        tag => tag.actions_for(inert),
     }
 }
 
@@ -364,28 +352,10 @@ impl Tree {
         self.nodes[index].disabled() || self.blocked(index) || self.folded(index)
     }
 
-    /// A table's `column` children, in order. These are its header.
-    pub fn columns(&self, table: usize) -> Vec<usize> {
-        self.children_of(table, Tag::Column)
-    }
-
     /// A strip's `tab` children, in order, which is the order a `move` names
     /// a slot in.
     pub fn tabs(&self, strip: usize) -> Vec<usize> {
         self.children_of(strip, Tag::Tab)
-    }
-
-    /// A table's `row` children, in order: exactly the window the application
-    /// chose to send, never the whole sheet.
-    pub fn rows(&self, table: usize) -> Vec<usize> {
-        self.children_of(table, Tag::Row)
-    }
-
-    /// A row's `cell` children, in order. Position is what ties a cell to a
-    /// column, so a row with fewer cells than the table has columns simply
-    /// has empty ones at the end.
-    pub fn cells(&self, row: usize) -> Vec<usize> {
-        self.children_of(row, Tag::Cell)
     }
 
     fn children_of(&self, parent: usize, tag: Tag) -> Vec<usize> {
@@ -395,60 +365,6 @@ impl Tree {
             .copied()
             .filter(|&child| self.nodes[child].tag == tag)
             .collect()
-    }
-
-    /// The nearest enclosing table, if a node is inside one.
-    pub fn table_of(&self, index: usize) -> Option<usize> {
-        let mut at = Some(index);
-        while let Some(node) = at {
-            if self.nodes[node].tag == Tag::Table {
-                return Some(node);
-            }
-            at = self.nodes[node].parent;
-        }
-        None
-    }
-
-    /// Where a cell sits in its table: the row's position in the window and
-    /// the cell's position in its row. `None` for anything not in a table.
-    pub fn cell_position(&self, cell: usize) -> Option<(usize, usize)> {
-        let row = self.nodes[cell].parent?;
-        if self.nodes[row].tag != Tag::Row {
-            return None;
-        }
-        let table = self.nodes[row].parent?;
-        let down = self.rows(table).iter().position(|&at| at == row)?;
-        let across = self.cells(row).iter().position(|&at| at == cell)?;
-        Some((down, across))
-    }
-
-    /// What a cell is, in words, for an agent that was given no description.
-    ///
-    /// Every control carries a description because it is the only thing
-    /// saying what the control means. A cell is the one control whose meaning
-    /// is entirely positional, and a spreadsheet has too many of them for a
-    /// human to write a sentence each. So the position is the description,
-    /// composed from the column's own label and the row's.
-    pub fn cell_description(&self, cell: usize) -> String {
-        if let Some(written) = self.nodes[cell].attr("description") {
-            return written.to_owned();
-        }
-        let Some((down, across)) = self.cell_position(cell) else {
-            return "A cell of a table".to_owned();
-        };
-        let table = self.nodes[cell].parent.and_then(|row| self.nodes[row].parent);
-        let column = table
-            .map(|table| self.columns(table))
-            .and_then(|columns| columns.get(across).copied())
-            .and_then(|column| self.nodes[column].attr("label"))
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("column {}", across + 1));
-        let row = self.nodes[cell]
-            .parent
-            .and_then(|row| self.nodes[row].attr("label"))
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("row {}", down + 1));
-        format!("The cell in column {column}, {row}")
     }
 
     /// The nearest value of an inheriting attribute, searching up the tree.
@@ -769,24 +685,24 @@ fn unescape(text: &str) -> String {
 ///
 /// `actions` is added, computed from the element and its state rather than
 /// copied from the document.
-pub fn agent_view(tree: &Tree, app: &str, desk: u32) -> String {
+pub fn agent_view(tree: &Tree, sheets: &Sheets, app: &str, desk: u32) -> String {
     // The app name and the workspace come from the supervisor's handoff, not
     // from the document, so an application cannot misreport which workspace it
     // is in or borrow another one's name.
     let mut out = format!("<view app=\"{app}\" desk=\"{desk}\">\n");
-    emit(tree, Tree::ROOT, 1, &mut out);
+    emit(tree, sheets, Tree::ROOT, 1, &mut out);
     out.push_str("</view>");
     out
 }
 
-fn emit(tree: &Tree, index: usize, depth: usize, out: &mut String) {
+fn emit(tree: &Tree, sheets: &Sheets, index: usize, depth: usize, out: &mut String) {
     let node = tree.node(index);
 
     // Arrangement carries no meaning, so it does not appear; its children rise
     // to take its place.
     if node.tag.is_layout() {
         for &child in &node.children {
-            emit(tree, child, depth, out);
+            emit(tree, sheets, child, depth, out);
         }
         return;
     }
@@ -821,11 +737,13 @@ fn emit(tree: &Tree, index: usize, depth: usize, out: &mut String) {
     // API key entered in Settings would be readable by the very agent it
     // authenticates, through the view of any app that renders it.
     let password = node.attr("kind") == Some("password");
-    // `rows` and `first-row` are a table's declared state, and the two an
-    // agent most needs: without them a window of forty rows is
-    // indistinguishable from a sheet of forty, and there is no way to tell
-    // which forty they are. They are what `query rows` is aimed with.
-    for state in ["value", "checked", "selected", "open", "invalid", "busy", "rows", "first-row"] {
+    // A spreadsheet's declared state is how far it runs, where the cursor is
+    // and what is chosen. None of it is guessable from the cells, and all of
+    // it is what an agent aims `read_cells` with.
+    for state in [
+        "value", "checked", "selected", "open", "invalid", "busy", "rows", "columns", "cursor",
+        "selection",
+    ] {
         if let Some(value) = node.attr(state) {
             if password && state == "value" {
                 let masked = "*".repeat(value.chars().count());
@@ -844,10 +762,21 @@ fn emit(tree: &Tree, index: usize, depth: usize, out: &mut String) {
     if node.tag.is_control() && tree.blocked(index) {
         attrs.push_str(" blocked");
     }
-    if node.tag == Tag::Cell {
-        attrs.push_str(&format!(" description=\"{}\"", tree.cell_description(index)));
-    } else if let Some(description) = node.attr("description") {
+    if let Some(description) = node.attr("description") {
         attrs.push_str(&format!(" description=\"{description}\""));
+    }
+    // A spreadsheet says how far it runs and where anything has been put in
+    // it, so an agent knows what to ask for without reading a screenful to
+    // find out. `used` is the compositor's, from the sheet the element points
+    // at; the rest is the element's own.
+    if node.tag == Tag::Spreadsheet {
+        let used = node
+            .attr("source")
+            .and_then(|source| sheets.get(source))
+            .and_then(|sheet| sheet.used())
+            .map(|(from, to)| format!("{}:{}", sheet::name(from), sheet::name(to)))
+            .unwrap_or_default();
+        attrs.push_str(&format!(" used=\"{used}\""));
     }
     if node.tag.is_control() {
         attrs.push_str(&format!(" actions=\"{}\"", actions_of(tree, index).join(" ")));
@@ -861,7 +790,7 @@ fn emit(tree: &Tree, index: usize, depth: usize, out: &mut String) {
 
     out.push_str(&format!("{pad}<{name}{attrs}>\n"));
     for &child in &node.children {
-        emit(tree, child, depth + 1, out);
+        emit(tree, sheets, child, depth + 1, out);
     }
     out.push_str(&format!("{pad}</{name}>\n"));
 }
@@ -883,55 +812,10 @@ mod tests {
                </window>"#,
         )
         .unwrap();
-        let view = agent_view(&tree, "awsettings", 1);
+        let view = agent_view(&tree, &Sheets::default(), "awsettings", 1);
         assert!(!view.contains("sk-ant-secret"), "the secret leaked: {view}");
         assert!(view.contains("value=\"*************\""), "no mask: {view}");
         assert!(view.contains("value=\"plain\""), "a plain field kept its value: {view}");
-    }
-
-    /// A grid reaches an agent as addressable cells that say where they are.
-    ///
-    /// The description is the point. Every control carries one because it is
-    /// the only thing saying what the control means, and a cell is the one
-    /// control whose meaning is purely positional; a sheet with ten thousand
-    /// of them cannot have ten thousand hand-written sentences, so the column
-    /// and the row are the sentence.
-    #[test]
-    fn a_table_reaches_the_agent_as_addressable_cells() {
-        let tree = parse(
-            r#"<window title="Sheet">
-                 <table id="sheet" label="Sheet1" rows="1000" first-row="0"
-                        description="The spreadsheet grid">
-                   <column label="A"/>
-                   <column label="B"/>
-                   <row label="1">
-                     <cell id="A1" value="12" editable="true"/>
-                     <cell id="B1" value="totals"/>
-                   </row>
-                 </table>
-               </window>"#,
-        )
-        .unwrap();
-        let view = agent_view(&tree, "awsheet", 2);
-
-        // The header survives, because which column a cell is in is what the
-        // cell means.
-        assert!(view.contains("<column label=\"A\""), "no header: {view}");
-        // Positions become words, without the application writing them.
-        assert!(
-            view.contains("description=\"The cell in column A, 1\""),
-            "no derived description: {view}"
-        );
-        // Actions are derived from state here as everywhere: only the
-        // editable cell takes text, and neither offers `click`, because
-        // pressing a cell means choosing it.
-        let editable = view.lines().find(|line| line.contains("id=\"A1\"")).unwrap();
-        let plain = view.lines().find(|line| line.contains("id=\"B1\"")).unwrap();
-        assert!(
-            editable.contains("actions=\"focus select select-range type-text clear submit\""),
-            "{editable}"
-        );
-        assert!(plain.contains("actions=\"focus select select-range\""), "{plain}");
     }
 
     /// A menu, its items, the tabs and the headers, as an agent reads them.
@@ -951,14 +835,12 @@ mod tests {
                  <menu id="edit" label="Edit" description="Commands for the chosen cells">
                    <menuitem id="menu-clear" label="Clear" description="Empties every chosen cell"/>
                  </menu>
-                 <table id="sheet" rows="9" first-row="0" description="The grid">
-                   <column id="col-A" label="A" description="Column A"/>
-                   <row id="row-1" label="1"><cell id="A1" value="x"/></row>
-                 </table>
+                 <spreadsheet id="sheet" source="book" version="1" rows="9" columns="4"
+                              cursor="A1" description="The grid"/>
                </window>"#,
         )
         .unwrap();
-        let view = agent_view(&closed, "awsheet", 1);
+        let view = agent_view(&closed, &Sheets::default(), "awsheet", 1);
 
         // A menu offers both verbs whatever its state, like a dropdown.
         let menu = view.lines().find(|line| line.contains("id=\"edit\"")).unwrap();
@@ -967,11 +849,32 @@ mod tests {
         // offering nothing, so an agent reads before it reaches for one.
         let item = view.lines().find(|line| line.contains("id=\"menu-clear\"")).unwrap();
         assert!(item.contains("actions=\"\""), "a folded item offered something: {item}");
-        // A tab, a column header and a row are all things you choose.
-        for id in ["tab-0", "col-A", "row-1"] {
-            let line = view.lines().find(|line| line.contains(&format!("id=\"{id}\""))).unwrap();
-            assert!(line.contains("actions=\"focus select\""), "{line}");
-        }
+        // A tab is a thing you choose.
+        let tab = view.lines().find(|line| line.contains("id=\"tab-0\"")).unwrap();
+        assert!(tab.contains("actions=\"focus select\""), "{tab}");
+
+        // A whole sheet is one line, and it takes what its cells take: the
+        // cells are not elements, so the element carries their vocabulary and
+        // the compositor is told which cell beside the action.
+        let grid = view.lines().find(|line| line.contains("id=\"sheet\"")).unwrap();
+        assert!(grid.contains("rows=\"9\""), "{grid}");
+        assert!(grid.contains("cursor=\"A1\""), "{grid}");
+        assert!(
+            grid.contains("actions=\"focus select select-range type-text clear submit\""),
+            "{grid}"
+        );
+        assert_eq!(
+            view.lines().filter(|line| line.contains("<cell")).count(),
+            0,
+            "a cell reached the agent as an element"
+        );
+        // Where anything has actually been put, so an agent knows what to ask
+        // for without reading a screenful to find out.
+        let mut sheets = Sheets::default();
+        sheets.apply("book", 0, 1, (0, 0), &["x".into(), "y".into()]);
+        let used = agent_view(&closed, &sheets, "awsheet", 1);
+        let grid = used.lines().find(|line| line.contains("id=\"sheet\"")).unwrap();
+        assert!(grid.contains("used=\"A1:B1\""), "{grid}");
 
         // Opened, the items answer.
         let open = parse(
@@ -982,7 +885,7 @@ mod tests {
                </window>"#,
         )
         .unwrap();
-        let view = agent_view(&open, "awsheet", 1);
+        let view = agent_view(&open, &Sheets::default(), "awsheet", 1);
         let item = view.lines().find(|line| line.contains("id=\"menu-clear\"")).unwrap();
         assert!(item.contains("actions=\"focus click\""), "an open item offered nothing: {item}");
     }
@@ -1021,29 +924,5 @@ mod tests {
                </window>"#,
         )
         .expect("a menu on the window was refused");
-    }
-
-    /// A cell the application scrolled past is not in the tree at all, so an
-    /// agent naming it is told there is no such node rather than being
-    /// silently given a different cell that now sits in that position.
-    #[test]
-    fn a_window_holds_only_the_rows_it_was_sent() {
-        let tree = parse(
-            r#"<window title="Sheet">
-                 <table id="sheet" rows="1000" first-row="500" description="The grid">
-                   <column label="A"/>
-                   <row label="501"><cell id="A501" value="x"/></row>
-                 </table>
-               </window>"#,
-        )
-        .unwrap();
-        let view = agent_view(&tree, "awsheet", 2);
-        assert!(view.contains("id=\"A501\""), "the window is not in the view: {view}");
-        assert!(!view.contains("id=\"A1\""), "a row nobody sent appeared: {view}");
-        // And the window says it is one. Without these an agent cannot tell
-        // one row of a thousand from a sheet with one row in it, and has
-        // nothing to aim `query rows` with.
-        assert!(view.contains("rows=\"1000\""), "the sheet's size is missing: {view}");
-        assert!(view.contains("first-row=\"500\""), "the window's start is missing: {view}");
     }
 }

@@ -127,12 +127,16 @@ impl Desks {
         self.entries.is_empty()
     }
 
-    /// Create a workspace, optionally with an opening prompt.
+    /// Create a workspace, optionally with an opening prompt and the backend
+    /// configuration it should answer with.
     ///
     /// The prompt is the one the human typed into the start menu, and it is
     /// handed to the agentdesk process, not to an agent. This is the *only*
     /// user text the supervisor ever touches, and it exists solely because a
     /// brand new workspace has no other way to be told what it was created for.
+    /// The backend rides along with it for the same reason and is read no more
+    /// than the prompt is: what the name means is the agentdesk's business,
+    /// and one it does not recognise falls back to the default there.
     ///
     /// Creating a workspace does not start a turn. The agentdesk reads its
     /// opening prompt and asks for an agent itself, via `start-agent`. That
@@ -141,7 +145,11 @@ impl Desks {
     ///
     /// Returns the workspace id and the compositor's end of a socket already
     /// connected to the new agentdesk, which the caller hands to `haimanager`.
-    pub fn create(&mut self, prompt: Option<&str>) -> Result<(u32, OwnedFd), String> {
+    pub fn create(
+        &mut self,
+        prompt: Option<&str>,
+        backend: Option<&str>,
+    ) -> Result<(u32, OwnedFd), String> {
         let id = self.next_id;
 
         let cgroup = Cgroup::create(&format!("desk-{id}"))
@@ -152,8 +160,13 @@ impl Desks {
         let (program, base_args) = &self.programs.desk;
         let mut args = base_args.clone();
         args.push(id.to_string());
-        if let Some(text) = prompt {
-            args.push(text.to_owned());
+        // Positional, so the prompt's slot is filled even when it is empty
+        // rather than letting a backend name slide into it.
+        if prompt.is_some() || backend.is_some() {
+            args.push(prompt.unwrap_or_default().to_owned());
+        }
+        if let Some(backend) = backend {
+            args.push(backend.to_owned());
         }
 
         let pid = spawn_in(&cgroup, program, &args, vec![(HAI_FD_ENV, desk_end)])

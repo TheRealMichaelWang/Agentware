@@ -88,21 +88,24 @@ system rather than a step you missed; report it and try something else.
 - unsupported-action: that element does not take that action.
 - needs-approval: the human must approve it; say what you wanted to do and stop.
 
-Tables hold a window, not a sheet:
-- A <table> carries rows, how many exist altogether, and first-row, which row its first \
-row is. The rows in the view are the only ones that exist anywhere; a sheet of ten \
-thousand is read forty at a time, as a human reads one.
-- read_rows moves that window and returns the fresh view: name the app, the table's id, \
-and the row you want first. A cell outside the window cannot be acted on, because it is \
-not there to name; read it into view first.
-- Cells take select to choose one, and type-text, clear and submit when they are \
-editable. There is no click on a cell.
-- select-range chooses a run of cells at once: name one corner as the target and the \
-other corner's id as the value, as in target A1 with value C5. Both must be in the same \
-table. It is one action because a person dragging across a grid did one thing.
-- A column header and a row both take select, which is how a whole column or row is \
-chosen. Tabs take select too, and one listing move can be reordered: name the tab and \
-give the position it should take, counting from zero.
+A spreadsheet is not in the view:
+- A <spreadsheet> says how far it runs, which cell the cursor is on, what is selected, \
+and used, the rectangle anything has been put in. Its cells are not elements: a \
+screenful of a grid is four hundred of them, which is forty kilobytes to learn twenty \
+numbers.
+- read_cells is how you read one: name the app, the element's id, and a range like \
+A1:D20 or a single cell like B7. What comes back is one line per row, values separated \
+by tabs. Ask for the part you need, and let used tell you where the sheet stops.
+- Act on a cell by naming it after the element and an exclamation mark: target \
+sheet!B7. The cell does not have to be on screen; the compositor scrolls to it, as it \
+does for anything else.
+- Cells take select to choose one, and type-text, clear and submit. There is no click \
+on a cell. **type-text does not need a select first**: name the cell and write to it. \
+Selecting is for saying which cell you are looking at, not for permission.
+- select-range chooses a run at once: target sheet!A1 with value C5 is A1 through C5. \
+One action, because a person dragging across a grid did one thing.
+- Tabs take select, and one listing move can be reordered: name the tab and give the \
+position it should take, counting from zero.
 - A menu takes open and close, and its items take click while it is open. Opening a menu \
 by name is how you reach a command a human would right-click for; there is no \
 right-click in your vocabulary and you do not need one.
@@ -243,7 +246,7 @@ fn main() {
         let mut acted = false;
         let mut results = Vec::new();
         for (id, name, input) in calls {
-            acted |= matches!(name.as_str(), "act" | "open_app" | "read_rows");
+            acted |= matches!(name.as_str(), "act" | "open_app");
             let (content, is_error) = run_tool(&mut agent, &name, &input);
             results.push(Block::ToolResult { id, content, is_error });
         }
@@ -430,24 +433,23 @@ fn tool_definitions() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "read_rows",
-            description: "Read a table from a given row. A table holds only the rows the \
-                          application chose to describe, so a large sheet is read a \
-                          window at a time; this moves that window and returns the \
-                          application's fresh view. A cell outside the window cannot be \
-                          acted on, because it is not there to name.",
+            name: "read_cells",
+            description: "Read part of a spreadsheet. Its cells are not in the view, \
+                          because a screenful of a grid is hundreds of them; this reads \
+                          the rectangle you name, as one line per row with values \
+                          separated by tabs. The element's used attribute says where \
+                          anything has been put in the sheet.",
             schema: json!({
                 "type": "object",
                 "properties": {
                     "app": {"type": "string", "description": "The application's name"},
-                    "table": {"type": "string", "description": "The table's id, as the view gives it"},
-                    "first_row": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "description": "The row that should be first, counting from zero"
+                    "id": {"type": "string", "description": "The spreadsheet's id, as the view gives it"},
+                    "range": {
+                        "type": "string",
+                        "description": "A rectangle like A1:D20, or one cell like B7"
                     }
                 },
-                "required": ["app", "table", "first_row"],
+                "required": ["app", "id", "range"],
                 "additionalProperties": false
             }),
         },
@@ -527,19 +529,18 @@ fn run_tool(agent: &mut Agent, name: &str, input: &Value) -> (String, bool) {
                 Err(err) => connection_lost(&err),
             }
         }
-        "read_rows" => {
-            let (Some(app), Some(table)) = (field("app"), field("table")) else {
-                return ("read_rows needs an app and a table id".to_owned(), true);
+        "read_cells" => {
+            let (Some(app), Some(id), Some(range)) =
+                (field("app"), field("id"), field("range"))
+            else {
+                return ("read_cells needs an app, an id and a range".to_owned(), true);
             };
-            // Numbers arrive as numbers, so this one is not read with the
-            // string helper the rest use.
-            let first = input.get("first_row").and_then(Value::as_u64).unwrap_or(0) as u32;
-            agent.say(turn::KIND_ACTION, &format!("reading {table} in {app} from row {first}"));
-            match agent.link.rows(&app, &table, first) {
-                Ok(markup) if markup.is_empty() => {
-                    (format!("no view came back for {app:?}; is it open?"), true)
+            agent.say(turn::KIND_ACTION, &format!("reading {range} of {id} in {app}"));
+            match agent.link.cells(&app, &id, &range) {
+                Ok(block) if block.is_empty() => {
+                    (format!("nothing came back for {range} of {id:?} in {app:?}"), true)
                 }
-                Ok(markup) => (markup, false),
+                Ok(block) => (block, false),
                 Err(err) => connection_lost(&err),
             }
         }

@@ -69,6 +69,7 @@ use crate::cursor;
 use crate::document::Document;
 use crate::editmenu::{EditMenu, Offer, Target};
 use crate::images::Images;
+use crate::sheet;
 use crate::startmenu::{AGENTWARE_ICON, AGENTWARE_SVG, StartMenu, StartOutcome};
 use crate::text::{Edit, Editing, MultiPress};
 use crate::input::{Button, Event, Key};
@@ -167,14 +168,6 @@ fn min_window() -> (i32, i32) { (ui::sc(320), ui::sc(200)) }
 /// claim rather than something on screen.
 const FLIGHT: Duration = Duration::from_millis(600);
 
-/// How long an agent's `rows` query waits for the application to describe a
-/// different window before it is answered with whatever is on screen.
-///
-/// Long enough for a re-render, short enough that an application which
-/// ignores the request costs the agent a pause rather than a hang. The reply
-/// carries `first-row`, so an agent can always see whether it moved.
-const ROWS_WAIT: Duration = Duration::from_millis(400);
-
 /// How long the conversation pane takes to fold away or return.
 const PANE_FOLD: Duration = Duration::from_millis(200);
 
@@ -211,27 +204,14 @@ struct Flight {
     app_name: String,
     desk: u32,
     target: String,
+    /// The cell of a spreadsheet, when the target is one. Empty otherwise.
+    cell: String,
     action: String,
     value: String,
     from: (i32, i32),
     to: (i32, i32),
     started: Instant,
     stage: Stage,
-}
-
-/// An agent's `rows` query, waiting for the application to answer.
-///
-/// The compositor cannot describe rows nobody sent, so this is one of the
-/// two places it asks an application for something and waits: it holds the
-/// agent's reply until a fresh tree arrives or the wait runs out. The
-/// version asked at is what tells a genuinely new tree from the one already
-/// held.
-struct PendingRows {
-    agent: RawFd,
-    app: RawFd,
-    app_name: String,
-    asked_at: u64,
-    until: Instant,
 }
 
 /// Where the keyboard is pointed.
@@ -361,7 +341,6 @@ pub struct Screen {
     /// The intent being performed, if any.
     flight: Option<Flight>,
     /// Agents waiting to be told what a table's new window holds.
-    pending_rows: Vec<PendingRows>,
     /// Intents that arrived while one was in flight. An agent waits for its
     /// answer before sending the next, so this is a safety net rather than a
     /// pipeline.
@@ -426,7 +405,6 @@ impl Screen {
             presses: MultiPress::default(),
             start: None,
             flight: None,
-            pending_rows: Vec::new(),
             queued: VecDeque::new(),
             agent_cursor: None,
             overlay_dirty: false,
@@ -843,7 +821,6 @@ impl Screen {
         self.queued.retain(|(from, _)| *from != fd);
         // An agent or an application that has gone leaves nobody to answer
         // and nothing to answer with.
-        self.pending_rows.retain(|pending| pending.agent != fd && pending.app != fd);
         if self.clients.iter().all(|client| client.kind != Kind::Agent) {
             self.agent_cursor = None;
         }
@@ -906,7 +883,6 @@ impl Screen {
             self.nav = None;
         }
         // A fresh tree may be the window an agent is waiting on.
-        self.settle_rows();
         // Whether the *screen* changed, which is what the event loop uses this
         // for and is not the same question. A workspace nobody is looking at
         // has an agentdesk re-rendering on its own clock and applications
@@ -1812,14 +1788,17 @@ impl Screen {
                 false
             }
 
-            // Read a different part of a table. A query rather than an
-            // action because it is a read, and because there is nothing to
-            // act on: a cell outside the window is not in the tree, so an
-            // intent naming one has no target to resolve.
-            (agent::MSG_QUERY, agent::MSG_ROWS) => {
-                let (app, table, row) =
+            // Read part of a sheet. A query rather than an action because it
+            // is a read, and a range rather than the whole thing because a
+            // sheet is the one thing in the system too big to hand over: the
+            // element in the view says how far it runs and where it is used,
+            // and this is how an agent asks for the part it wants.
+            (agent::MSG_QUERY, agent::MSG_CELLS) => {
+                let (app, id, range) =
                     (field(2).to_owned(), field(3).to_owned(), field(4).to_owned());
-                self.read_rows(from, &app, &table, &row)
+                let block = self.read_cells(from, &app, &id, &range);
+                self.reply(from, &[agent::MSG_CELLS, &app, &id, &range, &block]);
+                false
             }
 
             (agent::MSG_INTENT, _) => {
@@ -1837,101 +1816,22 @@ impl Screen {
         }
     }
 
-    /// Ask an application for a different window of one of its tables, and
-    /// answer the agent once it has described it.
-    fn read_rows(&mut self, from: RawFd, app: &str, table: &str, row: &str) -> bool {
-        let refuse = |screen: &mut Screen, reason: &str| {
-            let markup = format!("<rejected target=\"{table}\" reason=\"{reason}\"/>");
-            screen.reply(from, &[agent::MSG_VIEW, app, &markup]);
-        };
-
-        let Some(at) = self.agent_workspace(from) else {
-            refuse(self, agent::REASON_NOT_ADDRESSABLE);
-            return false;
-        };
-        let Some(app_fd) = self.app_in(at, app) else {
-            let reason = self.why_not(at, app);
-            refuse(self, reason);
-            return false;
-        };
-        let Ok(row) = row.parse::<i32>() else {
-            refuse(self, agent::REASON_UNSUPPORTED);
-            return false;
-        };
-        let Some(index) = self.client(app_fd).and_then(|client| client.node_by_id(table)) else {
-            refuse(self, agent::REASON_NO_SUCH_NODE);
-            return false;
-        };
-
-        // Already showing it: answer at once rather than asking for a window
-        // the application is already describing and waiting to be told so.
-        let showing = self.client(app_fd).and_then(|client| client.number(index, "first-row"));
-        if showing == Some(row.max(0)) {
-            self.answer_view(from, app_fd, app);
-            return false;
-        }
-
-        let version = self.client(app_fd).map_or(0, Client::version);
-        let asked = self
-            .client_mut(app_fd)
-            .map(|client| client.ask_for_row(index, row))
-            .unwrap_or(false);
-        if !asked {
-            // Not a table, or one with no id to address. What is on screen is
-            // still a true answer to what the agent asked to see.
-            self.answer_view(from, app_fd, app);
-            return false;
-        }
-
-        self.pending_rows.push(PendingRows {
-            agent: from,
-            app: app_fd,
-            app_name: app.to_owned(),
-            asked_at: version,
-            until: Instant::now() + ROWS_WAIT,
-        });
-        self.notes.push(format!("agent asked {app} for row {row} of {table}"));
-        false
+    /// A rectangle of one application's sheet, as rows of values.
+    ///
+    /// Rows of text rather than elements: a screenful of a grid is four
+    /// hundred cells, and four hundred elements with a description and an
+    /// action list each is forty kilobytes an agent has to read to learn
+    /// twenty numbers. The actions are the same for every cell in a sheet and
+    /// the description of one is its own name, so both are said once, on the
+    /// element, and this carries what is actually in there.
+    fn read_cells(&mut self, from: RawFd, app: &str, id: &str, range: &str) -> String {
+        let Some(at) = self.agent_workspace(from) else { return String::new() };
+        let Some(app_fd) = self.app_in(at, app) else { return String::new() };
+        let Some(client) = self.client(app_fd) else { return String::new() };
+        client.cells(id, range)
     }
 
-    fn answer_view(&mut self, to: RawFd, app_fd: RawFd, app: &str) {
-        let markup = self
-            .client(app_fd)
-            .and_then(Client::agent_view)
-            .unwrap_or_default();
-        self.reply(to, &[agent::MSG_VIEW, app, &markup]);
-    }
-
-    /// Answer every waiting `rows` query whose application has re-rendered,
-    /// or whose wait has run out.
-    fn settle_rows(&mut self) {
-        if self.pending_rows.is_empty() {
-            return;
-        }
-        let now = Instant::now();
-        let ready: Vec<usize> = self
-            .pending_rows
-            .iter()
-            .enumerate()
-            .filter(|(_, pending)| {
-                let answered = self
-                    .client(pending.app)
-                    .map(|client| client.version() > pending.asked_at);
-                // An application that has gone is answered with nothing
-                // rather than left holding the agent forever.
-                answered.unwrap_or(true) || now >= pending.until
-            })
-            .map(|(at, _)| at)
-            .collect();
-
-        for at in ready.into_iter().rev() {
-            let pending = self.pending_rows.remove(at);
-            let app_name = pending.app_name.clone();
-            self.answer_view(pending.agent, pending.app, &app_name);
-        }
-    }
-
-    /// Which workspace an agent connection belongs to.
+    /// Which workspace an agent connection belongs to.    /// Which workspace an agent connection belongs to.
     fn agent_workspace(&self, from: RawFd) -> Option<usize> {
         self.workspaces.iter().position(|w| w.agent == Some(from))
     }
@@ -2096,10 +1996,22 @@ impl Screen {
             self.refuse(from, &app, &target, agent::REASON_NO_SUCH_APP);
             return false;
         };
+        // A cell of a spreadsheet is named after its element: `sheet!B7`.
+        // Cells are not nodes, so there is nothing else for an intent to
+        // name; what is left of the target is the element, and the cell
+        // travels beside the action the way it does on the wire.
+        let (target, cell) = match target.split_once('!') {
+            Some((element, at)) => (element.to_owned(), at.to_owned()),
+            None => (target, String::new()),
+        };
         let Some(index) = client.node_by_id(&target) else {
             self.refuse(from, &app, &target, agent::REASON_NO_SUCH_NODE);
             return false;
         };
+        if !cell.is_empty() && sheet::parse(&cell).is_none() {
+            self.refuse(from, &app, &target, agent::REASON_NO_SUCH_NODE);
+            return false;
+        }
 
         // Everything the action needs to be legitimate, in the order that
         // makes each answer say what it means.
@@ -2134,9 +2046,15 @@ impl Screen {
         // its window. What is left after this is a node the compositor tried
         // to reveal and could not, which is a fault here rather than a step
         // the agent missed.
+        let at_cell = sheet::parse(&cell);
         let reachable = self
             .client_mut(app_fd)
-            .map(|client| client.reveal(fonts, index))
+            .map(|client| match at_cell {
+                // A cell is brought into view by scrolling the grid it is in,
+                // which the compositor can do itself: it holds the sheet.
+                Some(at) => client.reveal(fonts, index) && client.reveal_cell(fonts, index, at),
+                None => client.reveal(fonts, index),
+            })
             .unwrap_or(false);
         if !reachable {
             self.notes.push(format!(
@@ -2150,7 +2068,12 @@ impl Screen {
             self.refuse(from, &app, &target, agent::REASON_NO_SUCH_APP);
             return false;
         };
-        let rect = client.rect_of(index);
+        // The cursor flies to the cell rather than to the middle of the whole
+        // grid, so a human watching sees it land on the cell it is about to
+        // act on.
+        let rect = at_cell
+            .and_then(|at| client.cell_rect(index, at))
+            .unwrap_or_else(|| client.rect_of(index));
         let to = (rect.x + rect.w / 2, rect.y + rect.h / 2);
 
         let desk = self.workspaces[at].id;
@@ -2165,6 +2088,7 @@ impl Screen {
             app_name: app,
             desk,
             target,
+            cell,
             action,
             value,
             from: from_point,
@@ -2194,7 +2118,6 @@ impl Screen {
 
     /// Advance whatever is moving.
     pub fn tick(&mut self, fonts: &Fonts) -> bool {
-        self.settle_rows();
         let busy = self.wants_frame();
         // One frame after the last animation ends, so a pressed control is
         // repainted unpressed rather than staying that way until the next time
@@ -2265,18 +2188,19 @@ impl Screen {
         }
 
         let Some(flight) = self.flight.take() else { return false };
-        let outcome = self.apply(fonts, flight.app, &flight.target, &flight.action, &flight.value);
+        let outcome = self.apply(fonts, flight.app, &flight.target, &flight.cell, &flight.action, &flight.value);
         self.settle(fonts, flight, outcome);
         true
     }
 
     /// Put in one more character.
     fn type_one(&mut self, fonts: &Fonts, done: usize) -> bool {
-        let (app, target, action, total, prefix) = {
+        let (app, target, cell, action, total, prefix) = {
             let Some(flight) = &self.flight else { return false };
             (
                 flight.app,
                 flight.target.clone(),
+                flight.cell.clone(),
                 flight.action.clone(),
                 flight.value.chars().count(),
                 flight.value.chars().take(done + 1).collect::<String>(),
@@ -2287,7 +2211,7 @@ impl Screen {
         // application sees a value growing rather than one appearing, and the
         // caret stays solid exactly as it does under a human's typing.
         self.blink_epoch = Instant::now();
-        let outcome = self.apply(fonts, app, &target, &action, &prefix);
+        let outcome = self.apply(fonts, app, &target, &cell, &action, &prefix);
         if outcome.is_some() || done + 1 >= total {
             let Some(flight) = self.flight.take() else { return false };
             self.settle(fonts, flight, outcome);
@@ -2311,12 +2235,13 @@ impl Screen {
         fonts: &Fonts,
         app: RawFd,
         target: &str,
+        cell: &str,
         action: &str,
         value: &str,
     ) -> Option<&'static str> {
         match self.client_mut(app) {
             Some(client) => match client.node_by_id(target) {
-                Some(index) => client.act(fonts, index, action, value).err(),
+                Some(index) => client.act_cell(fonts, index, action, value, cell).err(),
                 None => Some(agent::REASON_NO_SUCH_NODE),
             },
             None => Some(agent::REASON_NO_SUCH_APP),
@@ -2743,12 +2668,18 @@ impl Screen {
                 self.close_start();
                 true
             }
-            StartOutcome::CreateDesk(prompt) => {
-                match prompt {
-                    Some(text) => self.requests.push(vec!["create-desk".into(), text]),
-                    None => self.requests.push(vec!["create-desk".into()]),
-                }
-                self.notes.push("new agentdesk requested from the start menu".into());
+            StartOutcome::CreateDesk { prompt, backend } => {
+                // The prompt and the model travel the same way: as arguments
+                // PID 1 hands to the new agentdesk without reading them. The
+                // empty prompt is still sent when a model is named, so the
+                // two are never confused for one another.
+                self.requests.push(vec![
+                    "create-desk".into(),
+                    prompt.unwrap_or_default(),
+                    backend.to_owned(),
+                ]);
+                self.notes
+                    .push(format!("new agentdesk requested from the start menu, as {backend}"));
                 self.close_start();
                 true
             }
@@ -3026,7 +2957,7 @@ impl Screen {
         };
 
         canvas.clipped(rect, |canvas| {
-            ui::paint_subtree(canvas, fonts, &self.images, &doc.tree, &self.nav_layout, Document::ROOT, &focus)
+            ui::paint_subtree(canvas, fonts, &ui::Content { images: &self.images, sheets: &crate::sheet::Sheets::default() }, &doc.tree, &self.nav_layout, Document::ROOT, &focus)
         });
 
         // The crosses are the strip's, drawn with the tabs. What is left
@@ -3258,9 +3189,8 @@ pub enum CompositorKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use awproto::display::ACTION_SCROLL;
     use awproto::{Decoder, encode};
-    use std::io::{Read, Write};
+    use std::io::{self, Read, Write};
     use std::os::fd::{AsRawFd, OwnedFd};
 
     /// One frame off a socket, blocking. The peers here are stand-ins for an
@@ -3279,33 +3209,21 @@ mod tests {
         }
     }
 
-    fn sheet(first: i32) -> String {
-        let mut out = format!(
-            "<window title=\"Sheet\" pad=\"none\"><table id=\"sheet\" grow=\"true\" \
-             rows=\"1000\" first-row=\"{first}\" description=\"The grid\">\
-             <column label=\"A\" chars=\"8\"/>"
-        );
-        for row in first..first + 3 {
-            out.push_str(&format!(
-                "<row label=\"{}\"><cell id=\"A{}\" value=\"r{}\"/></row>",
-                row + 1,
-                row + 1,
-                row
-            ));
-        }
-        out.push_str("</table></window>");
-        out
-    }
+    const SHEET: &str = "<window title=\"Sheet\" pad=\"none\">\
+         <spreadsheet id=\"sheet\" grow=\"true\" source=\"book\" version=\"2\" \
+         rows=\"1000\" columns=\"26\" cursor=\"A1\" description=\"The grid\"/></window>";
 
-    /// The whole of `query rows`: an agent asks for a window it cannot see,
-    /// the application is asked to describe it, and the agent is answered
-    /// with the fresh view once it has.
+    /// The whole of `query cells`: an agent asks for a rectangle and is
+    /// answered out of the sheet the compositor holds, without the
+    /// application being asked anything at all.
     ///
-    /// Worth an integration test rather than a unit one, because every part
-    /// of it is the seam between two processes: the compositor asking, the
-    /// application answering, and the agent's reply held in between.
+    /// That is the change. It used to be a round trip — the compositor asked
+    /// the application to describe a different window, held the agent's reply
+    /// until a fresh tree arrived, and answered with a view of four hundred
+    /// cell elements. The cells are the compositor's now, so a read is a
+    /// lookup, and what comes back is the values rather than the markup.
     #[test]
-    fn an_agent_reads_a_window_the_application_had_not_sent() {
+    fn an_agent_reads_cells_without_asking_the_application() {
         ui::set_scale(1.0);
         let fonts = Fonts::load().expect("the faces are compiled in");
         let mut screen = Screen::new(Rect::new(0, 0, 1200, 800), &fonts);
@@ -3330,73 +3248,47 @@ mod tests {
             )
             .expect("the agent attached");
 
-        // The application describes rows 1 to 3 of a thousand.
-        app.write_all(&encode(&["render", "1", &sheet(0)])).unwrap();
+        // The application publishes two rows, one of them five hundred rows
+        // down, and then the tree that claims their version. Cells first: one
+        // connection, so the compositor can never hold a tree ahead of its
+        // data.
+        app.write_all(&encode(&["sheet", "book", "1", "0", "A1", "Region", "Q1"])).unwrap();
+        app.write_all(&encode(&["sheet", "book", "2", "1", "A500", "far down"])).unwrap();
+        app.write_all(&encode(&["render", "1", SHEET])).unwrap();
         screen.readable(app_fd, &fonts);
 
-        // The agent asks to read from row 500, which is nowhere in that tree.
+        // The agent asks for a rectangle nowhere near the top of the sheet.
         agent
-            .write_all(&encode(&["query", "rows", "awsheet", "sheet", "500"]))
+            .write_all(&encode(&["query", "cells", "awsheet", "sheet", "A500:B500"]))
             .unwrap();
         let progress = screen.readable(agent_fd, &fonts).expect("the agent was read");
         screen.requests(&fonts, agent_fd, progress.requests);
 
-        // The application is asked, and nothing has been said to the agent
-        // yet: there is nothing true to say until the answer arrives.
-        let asked = frame(&mut app);
-        assert_eq!(asked[0], "event", "the application was not asked: {asked:?}");
-        assert_eq!(asked[3], ACTION_SCROLL, "asked for the wrong thing: {asked:?}");
-        assert_eq!(asked[4], "500", "asked for the wrong row: {asked:?}");
-
-        // It answers with that window, and the agent's reply follows.
-        app.write_all(&encode(&["render", "2", &sheet(500)])).unwrap();
-        screen.readable(app_fd, &fonts);
-
         let reply = frame(&mut agent);
-        assert_eq!(reply[0], agent::MSG_VIEW, "not a view: {reply:?}");
+        assert_eq!(reply[0], agent::MSG_CELLS, "not a block of cells: {reply:?}");
         assert_eq!(reply[1], "awsheet");
-        assert!(reply[2].contains("first-row=\"500\""), "the window did not move: {}", reply[2]);
-        assert!(reply[2].contains("id=\"A501\""), "the rows are not the ones asked for: {}", reply[2]);
-    }
+        assert_eq!(reply[3], "A500:B500");
+        assert_eq!(reply[4], "far down\t\n", "the wrong cells came back: {:?}", reply[4]);
 
-    /// A window the application is already describing is answered at once,
-    /// rather than asking for what is already there and waiting to be told.
-    #[test]
-    fn a_window_already_on_screen_is_answered_without_asking() {
-        ui::set_scale(1.0);
-        let fonts = Fonts::load().unwrap();
-        let mut screen = Screen::new(Rect::new(0, 0, 1200, 800), &fonts);
+        // And the application was asked nothing. There is nothing to ask.
+        app.set_nonblocking(true).unwrap();
+        let mut spare = [0u8; 64];
+        assert!(
+            matches!(app.read(&mut spare), Err(err) if err.kind() == io::ErrorKind::WouldBlock),
+            "the application was sent something"
+        );
 
-        let (mut app, app_end) = UnixStream::pair().unwrap();
-        let app_fd = app_end.as_raw_fd();
-        screen
-            .attach(
-                &fonts,
-                &["app-attached".into(), "1".into(), "awsheet".into(), "0".into()],
-                OwnedFd::from(app_end),
-            )
-            .unwrap();
-        let (mut agent, agent_end) = UnixStream::pair().unwrap();
-        let agent_fd = agent_end.as_raw_fd();
-        screen
-            .attach(
-                &fonts,
-                &["agent-attached".into(), "1".into(), "0".into()],
-                OwnedFd::from(agent_end),
-            )
-            .unwrap();
-
-        app.write_all(&encode(&["render", "1", &sheet(500)])).unwrap();
-        screen.readable(app_fd, &fonts);
-
-        agent
-            .write_all(&encode(&["query", "rows", "awsheet", "sheet", "500"]))
-            .unwrap();
-        let progress = screen.readable(agent_fd, &fonts).unwrap();
+        // The view carries the shape and where the sheet is used, so an agent
+        // knows what to ask for; it carries no cells at all.
+        agent.write_all(&encode(&["query", "view", "awsheet"])).unwrap();
+        let progress = screen.readable(agent_fd, &fonts).expect("the agent was read");
         screen.requests(&fonts, agent_fd, progress.requests);
-
         let reply = frame(&mut agent);
         assert_eq!(reply[0], agent::MSG_VIEW);
-        assert!(reply[2].contains("first-row=\"500\""), "{}", reply[2]);
+        assert!(reply[2].contains("rows=\"1000\""), "{}", reply[2]);
+        // The bounding box of everything published, which is what tells an
+        // agent where to look without reading a screenful to find out.
+        assert!(reply[2].contains("used=\"A1:B500\""), "{}", reply[2]);
+        assert!(!reply[2].contains("<cell"), "a cell reached the agent: {}", reply[2]);
     }
 }

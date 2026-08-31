@@ -23,6 +23,7 @@ mod images;
 mod input;
 mod paint;
 mod screen;
+mod sheet;
 mod startmenu;
 mod text;
 mod ui;
