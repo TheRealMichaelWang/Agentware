@@ -139,6 +139,69 @@ reports paint/blit cost while frames are produced):
   strips instead of a per-pixel square root. Measured on a six-second drag:
   paint fell from 14ms avg / 34ms worst to 7.1ms avg / 14ms worst.
 
+**A second round of that, from "dragging windows goes sluggish after working
+with an agent for a while".** Everything below was found by measuring rather
+than reading, and every one of them is a cost that grows with *use* and is
+therefore invisible in a capture of a fresh boot. The `frames:` line now
+carries what arriving trees cost as well, since a frame's paint is only half
+of what a drag competes with.
+
+* **Line breaking was quadratic.** `wrap` measured `text[start..next]` from
+  the top of the line at every character, so a line cost the square of its
+  length in glyph lookups. It now carries the width forward as the loop
+  advances, over `Fonts::advance`.
+* **Painting walked every node whether or not it could be seen.** A
+  transcript line scrolled out of the pane still ran its line breaking and a
+  glyph lookup per character, discarded a pixel at a time. Now a branch whose
+  layout clip the canvas has already excluded is skipped whole (a child's clip
+  is its parent's or a piece of it, so this is sound), and a node whose own box
+  is out of view is handed an empty clip.
+* **Measuring cannot be skipped the same way, so it is remembered.** A
+  `scroll` is only as tall as its content, so the pane cannot know its own
+  height without breaking every line of the conversation, including the
+  thousand that scrolled off the top; culling helps painting and can never
+  help this. `Fonts::break_lines` caches where each line of a string starts
+  and ends, by string, face and width (`WRAPS_KEPT` entries, dropped whole
+  when full rather than evicted one at a time). A transcript re-rendered for
+  its clock breaks no lines at all the second time.
+
+Measured with `bench_pane` (ignored, `--nocapture`), which lays out and paints
+a pane of telemetry lines. Layout is what the agentdesk pays once a second
+while a turn runs; paint is what every frame pays, a window drag included:
+
+| lines | layout before | layout now (cold / warm) | paint before | paint now |
+| --- | --- | --- | --- | --- |
+| 100 | 37.8ms | 0.55 / 0.11ms | 13.0ms | 1.5ms |
+| 400 | 163ms | 2.35 / 0.45ms | 52.9ms | 1.6ms |
+| 2000 | 836ms | 11.7 / 2.2ms | 267ms | 1.9ms |
+
+Four hundred lines is one afternoon with an agent. Two thousand is a week,
+and it used to be 836ms of the compositor's thread once a second and a quarter
+of a second per frame, which is not a sluggish desk, it is a stopped one.
+* **A workspace nobody was looking at repainted the one in front.** Every tree
+  from a background agentdesk or a minimized window set the screen dirty and
+  threw away the drag's damage rectangle. `Screen::readable` now answers for
+  the screen, not for the client, and so do an agent's intents and its typing.
+* **A press animation anywhere ran the compositor at 60Hz.** `wants_frame`
+  asked every client whether it was animating, so a control sinking in a
+  workspace nobody is looking at bought a fifth of a second of full repaints,
+  once per agent action. Measured against a two-desk case the last two are
+  worth about one repaint a second plus those bursts; they matter because
+  they compound with the number of agentdesks left working, and because they
+  are the difference between a window drag keeping its damage rectangle and
+  losing it.
+
+What is left is genuinely linear and small: laying out a conversation still
+walks every line to add up its height, at about a microsecond each once they
+are broken. Windowing the transcript the way a table is windowed would remove
+even that, and would need the pane's scroll offset to cross the protocol,
+which it deliberately does not.
+
+Verified by pixels as well as numbers: the whole screen is identical to the
+build before this work at 2560x1440 and at 1600x1000, and culled against
+unculled is identical with a scrolled table, a strip of tabs and an open menu
+on screen.
+
 **Nothing is left of the original plan.** What is missing now is not
 compositor work: more applications, and more backends behind the agent.
 
@@ -765,6 +828,15 @@ them is part of the application catalogue and none reaches an agent.
   timing numbers or mid-gesture captures exist.
 * **printk prints levels strictly below `console_loglevel`.** Setting it to 6
   suppresses level-6 messages.
+* **A cost that grows with use cannot be photographed.** Every capture starts
+  from a fresh boot with an empty conversation, so the quadratic line
+  breaking and the paint that walked scrolled-away nodes were invisible to
+  the whole screenshot harness: the desk looked right and the numbers on a
+  new boot were fine. What found them was measuring one function against
+  size, which is what `bench_pane` (ignored, `--nocapture`) exists to do.
+  It reports cold and warm separately for the same reason, and its lines are
+  distinct per size, because a bench that shares strings between runs warms
+  its own cache and reports a fix that is not there.
 * **A relative mouse can never align with the host cursor.** The PS/2 mouse
   streams deltas, so the guest integrates its own position and drifts from the
   host pointer the moment the window is scaled. The virtio tablet reports

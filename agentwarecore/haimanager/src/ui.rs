@@ -190,6 +190,10 @@ fn control_pad() -> i32 { sc(6) }
 fn button_pad() -> i32 { sc(12) }
 fn checkbox_size() -> i32 { sc(14) }
 const DIVIDER: i32 = 1;
+/// How far a dialog's shadow reaches beyond it. Named because `footprint`
+/// has to know, and a shadow that outgrew the number it is culled against
+/// would be clipped at the edge of a partial repaint and nowhere else.
+const DIALOG_SHADOW: i32 = 18;
 /// An editor is this many lines tall.
 const EDITOR_LINES: i32 = 4;
 /// A column with no declared width is this many characters wide, which is
@@ -709,7 +713,7 @@ fn measure(fonts: &Fonts, tree: &Tree, index: usize, width: i32) -> i32 {
         // is as tall as its lines rather than one line clipped at the edge.
         Tag::Text => {
             let style = style_at(tree, index);
-            let lines = wrap(fonts, label_of(node), &style, width).len().max(1) as i32;
+            let lines = fonts.line_count(label_of(node), &style, width).max(1) as i32;
             lines * fonts.line_height(&style)
         }
         Tag::Icon => line_height(fonts, tree, index),
@@ -1679,45 +1683,11 @@ pub fn gutter_width(fonts: &Fonts, tree: &Tree, table: usize) -> i32 {
 /// clipped at the edge is text the human cannot read at all. Newlines in the
 /// text break lines too, so a message typed with returns keeps them.
 pub fn wrap<'a>(fonts: &Fonts, text: &'a str, style: &Style, width: i32) -> Vec<&'a str> {
-    let mut lines = Vec::new();
-    for paragraph in text.split('\n') {
-        if paragraph.is_empty() {
-            lines.push(paragraph);
-            continue;
-        }
-        let mut start = 0;
-        let mut last_space: Option<usize> = None;
-        let mut at = 0;
-        while at < paragraph.len() {
-            let next = paragraph[at..]
-                .char_indices()
-                .nth(1)
-                .map(|(offset, _)| at + offset)
-                .unwrap_or(paragraph.len());
-            if fonts.measure(&paragraph[start..next], style) > width && next > start {
-                // Over the edge. Break at the last space if there was one, else
-                // right here, but always make progress by at least one char.
-                let (line_end, resume) = match last_space {
-                    Some(space) if space > start => (space, space + 1),
-                    _ if at > start => (at, at),
-                    _ => (next, next),
-                };
-                lines.push(&paragraph[start..line_end]);
-                start = resume;
-                last_space = None;
-                at = start;
-                continue;
-            }
-            if paragraph[at..].starts_with(' ') {
-                last_space = Some(at);
-            }
-            at = next;
-        }
-        if start < paragraph.len() || lines.is_empty() {
-            lines.push(&paragraph[start..]);
-        }
-    }
-    lines
+    fonts
+        .break_lines(text, style, width)
+        .iter()
+        .map(|&(from, to)| &text[from as usize..to as usize])
+        .collect()
 }
 
 /// The first `caret` characters of a string, as a slice.
@@ -1959,6 +1929,22 @@ fn paint_control_face(
     }
 }
 
+/// The area a node's own painting can touch.
+///
+/// Its rectangle, with two exceptions: a strip of tabs paints its band the
+/// full width of whatever it is clipped to rather than of its own box, and a
+/// dialog carries a shadow that falls outside it. Getting this wrong does not
+/// fail loudly, which is why it is one function: a node that paints outside
+/// what this returns loses that part of itself at the edge of a partial
+/// repaint, and a partial repaint is exactly the case nobody looks at.
+fn footprint(tag: Tag, rect: Rect, clip: Rect) -> Rect {
+    match tag {
+        Tag::Tabs => tabs_band(rect, clip),
+        Tag::Dialog => rect.inset(-DIALOG_SHADOW),
+        _ => rect,
+    }
+}
+
 fn paint_node(
     canvas: &mut Canvas,
     fonts: &Fonts,
@@ -1968,6 +1954,15 @@ fn paint_node(
     index: usize,
     focus: &Focus,
 ) {
+    // Nothing in this branch can paint outside this node's clip: layout gives
+    // a child its parent's clip or a piece of it, never more. So a clip the
+    // canvas has already excluded is a whole branch that can be skipped
+    // rather than walked, which is what makes a repaint of the region a
+    // dragged window swept cost the window and not the desk.
+    if layout.clips[index].intersect(&canvas.clip()).is_none() {
+        return;
+    }
+
     let node = tree.node(index);
     let rect = layout.rects[index];
     let disabled = node.disabled();
@@ -2001,6 +1996,20 @@ fn paint_node(
     // computed once during layout and reused here, so what is painted and what
     // is hit-testable cannot disagree.
     let clip = layout.clips[index];
+
+    // A node whose own box is out of view paints nothing, and settling that
+    // here rather than one primitive at a time is the difference between a
+    // scrolled-away transcript line costing a rectangle test and costing a
+    // line break plus a glyph lookup per character. Said as an empty clip
+    // rather than as a branch, because every arm below clips and a clip
+    // nothing intersects discards the lot at the top; the alternative is
+    // another level of indentation around five hundred lines. Children are
+    // still walked: a scroll container's content is taller than the
+    // container, so a box out of view can hold something in view.
+    let clip = match footprint(node.tag, rect, clip).intersect(&canvas.clip()) {
+        Some(_) => clip,
+        None => Rect::new(rect.x, rect.y, 0, 0),
+    };
 
     canvas.clipped(clip, |canvas| match node.tag {
         Tag::Window => canvas.fill_rect(rect, background()),
@@ -2051,7 +2060,7 @@ fn paint_node(
         }
 
         Tag::Dialog => {
-            canvas.shadow(rect, radius_surface(), 18, 120);
+            canvas.shadow(rect, radius_surface(), DIALOG_SHADOW, 120);
             canvas.fill_round_rect(rect, radius_surface(), raised());
             canvas.stroke_round_rect(rect, radius_surface(), 1, border());
             if let Some(label) = node.attr("label") {
@@ -2866,5 +2875,95 @@ mod tests {
         assert_eq!(tab_slot(&rects, 2, 250), 2, "left where it was");
         assert_eq!(tab_slot(&rects, 0, 120), 0, "not past the next middle yet");
         assert_eq!(tab_slot(&rects, 0, 160), 1, "past it now");
+    }
+
+
+    /// Line breaking carries a running width forward instead of measuring the
+    /// whole prefix again at every character. The prefix version was
+    /// quadratic in the line's length, which is what made a long transcript
+    /// cost a sixth of a second to lay out; this is the check that the sum
+    /// still says the same thing.
+    #[test]
+    fn wrapping_breaks_at_the_last_space_that_fits() {
+        set_scale(1.0);
+        let fonts = Fonts::load().unwrap();
+        let style = Style::default();
+        let text = "the quick brown fox jumps over the lazy dog and keeps going a while yet";
+        for width in [60, 80, 120, 200, 400] {
+            let lines = wrap(&fonts, text, &style, width);
+            for line in &lines {
+                let drawn = fonts.measure(line, &style);
+                assert!(
+                    drawn <= width,
+                    "a line of {drawn}px ran past {width}px: {line:?}"
+                );
+            }
+            assert_eq!(lines.join(" "), text, "wrapping at {width}px changed the words");
+        }
+
+        // A word longer than the width is broken rather than left to run off
+        // the side, and the break still makes progress.
+        let lines = wrap(&fonts, "unbreakableword", &style, 30);
+        assert!(lines.len() > 1, "a word wider than its box was not broken");
+        assert_eq!(lines.concat(), "unbreakableword", "breaking lost characters");
+
+        // Blank lines survive: a paragraph break in a message is content.
+        assert_eq!(wrap(&fonts, "a\n\nb", &style, 400), vec!["a", "", "b"]);
+    }
+
+    /// Not a check, a measurement: what a long transcript costs to lay out
+    /// and to paint. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_pane() {
+        set_scale(1.5);
+        let fonts = Fonts::load().unwrap();
+        for lines in [10usize, 100, 400, 2000] {
+            let mut src = String::from("<window pad=\"none\"><vstack><scroll grow=\"true\" anchor=\"end\"><vstack gap=\"sm\">\n");
+            for i in 0..lines {
+                // Distinct per size, so a bigger run is not warmed by the
+                // lines a smaller one already broke.
+                src.push_str(&format!("<text role=\"caption\" color=\"muted\">line {lines}-{i}: the agent said something of about this length, which is what a telemetry line looks like</text>\n"));
+            }
+            src.push_str("</vstack></scroll></vstack></window>");
+            let doc = Document::parse(&src, 1).unwrap();
+            let mut down = HashMap::new();
+            let mut across = HashMap::new();
+            let columns = HashMap::new();
+            let area = Rect::new(0, 0, 500, 1300);
+            // Cold and warm are different questions. Cold is the first time
+            // a line is seen, which happens once per line ever; warm is every
+            // re-render after it, which is once a second while a turn runs.
+            let mut lay = || {
+                let mut state = Ephemeral {
+                    scroll: &mut down,
+                    scroll_x: &mut across,
+                    columns: &columns,
+                    context_at: None,
+                };
+                layout(&fonts, &doc, &Frame::Whole(area), &mut state)
+            };
+            let t0 = std::time::Instant::now();
+            let _ = lay();
+            let cold = t0.elapsed();
+            let t0 = std::time::Instant::now();
+            let layout = lay();
+            let laid = t0.elapsed();
+            let images = crate::images::Images::new(0);
+            let mut canvas = Canvas::new(500, 1300);
+            let focus = Focus::default();
+            let t1 = std::time::Instant::now();
+            for _ in 0..10 {
+                paint(&mut canvas, &fonts, &images, &doc.tree, &layout, &focus);
+            }
+            let painted = t1.elapsed() / 10;
+            eprintln!(
+                "{lines} lines ({} nodes): layout cold {:.2}ms warm {:.2}ms, paint {:.2}ms",
+                doc.tree.nodes.len(),
+                cold.as_secs_f32() * 1000.0,
+                laid.as_secs_f32() * 1000.0,
+                painted.as_secs_f32() * 1000.0
+            );
+        }
     }
 }
