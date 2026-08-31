@@ -421,9 +421,22 @@ impl SheetOut {
         surface.sheet(&self.source, self.version, base, at, values)
     }
 
-    /// Say that the next run starts the sheet over, which is what a
-    /// `sheet-resend` asks for.
-    pub fn restart(&mut self) {
-        self.restart = true;
+    /// Start the sheet over: forget everything published so far, and leave it
+    /// empty until something is put in it. What a `sheet-resend` asks for, and
+    /// what switching a sheet's contents wholesale means.
+    ///
+    /// This sends a run of no values against `base = 0`, which is exactly
+    /// "the sheet is now this, and this is nothing". It has to be sent rather
+    /// than remembered, and that is the whole reason this takes a surface: an
+    /// earlier version armed a flag that the *next* run carried, so an
+    /// application that started a sheet over and then had nothing to publish
+    /// said nothing at all, and the compositor went on showing the sheet it
+    /// already had. An empty sheet is a thing an application must be able to
+    /// say, and a restart with nothing following it is the most likely way of
+    /// saying it.
+    pub fn restart(&mut self, surface: &mut Surface) -> io::Result<()> {
+        self.restart = false;
+        self.version += 1;
+        surface.sheet(&self.source, self.version, 0, "A1", &[])
     }
 }

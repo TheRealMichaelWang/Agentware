@@ -166,6 +166,9 @@ pub struct Client {
     /// points at. Not in any tree: they arrive as their own frames and the
     /// compositor paints from them. See [`crate::sheet`].
     sheets: Sheets,
+    /// The version each sheet was last asked to resend at, so a client that
+    /// does not answer is asked once rather than once per render.
+    asked: HashMap<String, u64>,
     /// A run of cells being dragged out: which spreadsheet, the corner it
     /// started from, and the cell the run currently reaches.
     cell_drag: Option<(String, sheet::Ref)>,
@@ -252,6 +255,7 @@ impl Client {
             running: false,
             column_drag: None,
             sheets: Sheets::default(),
+            asked: HashMap::new(),
             cell_drag: None,
             cell_extent: None,
             tab_drag: None,
@@ -330,7 +334,7 @@ impl Client {
                         let source = source.to_owned();
                         let had_doc = self.doc.is_some();
                         let was_version = self.version();
-                        let (dirty, line) = self.apply(fonts, &source, version);
+                        let (dirty, line) = self.apply(fonts, &source, version, &mut progress.log);
                         progress.dirty |= dirty;
                         // A tree counts as updated when it was installed and
                         // repainted: the version moved and the screen did too.
@@ -393,7 +397,13 @@ impl Client {
     }
 
     /// Install a newly arrived tree.
-    fn apply(&mut self, fonts: &Fonts, source: &str, version: u64) -> (bool, String) {
+    fn apply(
+        &mut self,
+        fonts: &Fonts,
+        source: &str,
+        version: u64,
+        log: &mut Vec<String>,
+    ) -> (bool, String) {
         let mut next = match Document::parse(source, version) {
             Ok(doc) => doc,
             Err(err) => {
@@ -406,6 +416,7 @@ impl Client {
         };
 
         self.reconcile(&mut next);
+        let cut = self.fit_sheets(&next, log);
 
         let diff = match &self.doc {
             Some(held) => next.diff(held),
@@ -416,9 +427,16 @@ impl Client {
         // An identical resend still advances the version, because events must
         // carry the version the application believes it is on. It just does not
         // cost a frame.
+        // A cut cannot change the picture: what a shape drops was outside it,
+        // and outside the shape is never painted. So an identical tree that
+        // cut something still costs no frame; it is said in the note because
+        // a sheet quietly getting smaller is worth being able to read back.
         if !first && diff.is_empty() {
             self.doc = Some(next);
-            self.note = format!("v{version} identical, not repainted");
+            self.note = match cut {
+                true => format!("v{version} identical, cells cut to the shape"),
+                false => format!("v{version} identical, not repainted"),
+            };
             return (false, format!("{}: {}", self.label(), self.note));
         }
 
@@ -434,6 +452,84 @@ impl Client {
 
     fn node_count(&self) -> usize {
         self.doc.as_ref().map_or(0, |doc| doc.tree.nodes.len())
+    }
+
+    /// Make the sheets agree with the tree that just arrived: cut each one to
+    /// the shape its element declares, and ask again for any whose version no
+    /// longer matches the one the element claims.
+    ///
+    /// The version check is what the version in the tree has always been
+    /// *for*. Cells and trees travel on one connection in a fixed order, so by
+    /// the time a tree arrives the compositor should be at exactly the version
+    /// that tree claims; anything else means the picture and the application
+    /// have come apart, and the only honest answer is to ask for the sheet
+    /// from the beginning rather than to paint on. Every render re-asserts it,
+    /// so divergence is caught on the next frame instead of sitting there.
+    ///
+    /// It was worth building the day a workbook switched to an empty sheet and
+    /// the compositor went on showing the sheet before it: the application
+    /// believed it had said something it had not, and there was nothing
+    /// anywhere that could notice. A client that does not answer is asked once
+    /// per version rather than once per render, since a broken application
+    /// should not also be a flood in the log.
+    ///
+    /// A cut and a resend cannot fight: a cut leaves the version alone, so a
+    /// sheet that has just been trimmed still matches the tree that trimmed it.
+    ///
+    /// Cut every sheet to the shape the tree that just arrived declares.
+    ///
+    /// Resizing a spreadsheet is done by declaring a different shape, exactly
+    /// as moving its cursor is done by declaring a different cursor: there is
+    /// no resize message and there should not be one, because the shape is
+    /// already re-asserted on every render and a message would be a second
+    /// answer to a question the tree answers. Growing is free and shrinking is
+    /// the sheet giving memory back, which is what this is here to make
+    /// happen; [`sheet::Sheet::fit`] has the reasoning for both.
+    ///
+    /// Run on every tree, so the usual cost is what it takes to find the
+    /// spreadsheets and ask each one a pair of comparisons. Documents have a
+    /// handful of nodes, and a document with no spreadsheet in it does no work
+    /// at all.
+    ///
+    /// This runs after the cells, never before, and that ordering is the whole
+    /// reason it is safe: an application publishes the cells and then the tree
+    /// that claims them, so a value written past the old shape is always
+    /// followed by the shape that makes room for it. A cut can therefore only
+    /// ever drop what the application has just said is not in the sheet.
+    fn fit_sheets(&mut self, next: &Document, log: &mut Vec<String>) -> bool {
+        let mut cut = false;
+        for index in 0..next.tree.nodes.len() {
+            let node = next.tree.node(index);
+            if node.tag != Tag::Spreadsheet {
+                continue;
+            }
+            let Some(source) = node.attr("source") else { continue };
+            let source = source.to_owned();
+            let (columns, rows) = ui::sheet_shape(node);
+            cut |= self.sheets.fit(&source, columns, rows);
+
+            // An element that does not say which version it was drawn against
+            // is not claiming anything, so there is nothing to disagree with.
+            let Some(claimed) = node.attr("version").and_then(|at| at.parse::<u64>().ok()) else {
+                self.asked.remove(&source);
+                continue;
+            };
+            let held = self.sheets.version(&source);
+            if claimed == held {
+                self.asked.remove(&source);
+                continue;
+            }
+            if self.asked.get(&source) == Some(&held) {
+                continue;
+            }
+            self.asked.insert(source.clone(), held);
+            log.push(format!(
+                "{}: sheet {source}: the tree claims v{claimed} and v{held} is held, asking again",
+                self.label()
+            ));
+            self.send(&[display::MSG_SHEET_RESEND, &source, &held.to_string()]);
+        }
+        cut
     }
 
     /// Carry ephemeral state onto the incoming tree, and write back what the
@@ -2273,7 +2369,7 @@ mod tests {
         let (ours, peer) = UnixStream::pair().expect("a socketpair");
         let mut client =
             Client::adopt(Kind::App, 1, "test".to_owned(), 0, ours).expect("adopted");
-        client.apply(&fonts, source, 1);
+        client.apply(&fonts, source, 1, &mut Vec::new());
         client.set_frame(&fonts, Frame::Whole(frame));
         (fonts, client, peer)
     }
@@ -2391,7 +2487,7 @@ mod tests {
         client.sheets.apply("book", 0, 1, (0, 0), &["Region".into(), "Q1".into()]);
         client.sheets.apply("book", 1, 2, (0, 1), &["North".into(), "1240".into()]);
         client.sheets.apply("book", 2, 3, (0, 499), &["far down".into()]);
-        client.apply(fonts, &markup, client.version() + 1);
+        client.apply(fonts, &markup, client.version() + 1, &mut Vec::new());
         client.set_frame(fonts, Frame::Whole(Rect::new(0, 0, 400, 300)));
     }
 
@@ -2413,6 +2509,106 @@ North	1240
 ");
         // A range that runs past the sheet is cut to it.
         assert!(!client.cells("sheet", "A1:ZZ2000").is_empty());
+    }
+
+    /// The version on the element is checked against the version held, and a
+    /// tree that claims one the compositor is not on is answered by asking for
+    /// the sheet from the beginning.
+    ///
+    /// This is what the version in the tree is for, and it went unbuilt long
+    /// enough for the thing it exists to catch to happen: a workbook switched
+    /// to an empty sheet, published nothing at all because there was nothing
+    /// to publish, and the compositor went on showing the sheet before it with
+    /// no way for anyone to notice.
+    #[test]
+    fn a_tree_claiming_a_version_nobody_holds_is_answered_by_asking_again() {
+        let (fonts, mut client, mut peer) =
+            framed(r#"<window pad="none"><text>x</text></window>"#, Rect::new(0, 0, 400, 300));
+        grid(&mut client, &fonts, "A1");
+        let _ = said(&mut peer);
+
+        let claiming = |client: &mut Client, fonts: &Fonts, version: u64| {
+            let markup = format!(
+                r#"<window pad="none"><spreadsheet id="sheet" grow="true" source="book"
+                     version="{version}" rows="1000" columns="26" cursor="A1"
+                     description="The grid"/></window>"#
+            );
+            client.apply(fonts, &markup, client.version() + 1, &mut Vec::new());
+        };
+
+        // The version held is 3, so a tree drawn against 3 says nothing.
+        claiming(&mut client, &fonts, 3);
+        assert!(said(&mut peer).is_empty(), "an agreeing tree asked for something");
+
+        // One drawn against 9 has come apart from the picture.
+        claiming(&mut client, &fonts, 9);
+        let asked = said(&mut peer);
+        assert_eq!(
+            asked.iter().find(|fields| fields[0] == display::MSG_SHEET_RESEND),
+            Some(&vec![display::MSG_SHEET_RESEND.to_owned(), "book".to_owned(), "3".to_owned()]),
+            "{asked:?}"
+        );
+
+        // Asked once, not once per render: a client that does not answer is
+        // broken, and a broken client should not also be a flood in the log.
+        claiming(&mut client, &fonts, 9);
+        assert!(
+            !said(&mut peer).iter().any(|fields| fields[0] == display::MSG_SHEET_RESEND),
+            "asked twice for the same thing"
+        );
+
+        // And once it agrees again, a later disagreement is asked about
+        // afresh rather than suppressed by the memory of the last one.
+        claiming(&mut client, &fonts, 3);
+        let _ = said(&mut peer);
+        claiming(&mut client, &fonts, 11);
+        assert!(said(&mut peer).iter().any(|fields| fields[0] == display::MSG_SHEET_RESEND));
+    }
+
+    /// A spreadsheet is resized by declaring a different shape, and the sheet
+    /// behind it follows: it grows for nothing, and when it shrinks it stops
+    /// holding the cells that are no longer in it.
+    ///
+    /// The half that matters to an agent is the last assertion. `used` is what
+    /// it reads to decide what to ask for, so a sheet that says it is a
+    /// hundred rows deep while reporting something at row five hundred is
+    /// telling it to go and read cells that cannot be reached, painted or
+    /// typed into.
+    #[test]
+    fn a_smaller_shape_takes_the_cells_outside_it_with_it() {
+        let (fonts, mut client, _peer) =
+            framed(r#"<window pad="none"><text>x</text></window>"#, Rect::new(0, 0, 400, 300));
+        grid(&mut client, &fonts, "A1");
+        assert_eq!(client.cells("sheet", "A500:A500"), "far down\n");
+
+        let shaped = |client: &mut Client, fonts: &Fonts, rows: u32, columns: u32| {
+            let markup = format!(
+                r#"<window pad="none"><spreadsheet id="sheet" grow="true" source="book"
+                     version="3" rows="{rows}" columns="{columns}" cursor="A1"
+                     description="The grid"/></window>"#
+            );
+            client.apply(fonts, &markup, client.version() + 1, &mut Vec::new());
+        };
+
+        // Taller and wider: nothing moves, and everything is still there.
+        shaped(&mut client, &fonts, 5000, 60);
+        assert_eq!(client.sheets.get("book").and_then(sheet::Sheet::used), Some(((0, 0), (1, 499))));
+
+        // Shorter than the furthest cell: that cell is not in the sheet any
+        // more, and the sheet says so.
+        shaped(&mut client, &fonts, 100, 26);
+        assert_eq!(client.sheets.get("book").and_then(|book| book.get((0, 499))), None);
+        assert_eq!(client.sheets.get("book").and_then(sheet::Sheet::used), Some(((0, 0), (1, 1))));
+        // And a range wholly past the end is nothing rather than a rectangle
+        // of blanks, since there is no row there to answer with.
+        assert_eq!(client.cells("sheet", "A500:A500"), "");
+
+        // Narrower does the same across, and what is left of the sheet is
+        // untouched: a cut is not a clear.
+        shaped(&mut client, &fonts, 100, 1);
+        assert_eq!(client.sheets.get("book").and_then(|book| book.get((1, 0))), None);
+        assert_eq!(client.cells("sheet", "A1:B1"), "Region\n", "a read is cut to the shape too");
+        assert_eq!(client.sheets.version("book"), 3, "a shape is not a delta");
     }
 
     /// A press on a grid chooses the cell it landed on, a drag reports a run,
