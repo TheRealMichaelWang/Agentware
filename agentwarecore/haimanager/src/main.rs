@@ -252,6 +252,15 @@ fn run(
     let mut stat_frames: u32 = 0;
     let mut stat_since = std::time::Instant::now();
 
+    // What arriving trees cost, on the same clock. A frame's paint is only
+    // half of what a drag competes with: every tree a client sends is parsed,
+    // diffed and laid out on this thread, and a workspace nobody is looking
+    // at sends them just as often as the one on screen.
+    let mut stat_trees: u32 = 0;
+    let mut stat_tree_time = std::time::Duration::ZERO;
+    let mut stat_tree_worst = std::time::Duration::ZERO;
+    let mut stat_tree_who = String::new();
+
     // While the agent's cursor is travelling there is an animation to run, and
     // an animation is the one thing an event-driven loop cannot wait for. This
     // is the only case in which the compositor wakes without being asked to.
@@ -344,20 +353,39 @@ fn run(
                 }
 
                 token if token >= TOKEN_CLIENT_BASE => {
-                    only_pointer = false;
                     let fd = (token - TOKEN_CLIENT_BASE) as RawFd;
+                    let t0 = std::time::Instant::now();
                     let Some(progress) = screen.readable(fd, fonts) else { continue };
+                    let cost = t0.elapsed();
+                    stat_trees += 1;
+                    stat_tree_time += cost;
+                    if cost > stat_tree_worst {
+                        stat_tree_worst = cost;
+                        stat_tree_who = screen
+                            .client_mut(fd)
+                            .map(|client| client.label())
+                            .unwrap_or_default();
+                    }
 
                     for line in progress.log {
                         log(&line);
                     }
                     dirty |= progress.dirty;
+                    // A tree that changed nothing on screen, from a window
+                    // that is minimized or a workspace that is not the one in
+                    // front, leaves a window drag on its fast path. Saying
+                    // "something happened" for any client at all is what used
+                    // to cost the whole screen every time an agentdesk in
+                    // another workspace ticked.
+                    only_pointer &= !progress.dirty;
 
                     // Queries and intents. Only an agent connection produces
                     // any, and what it may see is decided by the workspace the
                     // supervisor said this descriptor belongs to.
                     if !progress.requests.is_empty() {
-                        dirty |= screen.requests(fonts, fd, progress.requests);
+                        let acted = screen.requests(fonts, fd, progress.requests);
+                        dirty |= acted;
+                        only_pointer &= !acted;
                     }
 
                     // A tree that genuinely changed is worth a word to the
@@ -370,9 +398,8 @@ fn run(
                     // A first tree is worth printing whole: the reduced schema
                     // can then be read against the document that produced it,
                     // which is the claim the design makes about them.
-                    if let Some(client) = screen.client_mut(fd)
-                        && client.version() == 1
-                        && progress.dirty
+                    if progress.first
+                        && let Some(client) = screen.client_mut(fd)
                         && let Some(view) = client.agent_view()
                     {
                         for line in view.lines() {
@@ -388,6 +415,7 @@ fn run(
                             log(&format!("{label} disconnected"));
                         }
                         dirty = true;
+                        only_pointer = false;
                     }
                 }
 
@@ -487,17 +515,26 @@ fn run(
 
             if stat_since.elapsed().as_secs() >= 1 && stat_frames > 0 {
                 log(&format!(
-                    "frames: {} in {}ms, paint avg {:.1}ms worst {:.1}ms, blit avg {:.1}ms",
+                    "frames: {} in {}ms, paint avg {:.1}ms worst {:.1}ms, blit avg {:.1}ms, \
+                     trees {} costing {:.1}ms worst {:.1}ms ({})",
                     stat_frames,
                     stat_since.elapsed().as_millis(),
                     stat_paint.as_secs_f32() * 1000.0 / stat_frames as f32,
                     stat_worst.as_secs_f32() * 1000.0,
                     stat_blit.as_secs_f32() * 1000.0 / stat_frames as f32,
+                    stat_trees,
+                    stat_tree_time.as_secs_f32() * 1000.0,
+                    stat_tree_worst.as_secs_f32() * 1000.0,
+                    stat_tree_who,
                 ));
                 stat_paint = std::time::Duration::ZERO;
                 stat_blit = std::time::Duration::ZERO;
                 stat_worst = std::time::Duration::ZERO;
                 stat_frames = 0;
+                stat_trees = 0;
+                stat_tree_time = std::time::Duration::ZERO;
+                stat_tree_worst = std::time::Duration::ZERO;
+                stat_tree_who.clear();
                 stat_since = std::time::Instant::now();
             }
         } else if overlay {

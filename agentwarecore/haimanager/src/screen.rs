@@ -87,6 +87,9 @@ fn taskbar_height(fonts: &Fonts) -> i32 { ui::control_h(fonts) + ui::taskbar_ins
 fn pane_handle_w() -> i32 { ui::sc(12) }
 /// Height of the title bar the compositor draws around an application window.
 fn window_title_h() -> i32 { ui::sc(24) }
+/// How far a window's painting reaches beyond its own rectangle: its shadow,
+/// at the largest blur a focused one wears.
+fn window_reach() -> i32 { ui::sc(22) }
 /// The square icon at the left end of a title bar.
 fn title_icon() -> i32 { ui::sc(14) }
 /// How far each successive window is offset, so none opens exactly on another.
@@ -875,7 +878,7 @@ impl Screen {
     }
 
     pub fn readable(&mut self, fd: RawFd, fonts: &Fonts) -> Option<Progress> {
-        let progress = self.client_mut(fd)?.readable(fonts);
+        let mut progress = self.client_mut(fd)?.readable(fonts);
         if progress.first {
             self.fit_window(fd, fonts);
         }
@@ -886,7 +889,36 @@ impl Screen {
         }
         // A fresh tree may be the window an agent is waiting on.
         self.settle_rows();
+        // Whether the *screen* changed, which is what the event loop uses this
+        // for and is not the same question. A workspace nobody is looking at
+        // has an agentdesk re-rendering on its own clock and applications
+        // answering an agent's actions, and every one of those used to repaint
+        // the desk in front of the human, and to throw away the small damage
+        // rectangle a window drag would otherwise have cost.
+        progress.dirty &= self.on_screen(fd);
         Some(progress)
+    }
+
+    /// Whether a workspace is the one on screen.
+    fn desk_on_screen(&self, desk: u32) -> bool {
+        self.workspaces.get(self.current).is_some_and(|workspace| workspace.id == desk)
+    }
+
+    /// Whether anything this client draws is currently visible: its workspace
+    /// is the one on screen, and if it owns a window, that window is not
+    /// minimized.
+    fn on_screen(&self, fd: RawFd) -> bool {
+        let Some(client) = self.client(fd) else { return false };
+        let Some(workspace) = self.workspaces.get(self.current) else { return false };
+        if client.desk != workspace.id {
+            return false;
+        }
+        match workspace.windows.iter().find(|window| window.fd == fd) {
+            Some(window) => !window.minimized,
+            // Not a window: the agentdesk's own regions, which are the
+            // wallpaper, the pane and the taskbar.
+            None => true,
+        }
     }
 
     pub fn flush_all(&mut self) {
@@ -1597,7 +1629,11 @@ impl Screen {
         for fields in requests {
             dirty |= self.answer(fonts, from, &fields);
         }
-        dirty
+        // Whether the screen changed, which for an agent's intent means
+        // whether its workspace is the one being looked at. Queries never
+        // change anything and say so themselves.
+        let desk = self.client(from).map(|client| client.desk);
+        dirty && desk.is_some_and(|desk| self.desk_on_screen(desk))
     }
 
     fn answer(&mut self, fonts: &Fonts, from: RawFd, fields: &[String]) -> bool {
@@ -1996,7 +2032,16 @@ impl Screen {
     pub fn wants_frame(&self) -> bool {
         self.flight.is_some()
             || self.panes_moving()
-            || self.clients.iter().any(Client::animating)
+            // Only what is on screen: a control sinking for a fifth of a
+            // second in a workspace nobody is looking at is not a reason to
+            // run the compositor at sixty frames a second and repaint the
+            // desk in front of the human for every one of them. An agent
+            // working in another agentdesk presses a control every few
+            // hundred milliseconds, so this was very nearly continuous.
+            || self
+                .clients
+                .iter()
+                .any(|client| client.animating() && self.on_screen(client.fd()))
     }
 
     /// Advance whatever is moving.
@@ -2024,12 +2069,18 @@ impl Screen {
 
         let Some(flight) = &self.flight else { return busy || settling || panes || blinked };
 
+        // An agent working in another agentdesk is still working: its cursor
+        // travels, its keystrokes go in, the application answers. What it
+        // must not do is repaint the desk in front of the human once per
+        // character for something happening where nobody can see it.
+        let showing = self.desk_on_screen(flight.desk);
+
         match flight.stage {
             Stage::Travelling => {
                 let elapsed = flight.started.elapsed();
                 if elapsed >= FLIGHT {
                     self.land(fonts);
-                    return true;
+                    return showing;
                 }
 
                 // Eased, because a pointer that moves at a constant speed and
@@ -2040,7 +2091,7 @@ impl Screen {
                 let x = flight.from.0 + ((flight.to.0 - flight.from.0) as f32 * eased) as i32;
                 let y = flight.from.1 + ((flight.to.1 - flight.from.1) as f32 * eased) as i32;
                 self.agent_cursor = Some((flight.desk, x, y));
-                self.overlay_dirty = true;
+                self.overlay_dirty |= showing;
                 false
             }
 
@@ -2048,7 +2099,7 @@ impl Screen {
                 if Instant::now() >= next {
                     self.type_one(fonts, done);
                 }
-                true
+                showing
             }
         }
     }
@@ -2627,6 +2678,14 @@ impl Screen {
         // put anything behind its own windows.
         for window in &workspace.windows {
             if window.minimized {
+                continue;
+            }
+            // A window the repaint does not reach costs nothing. Worth the
+            // test because a window is not cheap: four spreadsheets open at
+            // once measured 11.8ms of paint against 4.3ms for one, about two
+            // milliseconds each, and a repaint of the region a small window
+            // swept used to pay all of it.
+            if window.rect.inset(-window_reach()).intersect(&canvas.clip()).is_none() {
                 continue;
             }
             let focused = self.focus == Surface::App(window.fd);
