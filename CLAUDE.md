@@ -223,9 +223,12 @@ asking the compositor what is open.
 The start menu is a panel, not a process (`haimanager/src/startmenu.rs`).
 The Agentware mark at the left end of the taskbar opens it, centred over the
 workspace and sized to its content: a large prompt on top (Enter makes a new
-agentdesk that begins with it; empty makes one with nothing to do), and below
+agentdesk that begins with it; empty makes one with nothing to do) with the
+model that will answer it beside the button that starts it, and below
 it every installed application as a grid three across, icon over name, each
-tile opening the app into the workspace on screen. A click anywhere else, or
+tile opening the app into the workspace on screen. The heading says what the
+panel is; the sentence that used to explain the box underneath it is gone,
+because the placeholder in the box already says what it is for. A click anywhere else, or
 Escape, closes it. It is compositor chrome for the reasons the dock is: it
 needs the icons only the compositor holds, click-out is something only the
 compositor sees, and it must work when the workspace under it does not. It is
@@ -580,6 +583,10 @@ is the list so it does not get relitigated.
 * The stop button is drawn by the haimanager and routes to the supervisor, so it
   works even if the agentdesk is wedged.
 * Applications send the **whole tree** every time; the haimanager diffs it.
+  The one exception is a `spreadsheet`, whose cells are published as runs on
+  their own frames and are never diffed at all. It earns the exception by
+  being the first thing that is not small, and it pays for it with a version
+  in the tree that every render re-asserts.
 * Window chrome is the **compositor's**: title bar, shadow, and the three dots.
   They are the only controls that are not AWML, so no application decides
   whether it is closable and no agent sees the button that destroys its window.
@@ -590,18 +597,18 @@ is the list so it does not get relitigated.
   only do what a human could have done stops being checkable.
 * **Scrolling is not in the agent's vocabulary and never was a good idea
   there.** Acting on a node scrolls every container above it, outermost
-  first, and a table across its columns, exactly as acting on an application
-  arranges its window. An agent expresses what should be true and is not told
-  about pixels. `not-visible` is gone with it: every case it named was either
-  a bug here (a nested container not walked, a table walked past) or a
-  different word (a folded option offers no actions, which is what it should
+  first, and a grid to the cell being acted on, exactly as acting on an
+  application arranges its window. An agent expresses what should be true and
+  is not told about pixels. `not-visible` is gone with it: every case it named
+  was either a bug here (a nested container not walked, a grid walked past) or
+  a different word (a folded option offers no actions, which is what it should
   say). What is left is `unreachable`, which means the compositor tried and
   failed, and is logged as the fault it is.
-* **A row nobody sent is not a scrolling problem.** `query rows <app>
-  <table> <first-row>` asks an application to describe a different window and
-  answers with the view once it has. A query rather than an action because it
-  is a read, and because a cell outside the window is not in the tree for an
-  intent to name.
+* **A sheet is read by asking for a rectangle, not by reading the view.**
+  `query cells <app> <id> <range>` answers with rows of values. A query rather
+  than an action because it is a read, and unlike the `query rows` it replaced
+  it asks the application nothing at all: the compositor holds the cells, so
+  the answer is a lookup.
 * The tree version is the **application's own counter**, stamped by it and echoed
   back on every event. Checking one is then a comparison against a number the app
   already holds, not a mapping it has to maintain.
@@ -645,41 +652,83 @@ is the list so it does not get relitigated.
   from the one table in `awproto::turn`, and travels to the agent as the
   `backend` message on the turn channel. The selector is desk chrome, so an
   agent is told what it runs as and can never see or change the control.
+  **The start menu offers the same choice for a conversation that does not
+  exist yet**, from the same table, because choosing the model after the
+  first turn has already run is choosing it too late. It travels to the new
+  workspace the way the opening prompt does, as an argument PID 1 passes on
+  without reading; a name the agentdesk does not recognise falls back to the
+  default, which is what a workspace nobody chose for gets anyway. It is not
+  a machine setting and is not remembered between openings: the next
+  conversation is not this one.
 * **A dialog belongs to the application's tree**, never to a separate process
   or to chrome, so the agent sees it in the app's view as controls nested in
   `<dialog>`. The compositor makes it modal for human and agent alike; there
   is no attribute to opt out.
 
-**The grid, and the two things it needed.** `table`, `column`, `row` and
-`cell` are built (`docs/UIElements.md`), which is everything a spreadsheet
-application needs from the compositor. A `cell` is a control rather than
-content, since a cell that cannot be named cannot be read or typed into,
-and it is the one control whose description the compositor writes: meaning
-is positional there, and a sheet cannot carry ten thousand hand-written
-sentences, so the column's label and the row's become one.
+**The grid: `spreadsheet`, and the one place the whole-tree rule is set
+aside.** `table`, `column`, `row` and `cell` are gone. They worked, and they
+did not scale in three directions at once. A screenful of a grid is four
+hundred cell elements, so an agent paid **46.6 KB to read twenty numbers**,
+89% of it identical action lists and descriptions the compositor had composed
+itself; every keystroke made the application re-serialise the visible grid;
+and ten thousand rows could only be described a window at a time, so
+scrolling was a question the application had to answer.
 
-Two things had to exist first. A **second scrolling axis**, because a grid
-is the first thing wider than its window; the offset across is the
-compositor's, over columns that are all present, and `Scroller` now carries
-which way it runs. And a **window over content too large to send**: a
-table's `row` children are the rows it chose to describe, `rows` says how
-many exist and `first-row` which one the first child is, so ten thousand
-rows cost a tree of forty. The bar is drawn against the whole sheet, and
-the wheel, the bar and an agent's `query rows` all become one `scroll` event
-asking the application to move its window, answered by a
-new tree the way a dropdown answers `open`. It is the only scroll position
-that crosses the protocol, because it is not one: it is which slice the
-application chose. Offsets inside a `scroll` container remain the
-compositor's and still go nowhere.
+So a spreadsheet's cells are **not in the tree**. The element carries a
+*name* and a *version*, the way an `image` carries a path, and the cells go
+up the same socket as their own frames (`awproto::display::MSG_SHEET`,
+`haimanager/src/sheet.rs`):
 
-Column widths are in `chars`, not pixels, so a column is the same column on
-another display; the human may drag an edge and where they drag it to is
-ephemeral state like a scroll offset, never told to the application.
-Keyboard work in a grid is the compositor's too: arrows move the cursor
-cell, Enter commits and moves down, and typing into a selected cell starts
-a fresh value the way every spreadsheet does. Each move reports `select` on
-the cell it lands on, which is what lets the application keep its window on
-the cursor when the compositor is the one moving it.
+```
+sheet <source> <version> <base> <at> <value>...
+```
+
+One shape and no operation verbs: put these values in, starting at this cell
+and running across. A single cell is a run of one, a row is a run of many,
+and clearing is a run of empty strings, because in a sheet an empty cell and
+a cleared one are the same cell. **Nothing is compared with anything** — the
+compositor does not work out what changed, it is told, and it writes what it
+is told. `version` is what the sheet becomes and `base` what it must already
+be, so a run that cannot be placed is refused whole and answered with
+`sheet-resend`; a `base` of zero means "forget what you have", so a first
+publish and a recovery are one code path. `SheetOut` owns the counter,
+because getting it wrong is the one way this can go wrong. Ordering is free
+because it is one connection: cells, then the tree that claims them.
+
+**Both axes became the compositor's**, which is a settled decision reversed
+on purpose. It held while the rows on screen were the ones the application
+chose to describe; it does not hold now that the compositor holds the sheet.
+Sixty wheel notches move a thousand-row sheet, and a drag of its bar from the
+top to row 989, with the application hearing nothing at all: `query rows`,
+`first-row`, `PendingRows`, the deferred reply and the `scroll` action all
+went with it. What the compositor holds is what the application *chose to
+publish*, and it scrolls the shape the element declares.
+
+The honest limit: an application whose sheet is too large to publish whole
+has no way to be told where the view is, so it cannot stream a band. Nothing
+needs that yet — a sparse sheet of a hundred thousand filled cells is about
+6MB — and the shape a fix would take is a `scroll` event again, opted into on
+the element so the common case stays silent. It is not built, so it is not
+claimed.
+
+**A cell is a coordinate, not a node.** There is nothing for a target to
+name, so the cell travels beside the action — a `cell` field on the event,
+and `sheet!B7` in an intent. Layout produces one `Grid` record of arithmetic
+instead of four hundred rectangles, and painting, hit testing and the fake
+cursor all read cells out of it, so a sheet of a million costs what a sheet
+of ten costs. Column letters are the compositor's, because A, B, … Z, AA is
+what every spreadsheet does. Typing into a cell is the compositor's copy
+until the application echoes it, exactly as in a field.
+
+Measured, first tree of `awsheet`: the agent's view went from **423 lines and
+46,650 bytes to 14 lines and 1,082**, and the tree from about four hundred
+nodes to twelve.
+
+One bug worth keeping: the compositor's copy of a cell being typed into is
+keyed `element!B7`, which is not a document key, and `reconcile` pruned
+`editing` by asking whether the key was still in the tree. It never was, so
+every re-render threw the edit away — and the application re-renders after
+every keystroke. Typing `42` into a cell left `2` in it.
 
 **A grid is more than cells.** `menu` and `menuitem` are a dropdown by
 another name and share its machinery: items float while open, fold to

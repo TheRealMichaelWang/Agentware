@@ -2,10 +2,20 @@
 //! installed application.
 //!
 //! The Agentware mark at the left end of the taskbar opens a panel centred over
-//! the workspace. On top, a prompt: Enter makes it a new agentdesk, empty makes
-//! one with nothing to do yet. Below, a grid of every installed application,
-//! three across, icon over name; pressing one opens it into the workspace on
-//! screen. A click anywhere else, or Escape, closes the panel.
+//! the workspace. On top, a prompt and the model that will answer it: Enter
+//! makes a new agentdesk, empty makes one with nothing to do yet. Below, a grid
+//! of every installed application, three across, icon over name; pressing one
+//! opens it into the workspace on screen. A click anywhere else, or Escape,
+//! closes the panel.
+//!
+//! The model is chosen here as well as in an agentdesk's pane because this is
+//! where a conversation begins, and which model answers is a property of the
+//! conversation: choosing it after the first turn has already run is choosing
+//! it too late. Both selectors read the one table in `awproto::turn`, and the
+//! choice travels to the new workspace the way the prompt does, as an argument
+//! PID 1 passes on without reading. It is not a machine setting and is not
+//! remembered: the panel opens on the default, because the next conversation is
+//! not this one.
 //!
 //! It is compositor chrome for the reasons the dock and the navigation bar are:
 //! it needs the icons only the compositor holds, it must vanish on a click
@@ -23,6 +33,7 @@
 use std::collections::HashMap;
 
 use awproto::display::escape;
+use awproto::turn;
 
 use crate::clipboard::Clipboard;
 use crate::document::Document;
@@ -61,8 +72,9 @@ pub enum StartOutcome {
     /// The document changed and wants rebuilding.
     Changed,
     Close,
-    /// Make a workspace, with this prompt or with none.
-    CreateDesk(Option<String>),
+    /// Make a workspace, with this prompt or with none, running as this
+    /// backend configuration.
+    CreateDesk { prompt: Option<String>, backend: &'static str },
     /// Open this application into the workspace on screen.
     Open(String),
     /// Shut the machine down. Real power-off, not a screen that pretends:
@@ -92,6 +104,10 @@ pub struct StartMenu {
     presses: MultiPress,
     /// Whether a run is being dragged out of the prompt right now.
     dragging: bool,
+    /// Which of `turn::BACKENDS` the new agentdesk will run as, and whether
+    /// its dropdown is showing.
+    backend: &'static turn::BackendConfig,
+    backend_open: bool,
     doc: Option<Document>,
     layout: Layout,
     scroll: HashMap<String, i32>,
@@ -111,6 +127,9 @@ impl StartMenu {
             prompt: Editing::new(String::new()),
             presses: MultiPress::default(),
             dragging: false,
+            backend: turn::backend_config(turn::DEFAULT_BACKEND)
+                .unwrap_or(&turn::BACKENDS[0]),
+            backend_open: false,
             doc: None,
             layout: Layout::empty(),
             scroll: HashMap::new(),
@@ -149,9 +168,7 @@ impl StartMenu {
     fn markup(&self) -> String {
         let mut out = String::from(
             "<window font=\"sans\" pad=\"none\">\n  <vstack gap=\"md\">\n\
-             \x20   <text role=\"heading\">New agentdesk</text>\n\
-             \x20   <text color=\"muted\">Say what it should do. Enter starts it; \
-             an empty prompt makes one with nothing to do yet.</text>\n",
+             \x20   <text role=\"heading\">New agentdesk</text>\n",
         );
         out.push_str(&format!(
             "    <field id=\"start-prompt\" size=\"16\" height=\"{height}\" value=\"{value}\" \
@@ -160,8 +177,31 @@ impl StartMenu {
             height = prompt_h(),
             value = escape(&self.prompt.value),
         ));
+
+        // The model, beside the button that starts the turn it will answer.
+        // The same table the pane's selector reads, so there is one list of
+        // what this machine can run as.
+        out.push_str("    <hstack gap=\"sm\">\n");
+        out.push_str(&format!(
+            "      <select id=\"start-backend\" value=\"{value}\"{open} \
+             description=\"Chooses the model the new agentdesk answers with\">\n",
+            value = turn::BACKENDS
+                .iter()
+                .position(|config| config.id == self.backend.id)
+                .unwrap_or(0),
+            open = if self.backend_open { " open=\"true\"" } else { "" },
+        ));
+        for (index, config) in turn::BACKENDS.iter().enumerate() {
+            out.push_str(&format!(
+                "        <option id=\"start-backend-{index}\" label=\"{label}\" value=\"{index}\"{selected} \
+                 description=\"Starts the new agentdesk as {label}\"/>\n",
+                label = escape(config.label),
+                selected = if config.id == self.backend.id { " selected=\"true\"" } else { "" },
+            ));
+        }
+        out.push_str("      </select>\n");
         out.push_str(
-            "    <hstack gap=\"sm\">\n      <text grow=\"true\"/>\n\
+            "      <text grow=\"true\"/>\n\
              \x20     <button id=\"start-go\" label=\"Start agentdesk\" emphasis=\"primary\" \
              description=\"Creates a new agentdesk that begins with the prompt above\"/>\n\
              \x20   </hstack>\n\
@@ -221,8 +261,37 @@ impl StartMenu {
     /// A press inside the panel.
     pub fn click(&mut self, fonts: &Fonts, x: i32, y: i32) -> StartOutcome {
         let Some(doc) = &self.doc else { return StartOutcome::Nothing };
-        let Some(index) = self.layout.hit(&doc.tree, x, y) else { return StartOutcome::Nothing };
+        // With overlays, because an open dropdown's options float over
+        // whatever they cover and are hit before it.
+        let hit = self.layout.hit_with_overlays(&doc.tree, x, y);
+
+        // A press anywhere but on the open list closes it, exactly as it does
+        // in an application: the press that dismisses a dropdown is not also
+        // a press on what was behind it.
+        if self.backend_open {
+            let on_list = hit.is_some_and(|index| {
+                doc.tree.node(index).id().is_some_and(|id| id.starts_with("start-backend"))
+            });
+            if !on_list {
+                self.backend_open = false;
+                return StartOutcome::Changed;
+            }
+        }
+
+        let Some(index) = hit else { return StartOutcome::Nothing };
         let Some(id) = doc.tree.node(index).id() else { return StartOutcome::Nothing };
+
+        if id == "start-backend" {
+            self.backend_open = !self.backend_open;
+            return StartOutcome::Changed;
+        }
+        if let Some(at) = id.strip_prefix("start-backend-") {
+            self.backend_open = false;
+            if let Some(config) = at.parse::<usize>().ok().and_then(|at| turn::BACKENDS.get(at)) {
+                self.backend = config;
+            }
+            return StartOutcome::Changed;
+        }
 
         if id == "start-go" {
             return self.submit();
@@ -301,7 +370,10 @@ impl StartMenu {
     /// if there is not.
     fn submit(&mut self) -> StartOutcome {
         let prompt = self.prompt.value.trim().to_owned();
-        StartOutcome::CreateDesk(if prompt.is_empty() { None } else { Some(prompt) })
+        StartOutcome::CreateDesk {
+            prompt: if prompt.is_empty() { None } else { Some(prompt) },
+            backend: self.backend.id,
+        }
     }
 
     pub fn key(&mut self, key: Key, clipboard: &mut Clipboard) -> StartOutcome {
@@ -352,7 +424,7 @@ impl StartMenu {
         // corners.
         let Some(&body) = doc.tree.node(Document::ROOT).children.first() else { return };
         canvas.clipped(panel, |canvas| {
-            ui::paint_subtree(canvas, fonts, images, &doc.tree, &self.layout, body, &focus)
+            ui::paint_subtree(canvas, fonts, &ui::Content { images, sheets: &crate::sheet::Sheets::default() }, &doc.tree, &self.layout, body, &focus)
         });
     }
 }

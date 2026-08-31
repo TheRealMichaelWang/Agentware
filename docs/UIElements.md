@@ -160,10 +160,7 @@ A `select` is a dropdown. Its `open` is the application's, like every other piec
 | --- | --- | --- | --- |
 | `list` | `label`, `multi` | `disabled` | — |
 | `item` | `label` | `selected`, `disabled` | `focus` `click` `select` `deselect` |
-| `table` | `label`, `rows`, `first-row` | `disabled` | — |
-| `column` | `label`, `chars` | — | — |
-| `row` | `label` | `selected` | `focus` `select` |
-| `cell` | — | `value`, `editable`, `selected`, `disabled` | `focus` `select`, plus `type-text` `clear` `submit` when `editable` |
+| `spreadsheet` | `source`, `version`, `rows`, `columns`, `cursor`, `selection` | `disabled` | `focus` `select` `select-range` `type-text` `clear` `submit` |
 | `tabs` | `label` | — | — |
 | `tab` | `label` | `selected`, `closable`, `movable`, `disabled` | `focus` `select`, plus `close` when `closable` and `move` when `movable` |
 
@@ -197,23 +194,53 @@ Nothing in there says where the strip is, how tall it is, what colour the band b
 
 `item` has both `click` and `select` because they are different intentions: clicking a file opens it, selecting it marks it for a subsequent operation.
 
+### A spreadsheet's cells are not in the tree
+
+This is the one element whose content does not arrive as markup, and the only place in the system where the whole-tree rule is set aside. It is set aside because a sheet is the first thing that is not small.
+
+Everything else is described by resending the whole document and letting the compositor diff it, which works because everything else *is* small. Cells as elements did not scale in three directions at once. A screenful of a grid is four hundred of them, so an agent paid **46 KB to read twenty numbers**, 89% of it identical action lists and descriptions the compositor had composed itself. Every keystroke made the application re-serialise the visible grid. And a sheet of ten thousand rows could only ever be described a window at a time, so scrolling was a question the application had to answer.
+
+So the tree carries a *name* and a *version*, the way an `image` carries a path, and the cells go up the same socket as their own frames:
+
+```xml
+<spreadsheet id="sheet" grow="true" source="book" version="42"
+             rows="1000" columns="26" cursor="B7" selection="A1:C5"
+             description="The budget"/>
+```
+
+```
+sheet <source> <version> <base> <at> <value>...
+```
+
+One frame shape and no operation verbs: *put these values in, starting at this cell and running across*. A single cell is a run of one, a filled row is a run of many, and emptying a cell is a run carrying an empty string, because in a sheet an empty cell and a cleared one are the same cell.
+
+**Nothing is compared with anything.** The compositor does not work out what changed; it is told, and it writes what it is told. `version` is what the sheet becomes and `base` is what it must already be, so a run that cannot be placed is refused rather than half-applied, and the compositor answers `sheet-resend <source> <have>`. A `base` of zero means "forget what you have and start from here", which is what a snapshot is, so a first publish and a recovery are one code path. `awproto`'s `SheetOut` owns the counter, because getting it wrong is the one way this can go wrong.
+
+Ordering is free because it is one connection: publish the cells that make a version, then send the tree that claims it. The compositor can never hold a tree ahead of its data, and because the version is *in the tree*, every render re-asserts which version the picture is of — divergence is caught on the next frame instead of drifting.
+
+**Both axes are the compositor's.** It holds the sheet, so scrolling is two offsets rather than a round trip: sixty wheel notches, or a drag of the bar from the top to row 989, move a thousand-row sheet without the application hearing anything at all. What it holds is what the application *chose to publish*, and it scrolls the shape the element declares. An application whose sheet is too large to publish whole has no way yet to be told where the view is, so it cannot stream a band; nothing needs that yet, and it is not claimed.
+
+**A cell is a coordinate, not a node.** There are no cell elements, so nothing can name one as a target; the cell travels *beside* the action instead, on the event and in an intent. A press on a grid sends `select` naming `B7`; a drag sends `select-range` with the two corners; typing sends `type-text` a keystroke at a time, carrying the value the cell now has. An agent names a cell after its element: `sheet!B7`.
+
+Column letters are the compositor's, because A, B, … Z, AA is what every spreadsheet does and an application saying so would only ever say the same thing. A column's width is the human's to drag and the compositor's to remember, like a scroll offset.
+
 ### Choosing a run of cells
 
-`select-range` names one corner as the target and the other corner's id as the value. Both must be cells in the same table; anything else is refused.
+`select-range` names one corner in the event's cell and the other in its value. Both must be cells of that grid; anything else is refused.
 
-One action rather than fifteen selects, because a person dragging across a grid did one thing, and because "A1 through C5" is legible in a way a list of ids is not. The human's drag produces the same event, sent again each time the run reaches another cell, in the same spirit as one event per keystroke: the application hears what the hand is doing while it does it. What the run looks like is then the application's business, painted from the `selected` state it puts on its own cells.
+One action rather than fifteen selects, because a person dragging across a grid did one thing, and because "A1 through C5" is legible in a way a list of ids is not. The human's drag produces the same event, sent again each time the run reaches another cell, in the same spirit as one event per keystroke: the application hears what the hand is doing while it does it. What the run looks like is then the application's business, and it says so by sending `selection` back on the element.
 
-A column header and a row take plain `select`, which is how a whole column or row is chosen.
+### Reading one
 
-### A table holds a window, not a sheet
+An agent gets the shape in the view and the values by asking:
 
-A `cell` is a control, not content: a spreadsheet's cells are named, read and typed into one at a time, and something that cannot be addressed cannot be any of those. It is the one control whose description is not written by the application, because its meaning is entirely positional and a sheet has far too many of them for a sentence each; the compositor composes one from the column's label and the row's, so `A1` reads as "The cell in column A, 1". There is no `click` on a cell. Pressing one means choosing it, and `select` is the event a person pressing it produces; pressing an already-chosen editable cell puts the caret in, which is what a double click means elsewhere, spread over two presses because there is no double click in the event vocabulary.
+```xml
+<spreadsheet id="sheet" rows="1000" columns="26" cursor="A1" selection="A1"
+             used="A1:D500" description="The grid of cells, 1000 rows deep"
+             actions="focus select select-range type-text clear submit"/>
+```
 
-**The `row` children are the window, not the sheet.** `rows` says how many rows exist altogether and `first-row` which row the first child is, so a sheet of ten thousand rows is described forty at a time and the tree stays the size of the screen. Nothing else in the system works this way, and nothing else needs to: an application resends everything because everything is small. A spreadsheet is the first thing that is not.
-
-Two axes with two owners follow from that. Across is the compositor's, an ordinary offset over columns that are all present. Down is the application's: the compositor draws the bar against `rows`, and the wheel, the bar and an agent's `query rows` all become a `scroll` event carrying the row that should now be first. The application answers by re-rendering with a new `first-row`, exactly as a dropdown answers `open` by re-rendering with its options. It is the only scroll position that crosses the protocol, and it crosses because it is not a scroll position: it is which slice of the sheet the application chose to describe.
-
-A column's width is in `chars`, not pixels, because a column's width is a property of what is in it and a pixel count would be a different column on a different display. The human may drag a column's edge, and where they drag it to is the compositor's, like a scroll offset: the application declares where a column starts and is never told it moved.
+`used` is the compositor's, the bounding box of everything published, so an agent knows where to look without reading a screenful to find out. `query cells <app> <id> <range>` answers with one line per row, values separated by tabs. The whole view of a sheet application is **14 lines and 1082 bytes**, against 423 lines and 46,650 before.
 
 ### Menus and overlays
 
@@ -245,7 +272,7 @@ The machinery under it is a dropdown's, deliberately: its items float below it w
 
 **Right-click belongs to the application, not to the vocabulary.** The other mouse button sends a `context` event naming whatever was under it, and that is all it does: what it means is the application's to decide, and what it usually decides is to open a menu. The compositor then hangs that menu's items from where the press landed, which is what makes a context menu appear under the hand. Nothing in the tree says so; the compositor knows because it saw the press, and a press with the ordinary button clears it again.
 
-**Except over words, where the compositor keeps it.** The selection and the clipboard are the compositor's and are never told to anyone, so the menu that acts on them is the compositor's too: the other button over a `field`, an `editor`, or any `text` element opens a Cut / Copy / Paste of its own, and the application hears nothing. Over a `cell` the press stays the application's, because cut and copy over a grid mean *cells*, and which cells are chosen is the application's state, reported to it and painted by it; the compositor could not copy a run of them if it wanted to. A cell that is being typed into is a field like any other, and then the words in it are the compositor's again. Neither menu is in any tree and neither reaches an agent, which has no other button and needs none.
+**Except over words, where the compositor keeps it.** The selection and the clipboard are the compositor's and are never told to anyone, so the menu that acts on them is the compositor's too: the other button over a `field`, an `editor`, or any `text` element opens a Cut / Copy / Paste of its own, and the application hears nothing. Over a `spreadsheet` the press stays the application's, because cut and copy over a grid mean *cells*, and which cells are chosen is the application's state, published by it and sent back on the element. Neither menu is in any tree and neither reaches an agent, which has no other button and needs none.
 
 An agent has no right-click and needs none: it opens a menu by naming it, which reaches the same commands without a pointer. A menu with no label draws no title in the bar and still holds a place in the tree, which is how an application offers a context menu that is not also a menu the human can pull down.
 | `dialog` | `label` | — | — |
@@ -270,7 +297,7 @@ The complete closed set. Nothing else exists.
 | `uncheck` | — | Make unchecked, whatever it was. |
 | `toggle` | — | Invert. |
 | `select` | — | Make this the selected one. |
-| `select-range` | the other corner's id | Choose a run of cells between two corners. |
+| `select-range` | the other corner | Choose a run of cells between two corners of a grid. |
 | `deselect` | — | Remove from the selection. |
 | `set-value` | number | Set a numeric value. |
 | `open` | — | Expand a menu, dropdown or popover. |
@@ -281,11 +308,11 @@ The complete closed set. Nothing else exists.
 
 There is no verb for it, and an agent is never told something was out of view.
 
-Acting on a node scrolls whatever has to move first: every scroll container above it, outermost first, and a table across its columns. This is the same thing arrangement does one level up, where acting on an application brings its window forward and puts its siblings away. Reachability is something the compositor makes true, not a question it answers.
+Acting on a node scrolls whatever has to move first: every scroll container above it, outermost first, and a grid to the cell being acted on. This is the same thing arrangement does one level up, where acting on an application brings its window forward and puts its siblings away. Reachability is something the compositor makes true, not a question it answers.
 
-The rejection that used to exist for this, `not-visible`, is gone. It was a symptom wearing the name of one of its causes: a nested container the old code did not walk, a table it walked straight past, a folded dropdown option whose rectangle happened to be empty. Each of those is either a bug here or a different word. What remains is `unreachable`, which an agent should never see: it means the compositor tried to reveal a node and failed, and it is logged as the fault it is.
+The rejection that used to exist for this, `not-visible`, is gone. It was a symptom wearing the name of one of its causes: a nested container the old code did not walk, a grid it walked straight past, a folded dropdown option whose rectangle happened to be empty. Each of those is either a bug here or a different word. What remains is `unreachable`, which an agent should never see: it means the compositor tried to reveal a node and failed, and it is logged as the fault it is.
 
-A row nobody sent is the one thing revealing cannot fix, and that is not scrolling. See `query rows` below.
+There used to be one thing revealing could not fix — a row the application had not sent — and there no longer is. The compositor holds the sheet, so a cell five hundred rows down is two offsets away rather than a question.
 
 ## Selection and the clipboard
 
@@ -293,7 +320,7 @@ Neither is in the protocol, in either direction.
 
 Highlighting is the human's: a press anchors, a drag extends, and the run between is painted behind the words. Ctrl+A, Ctrl+C, Ctrl+X and Ctrl+V are recognised by the compositor against its own copy of a text control, so what an application receives from a paste is a `type-text` carrying the value the control now has, exactly what it would have received had the human typed the words out. No application needs to know a clipboard exists, and none can read one it was not given. No modifier ever reaches the event vocabulary: the keyboard layer turns the chord into the intention before anything else sees it.
 
-**There is one text box on this machine**, `haimanager/src/text.rs`, and an application's `field`, an `editor`, a `cell` being typed into, the start menu's prompt and the navigation bar's rename field are all it. That is worth stating because it was not true: the two chrome boxes had `push` and `pop` and nothing else, so neither could be selected in, copied out of, pasted into, or have its caret moved by an arrow key. A text box that cannot be pasted into is not a text box, and there was no reason for these to be a different thing from the others. What each of them keeps for itself is only what Enter means, which is the one thing that genuinely differs: a field submits, an editor breaks the line, the prompt makes a workspace, the rename field commits a name.
+**There is one text box on this machine**, `haimanager/src/text.rs`, and an application's `field`, an `editor`, a spreadsheet cell being typed into, the start menu's prompt and the navigation bar's rename field are all it. That is worth stating because it was not true: the two chrome boxes had `push` and `pop` and nothing else, so neither could be selected in, copied out of, pasted into, or have its caret moved by an arrow key. A text box that cannot be pasted into is not a text box, and there was no reason for these to be a different thing from the others. What each of them keeps for itself is only what Enter means, which is the one thing that genuinely differs: a field submits, an editor breaks the line, the prompt makes a workspace, the rename field commits a name.
 
 What the one text box does, everywhere:
 
@@ -305,21 +332,19 @@ What the one text box does, everywhere:
 
 Static `text` is selectable too, and that is not the same machinery, because a paragraph on a page is not a control: it has no value an application tracks, no caret, and nothing that can be typed into it. What it has is a run, started by pressing on the words, taken whole by a double or triple click, reached further with shift and an arrow, and copied with Ctrl+C. A press on words is the only way to say where such a run begins, since there is no caret to put down in a paragraph, so a press that selects nothing is kept as an empty run rather than dropped: it paints nothing, copies nothing, and is what the first shift reaches out from. A run stops at one element, so an agent's answer selects whole and an answer plus the label above it does not.
 
-**Shift with an arrow over a grid means cells, not characters.** A chosen cell has no caret, so there is nothing in it for a run of text to be; what the keystroke means there is the same thing it means in every spreadsheet, one cell further, and it ends in the same `select-range` a drag across the grid sends. The far corner is remembered between keystrokes, so shift and right twice reaches two cells. A plain arrow is how it stops being a run. A cell that is being typed into is a text box again, and then shift with left or right is characters; up and down stay the grid's, exactly as the plain ones do, because a spreadsheet that trapped the cursor in a half-typed cell would be unusable.
+**Shift with an arrow over a grid means cells, not characters.** A chosen cell has no caret, so there is nothing in it for a run of text to be; what the keystroke means there is the same thing it means in every spreadsheet, one cell further, and it ends in the same `select-range` a drag across the grid sends. The far corner is remembered between keystrokes, so shift and right twice reaches two cells. A plain arrow is how it stops being a run, and it moves the *application's* cursor by sending it the `select` a press would have sent. A cell being typed into is a text box again, and then shift with left or right is characters; up and down stay the grid's, exactly as the plain ones do, because a spreadsheet that trapped the cursor in a half-typed cell would be unusable.
 
-## Reading a collection too large to send
+## Reading a sheet
 
-A table holds a window. An agent reading a thousand-row sheet sees the forty rows the application described, which is what a human sees too, and `rows` and `first-row` in its view tell it that is what it is holding.
-
-To read a different part it asks:
+A `spreadsheet`'s cells are not in the view, because a screenful of a grid is four hundred of them and four hundred elements is forty kilobytes to learn twenty numbers. The element says how far the sheet runs, where the cursor is, what is chosen, and `used`, the rectangle anything has been put in. To read the part that matters:
 
 ```
-query rows <app> <table> <first-row>
+query cells <app> <id> <range>
 ```
 
-The compositor asks the application to move that table's window and answers with the view once it has, within a bounded wait. One call both asks and reads.
+`range` is `A1:D20`, or one cell as `B7`. The answer is one line per row, values separated by tabs. A range that runs past the sheet is cut to it, because an agent asking for `A1:Z100` of a small sheet is asking to see the sheet.
 
-It is a **query rather than an action** for two reasons. It is a read: the agent wants to see a part of a collection, not change anything. And there is nothing to act on — a cell outside the window is not in the tree, so an intent naming it has no target to resolve. An application that ignores the request costs the agent one stale view whose `first-row` says plainly that nothing moved.
+It is a **query rather than an action** because it is a read: the agent wants to see part of a sheet, not change anything. And unlike the `query rows` it replaced, nothing is asked of the application at all — the compositor holds the cells, so the answer is a lookup and arrives at once.
 
 ## Selection and the clipboard
 

@@ -148,10 +148,15 @@ struct Desk {
 fn main() {
     let mut args = std::env::args().skip(1);
     let Some(id) = args.next().and_then(|id| id.parse::<u32>().ok()) else {
-        log("usage: agentdesk <id> [opening prompt]");
+        log("usage: agentdesk <id> [opening prompt] [backend]");
         std::process::exit(2);
     };
     let opening: Option<String> = args.next().filter(|text| !text.trim().is_empty());
+    // Which model this workspace answers with, chosen in the start menu
+    // before the conversation existed. A name from outside the table is not
+    // an error worth refusing a workspace over: it falls back to the default,
+    // which is what a workspace nobody chose for gets anyway.
+    let backend = args.next().and_then(|id| turn::backend_config(&id));
 
     let mut surface = match Surface::inherited() {
         Ok(surface) => surface,
@@ -166,6 +171,9 @@ fn main() {
     }
 
     let mut desk = Desk::new(id);
+    if let Some(backend) = backend {
+        desk.backend = backend;
+    }
     log(&format!("desk {id}: up, {} application(s) installed", desk.installed.len()));
 
     // The opening prompt is the reason the workspace exists, so it is the

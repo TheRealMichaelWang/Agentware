@@ -104,8 +104,14 @@ pub const MSG_INTENT: &str = "intent";
 pub const MSG_APPS: &str = "apps";
 pub const MSG_VIEW: &str = "view";
 pub const MSG_CLIPBOARD: &str = "clipboard";
-/// Read a different window of a table. Answered with a `view`.
-pub const MSG_ROWS: &str = "rows";
+/// Read a rectangle of a spreadsheet. Answered with a `cells` block.
+///
+/// A sheet is the one thing too big to put in a view: a screenful is four
+/// hundred cells, and four hundred elements with a description and an action
+/// list each is forty kilobytes to learn twenty numbers. The element in the
+/// view says how far the sheet runs and where it is used; this is how the
+/// part that matters is read.
+pub const MSG_CELLS: &str = "cells";
 pub const MSG_DONE: &str = "done";
 pub const MSG_REJECTED: &str = "rejected";
 /// An application's tree changed since it was last read. Unsolicited, and
@@ -254,15 +260,13 @@ impl Link {
         Ok(reply.get(2).cloned().unwrap_or_default())
     }
 
-    /// Read a table from a given row, moving its window if it has to.
+    /// Read a rectangle of a spreadsheet, as `A1:D20` or a single `B7`.
     ///
-    /// Answered with the application's view once the window has moved, so
-    /// one call both asks and reads. Slower than [`Link::view`], because it
-    /// waits for the application to answer; the reply says which rows it got.
-    pub fn rows(&mut self, app: &str, table: &str, first_row: u32) -> io::Result<String> {
-        let reply =
-            self.round_trip(&[MSG_QUERY, MSG_ROWS, app, table, &first_row.to_string()])?;
-        Ok(reply.get(2).cloned().unwrap_or_default())
+    /// Answered with one line per row, values separated by tabs, so twenty
+    /// numbers read as twenty numbers.
+    pub fn cells(&mut self, app: &str, id: &str, range: &str) -> io::Result<String> {
+        let reply = self.round_trip(&[MSG_QUERY, MSG_CELLS, app, id, range])?;
+        Ok(reply.get(4).cloned().unwrap_or_default())
     }
 
     /// What the human last copied, as a kind and its content.
