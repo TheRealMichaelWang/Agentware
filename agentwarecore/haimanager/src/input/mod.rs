@@ -35,6 +35,22 @@ pub enum Key {
     Right,
     Up,
     Down,
+    Home,
+    End,
+    Delete,
+    /// The same four, and the two ends of a line, with shift held: the
+    /// keyboard's way of dragging out a selection.
+    ///
+    /// Named rather than carried as a modifier for the reason every other
+    /// chord is: nothing downstream should be reasoning about which keys are
+    /// down, and an application must never be able to find out. What the
+    /// compositor does with them never leaves it.
+    ShiftLeft,
+    ShiftRight,
+    ShiftUp,
+    ShiftDown,
+    ShiftHome,
+    ShiftEnd,
     /// The clipboard chords, named by what they do rather than by the keys
     /// that produce them.
     ///

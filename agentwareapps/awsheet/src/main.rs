@@ -378,16 +378,30 @@ impl Sheet {
 
     fn render(&self) -> String {
         let mut out = String::from("<window title=\"Sheet\" font=\"sans\">\n");
+
+        // The menu bar: menus are children of the window and nowhere else,
+        // and the compositor puts them in a row across the top of it. This
+        // says the application has an Edit menu; where a menu bar goes is no
+        // more an application's business than where its window goes.
+        //
+        // The same menu is what a right-press opens, hung from wherever the
+        // press landed. One menu, two ways to reach it.
+        let _ = writeln!(
+            out,
+            "  <menu id=\"edit\" label=\"Edit\"{} description=\"Commands for the chosen cells\">
+    <menuitem id=\"menu-fill\" label=\"Fill from the first\" description=\"Copies the first chosen cell into the rest\"/>
+    <menuitem id=\"menu-clear\" label=\"Clear\" description=\"Empties every chosen cell\"/>
+  </menu>",
+            if self.menu_open { " open=\"true\"" } else { "" }
+        );
+
         out.push_str("  <vstack gap=\"sm\" grow=\"true\">\n");
 
-        // The tabs, then a menu bar. Both are ordinary controls in the tree;
-        // the compositor floats the menu's items and knows nothing else about
-        // either.
-        // The same gap the navigation bar puts between its agentdesk tabs.
-        // The strip holds the tabs, the plus that adds one, and the menu,
-        // exactly as the navigation bar holds its tabs and its own plus. The
-        // compositor paints the band; everything in it comes out looking
-        // like the bar without this having to ask.
+        // The sheet tabs. The same gap the navigation bar puts between its
+        // agentdesk tabs; the strip holds the tabs and the plus that adds
+        // one, exactly as the navigation bar holds its tabs and its own plus.
+        // The compositor paints the band, so they come out looking like the
+        // bar without this having to ask.
         out.push_str("    <tabs gap=\"sm\">\n");
         for (at, (id, name)) in self.sheets.iter().enumerate() {
             let _ = writeln!(
@@ -399,14 +413,6 @@ impl Sheet {
         }
         out.push_str(
             "      <button id=\"new-sheet\" label=\"+\" description=\"Adds a sheet\"/>\n",
-        );
-        let _ = writeln!(
-            out,
-            "      <menu id=\"edit\" label=\"Edit\"{} description=\"Commands for the chosen cells\">
-        <menuitem id=\"menu-fill\" label=\"Fill from the first\" description=\"Copies the first chosen cell into the rest\"/>
-        <menuitem id=\"menu-clear\" label=\"Clear\" description=\"Empties every chosen cell\"/>
-      </menu>",
-            if self.menu_open { " open=\"true\"" } else { "" }
         );
         out.push_str("    </tabs>\n");
         let _ = writeln!(

@@ -67,8 +67,10 @@ use crate::client::{Client, Kind, Progress};
 use crate::clipboard::Clipboard;
 use crate::cursor;
 use crate::document::Document;
+use crate::editmenu::{EditMenu, Offer, Target};
 use crate::images::Images;
 use crate::startmenu::{AGENTWARE_ICON, AGENTWARE_SVG, StartMenu, StartOutcome};
+use crate::text::{Edit, Editing, MultiPress};
 use crate::input::{Button, Event, Key};
 use crate::paint::font::{Family, Fonts, Style};
 use crate::paint::{Canvas, Rect};
@@ -333,13 +335,26 @@ pub struct Screen {
     /// compositor is the only process that sees both ends of a copy: it owns
     /// the keyboard the chord arrives on and the text being edited.
     clipboard: Clipboard,
+    /// The compositor's cut/copy/paste menu, while the other button has one
+    /// open. Chrome, like the start menu: no application is told it exists
+    /// and no agent can reach it.
+    edit: Option<EditMenu>,
     /// A tab held by the pointer. Whether it becomes a drag or a click is
     /// decided by whether it moves before it is released.
     tab_drag: Option<TabDrag>,
     /// The agentdesk tab being renamed: its workspace index, the text so far,
     /// and the width of the tab it replaced, so entering the editor does not
     /// change the tab's size under the click that opened it.
-    renaming: Option<(usize, String, i32)>,
+    /// The agentdesk tab being renamed: which workspace, the text box, and
+    /// the width the tab had. The text box is the same one an application's
+    /// field is, so this one can be selected in, copied out of and pasted
+    /// into as well; it used to be a `String` with `push` and `pop`.
+    renaming: Option<(usize, Editing, i32)>,
+    /// Whether a run is being dragged out of the rename field right now.
+    rename_drag: bool,
+    /// Presses counted for the chrome's own text boxes, so a double click in
+    /// the rename field takes a word there as it does everywhere else.
+    presses: MultiPress,
     /// The start menu, while it is open.
     start: Option<StartMenu>,
 
@@ -404,8 +419,11 @@ impl Screen {
             cell_drag: None,
             tabs_drag: None,
             clipboard: Clipboard::default(),
+            edit: None,
             tab_drag: None,
             renaming: None,
+            rename_drag: false,
+            presses: MultiPress::default(),
             start: None,
             flight: None,
             pending_rows: Vec::new(),
@@ -1038,6 +1056,15 @@ impl Screen {
                 {
                     scene |= client.drag_tabs(fonts, x);
                 }
+                if let Some(menu) = &mut self.start
+                    && menu.dragging()
+                    && menu.drag(fonts, x, y)
+                {
+                    scene = true;
+                }
+                if self.rename_drag && self.drag_rename(fonts, x, y) {
+                    scene = true;
+                }
 
                 // Hover feedback lives in the scene, so crossing on or off a
                 // lit control is a scene change; sweeping across inert pixels
@@ -1078,6 +1105,19 @@ impl Screen {
                 {
                     client.end_tab_drag();
                 }
+                if let Some(menu) = &mut self.start {
+                    menu.end_drag();
+                }
+                if self.rename_drag {
+                    self.rename_drag = false;
+                    // A press that never moved is no run at all, the rule
+                    // every text box on the machine follows.
+                    if let Some((_, buffer, _)) = &mut self.renaming
+                        && buffer.anchor == Some(buffer.caret)
+                    {
+                        buffer.anchor = None;
+                    }
+                }
                 self.nav_release(fonts)
             }
 
@@ -1090,13 +1130,30 @@ impl Screen {
             // there is no chrome that answers to it, and a workspace an agent
             // is driving stays frozen to it exactly as it is to the first.
             Event::ButtonPressed { button: Button::Right, x, y } => {
+                // Words first, wherever they are. What is selected and what
+                // is on the clipboard are the compositor's, so the menu that
+                // acts on them is too, and the application is not told about
+                // a press that was never about it.
+                if self.open_chrome_edit(fonts, x, y) {
+                    return true;
+                }
                 match self.surface_at(x, y) {
                     Some(Surface::App(fd)) if !self.agent_running() => {
                         self.raise(self.current, fd);
                         self.focus = Surface::App(fd);
+                        if self.open_edit(fonts, fd, x, y) {
+                            return true;
+                        }
                         self.route_to(fd, fonts, event)
                     }
-                    Some(Surface::Desk) => self.route_desk(fonts, event),
+                    Some(Surface::Desk) => {
+                        if let Some(fd) = self.workspaces.get(self.current).and_then(|w| w.desk)
+                            && self.open_edit(fonts, fd, x, y)
+                        {
+                            return true;
+                        }
+                        self.route_desk(fonts, event)
+                    }
                     _ => false,
                 }
             }
@@ -1110,6 +1167,12 @@ impl Screen {
 
             Event::KeyPressed(key) => {
                 self.blink_epoch = Instant::now();
+                // A keystroke puts the edit menu away, the way a keystroke
+                // puts away every other menu. Escape does only that; anything
+                // else goes on to wherever it was headed.
+                if self.edit.take().is_some() && key == Key::Escape {
+                    return true;
+                }
                 match self.focus {
                     Surface::App(fd) => self.route_to(fd, fonts, event),
                     Surface::Desk => self.route_desk(fonts, event),
@@ -1253,6 +1316,16 @@ impl Screen {
     }
 
     fn click(&mut self, fonts: &Fonts, x: i32, y: i32) -> bool {
+        // The edit menu, like every other menu, takes the press or is closed
+        // by it, and either way the press goes no further.
+        if let Some(menu) = &self.edit {
+            if menu.contains(x, y) {
+                return self.press_edit(fonts, x, y);
+            }
+            self.edit = None;
+            return true;
+        }
+
         // An open start menu takes the click or is closed by it. Closed and
         // consumed: the click that dismisses a menu is not also a click on
         // whatever was behind it, or a window would open on a stray press.
@@ -1381,6 +1454,81 @@ impl Screen {
                 dirty
             }
         }
+    }
+
+    /// Offer cut, copy and paste over whatever words are under the point.
+    ///
+    /// Answers whether it took the press. It does not when the point is not
+    /// on text, which is when the press is the application's `context` event
+    /// and its own menu, and it does not when nothing would be offered: a
+    /// menu whose every item is dead is worse than no menu.
+    fn open_edit(&mut self, fonts: &Fonts, fd: RawFd, x: i32, y: i32) -> bool {
+        let Some(offer) = self.client_mut(fd).and_then(|client| client.arm_edit(fonts, x, y))
+        else {
+            return false;
+        };
+        self.show_edit(fonts, offer, Target::Client(fd), x, y)
+    }
+
+    /// The same menu over one of the compositor's own text boxes.
+    fn show_edit(
+        &mut self,
+        fonts: &Fonts,
+        offer: Offer,
+        target: Target,
+        x: i32,
+        y: i32,
+    ) -> bool {
+        let held = self.clipboard.text().is_some();
+        self.edit = EditMenu::open(fonts, self.bounds, (x, y), offer, held, target);
+        self.edit.is_some()
+    }
+
+    /// The other button over the start menu's prompt or the navigation bar's
+    /// rename field. Chrome has text boxes and they answer to the same menu.
+    fn open_chrome_edit(&mut self, fonts: &Fonts, x: i32, y: i32) -> bool {
+        if let Some(menu) = &self.start {
+            if !menu.over_prompt(x, y) {
+                return false;
+            }
+            let offer = menu.offer();
+            return self.show_edit(fonts, offer, Target::Prompt, x, y);
+        }
+        if self.renaming.is_some()
+            && let Some(doc) = &self.nav
+            && let Some(index) = doc.index_of("#nav-rename")
+            && self.nav_layout.rect_of(index).contains(x, y)
+            && let Some((_, buffer, _)) = &self.renaming
+        {
+            let offer = Offer { selection: buffer.selected().is_some(), editable: true };
+            return self.show_edit(fonts, offer, Target::Rename, x, y);
+        }
+        false
+    }
+
+    /// Carry out what the edit menu decided, as the chord it stands for.
+    ///
+    /// Through `Client::handle`, so the menu and `Ctrl+C` are one
+    /// implementation: the menu is a second way to say it, not a second thing
+    /// that does it.
+    fn press_edit(&mut self, fonts: &Fonts, x: i32, y: i32) -> bool {
+        let Some(menu) = self.edit.take() else { return false };
+        let Some(key) = menu.press(x, y) else { return true };
+        match menu.target {
+            Target::Client(fd) => {
+                let clipboard = &mut self.clipboard;
+                if let Some(client) = self.clients.iter_mut().find(|client| client.fd() == fd) {
+                    client.handle(fonts, Event::KeyPressed(key), clipboard);
+                }
+            }
+            Target::Prompt => {
+                self.start_key(fonts, key);
+            }
+            Target::Rename => {
+                self.nav_key(fonts, key);
+            }
+        }
+        true
     }
 
     /// Close, minimize, maximize, or pick the window up.
@@ -2239,7 +2387,7 @@ impl Screen {
                 out.push_str(&format!(
                     "    <field id=\"nav-rename\" value=\"{value}\" width=\"{width}\" \
                      description=\"The name being typed for this agentdesk\"/>\n",
-                    value = awproto::display::escape(buffer),
+                    value = awproto::display::escape(&buffer.value),
                 ));
                 continue;
             }
@@ -2335,6 +2483,21 @@ impl Screen {
         // A click anywhere but the rename field settles the rename first.
         if id != "nav-rename" {
             self.commit_rename(fonts);
+        } else {
+            // In it, the press puts the caret down and anchors a run, exactly
+            // as it does in an application's field: the rename field is the
+            // same text box.
+            let at = self.rename_caret(fonts, x, y);
+            let count = self.presses.press(x, y);
+            if let Some((_, buffer, _)) = &mut self.renaming {
+                if count > 1 {
+                    buffer.press_again(at, count);
+                } else {
+                    buffer.press(at);
+                }
+            }
+            self.rename_drag = true;
+            return true;
         }
 
         if id == "nav-stop" {
@@ -2398,7 +2561,7 @@ impl Screen {
                 .find(|(id, _)| *id == held.id)
                 .map(|(_, rect)| rect.w)
                 .unwrap_or(ui::sc(160));
-            self.renaming = Some((at, name, width));
+            self.renaming = Some((at, Editing::new(name), width));
             self.focus = Surface::Nav;
             self.nav = None;
             return true;
@@ -2458,23 +2621,55 @@ impl Screen {
 
     /// A keystroke while a tab is being renamed.
     fn nav_key(&mut self, fonts: &Fonts, key: Key) -> bool {
-        let Some((_, buffer, _)) = &mut self.renaming else { return false };
+        // Enter and Escape are the bar's: one commits the name, the other
+        // abandons it. Everything about the words is the text box's, which is
+        // the same text box the start menu's prompt and an application's
+        // field are.
         match key {
-            Key::Char(c) => buffer.push(c),
-            Key::Backspace => {
-                buffer.pop();
-            }
-            Key::Enter => {
+            Key::Enter | Key::ShiftEnter => {
                 self.commit_rename(fonts);
                 return true;
             }
             Key::Escape => {
                 self.renaming = None;
+                self.nav = None;
+                return true;
             }
-            _ => return false,
+            _ => {}
+        }
+        let clipboard = &mut self.clipboard;
+        let Some((_, buffer, _)) = &mut self.renaming else { return false };
+        if buffer.key(key, clipboard, false) == Edit::Ignored {
+            return false;
         }
         self.nav = None;
         true
+    }
+
+    /// Which character of the rename field a point lands on.
+    fn rename_caret(&self, fonts: &Fonts, x: i32, y: i32) -> usize {
+        let Some(doc) = &self.nav else { return 0 };
+        let Some(index) = doc.index_of("#nav-rename") else { return 0 };
+        let Some((_, buffer, _)) = &self.renaming else { return 0 };
+        ui::caret_at_point(
+            fonts,
+            &buffer.value,
+            &ui::style_at(&doc.tree, index),
+            doc.tree.node(index).tag,
+            self.nav_layout.rect_of(index),
+            buffer.caret,
+            (x, y),
+        )
+    }
+
+    /// Carry the far end of the rename field's selection to here.
+    fn drag_rename(&mut self, fonts: &Fonts, x: i32, y: i32) -> bool {
+        if !self.rename_drag {
+            return false;
+        }
+        let at = self.rename_caret(fonts, x, y);
+        let Some((_, buffer, _)) = &mut self.renaming else { return false };
+        buffer.drag(at)
     }
 
     /// Settle a rename in progress: the trimmed text becomes the name, and an
@@ -2482,7 +2677,7 @@ impl Screen {
     fn commit_rename(&mut self, fonts: &Fonts) {
         let Some((at, buffer, _)) = self.renaming.take() else { return };
         if let Some(workspace) = self.workspaces.get_mut(at) {
-            let trimmed = buffer.trim();
+            let trimmed = buffer.value.trim();
             workspace.name = if trimmed.is_empty() { None } else { Some(trimmed.to_owned()) };
             let (id, name) = (workspace.id, self.tab_name(&self.workspaces[at]));
             self.notes.push(format!("workspace {id} is now named {name:?}"));
@@ -2585,13 +2780,14 @@ impl Screen {
 
     fn click_start(&mut self, fonts: &Fonts, x: i32, y: i32) -> bool {
         let Some(menu) = &mut self.start else { return false };
-        let outcome = menu.click(x, y);
+        let outcome = menu.click(fonts, x, y);
         self.start_outcome(fonts, outcome)
     }
 
     fn start_key(&mut self, fonts: &Fonts, key: Key) -> bool {
+        let clipboard = &mut self.clipboard;
         let Some(menu) = &mut self.start else { return false };
-        let outcome = menu.key(key);
+        let outcome = menu.key(key, clipboard);
         self.start_outcome(fonts, outcome)
     }
 
@@ -2643,6 +2839,9 @@ impl Screen {
 
         if let Some(menu) = &self.start {
             menu.draw(canvas, fonts, &self.images, self.start_rect(), self.caret_phase());
+        }
+        if let Some(menu) = &self.edit {
+            menu.draw(canvas, fonts, &self.images);
         }
         self.draw_nav(canvas, fonts, pointer);
 
@@ -2818,7 +3017,8 @@ impl Screen {
         let focus = match &self.renaming {
             Some((_, buffer, _)) => Focus {
                 node: doc.index_of("#nav-rename"),
-                caret: buffer.chars().count(),
+                caret: buffer.caret,
+                anchor: buffer.anchor,
                 caret_visible: self.caret_phase(),
                 ..Focus::default()
             },

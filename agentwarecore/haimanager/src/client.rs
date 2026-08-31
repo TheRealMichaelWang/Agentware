@@ -50,6 +50,8 @@ use awproto::display::{self, MAX_TREE};
 use crate::awml::{self, Tag};
 use crate::clipboard::Clipboard;
 use crate::document::Document;
+use crate::editmenu;
+use crate::text::{self, Edit, Editing, MultiPress};
 use crate::images::Images;
 use crate::input::{Button, Event, Key};
 use crate::paint::font::Fonts;
@@ -98,20 +100,6 @@ impl Kind {
 }
 
 /// The compositor's copy of a text control being edited.
-struct Editing {
-    /// What is on screen, which may be ahead of what the application holds.
-    value: String,
-    /// Caret position, in characters.
-    caret: usize,
-    /// Where a selection began, when there is one. The selected run is
-    /// everything between this and the caret, in either order, and it is the
-    /// compositor's alone: an application is told what the value became, not
-    /// which part of it was highlighted on the way.
-    anchor: Option<usize>,
-    /// Values sent to the application and not yet seen echoed back in a tree.
-    outstanding: Vec<String>,
-}
-
 pub struct Client {
     pub kind: Kind,
     /// The workspace this connection belongs to, as the supervisor stated it.
@@ -157,6 +145,19 @@ pub struct Client {
     columns: HashMap<String, i32>,
     /// A text control whose selection is being dragged out by the pointer.
     selecting: Option<String>,
+    /// Presses counted for the double and triple click, which are how a word
+    /// and a line are selected everywhere else and now here.
+    presses: MultiPress,
+    /// A run of static text the human has dragged out: the node's key, where
+    /// the drag anchored and where it has reached, in characters.
+    ///
+    /// Apart from `editing`, which holds text controls, because static text
+    /// is not one: it has no value the application tracks, no caret, and
+    /// nothing that can be typed into it. The compositor keeps a run over it
+    /// for one reason, which is that an agent's answer is worth copying.
+    text_run: Option<(String, usize, usize)>,
+    /// Whether that run is being dragged out right now.
+    running: bool,
     /// A column edge being dragged: which column, where the pointer took
     /// hold, and how wide it was when it did.
     column_drag: Option<(String, i32, i32)>,
@@ -243,6 +244,9 @@ impl Client {
             scroll_x: HashMap::new(),
             columns: HashMap::new(),
             selecting: None,
+            presses: MultiPress::default(),
+            text_run: None,
+            running: false,
             column_drag: None,
             cell_drag: None,
             cell_extent: None,
@@ -458,6 +462,14 @@ impl Client {
 
         self.scroll.retain(|key, _| next.has_key(key));
         self.editing.retain(|key, _| next.has_key(key));
+        // A run of words whose element the application stopped sending is a
+        // run over nothing.
+        if let Some((key, ..)) = &self.text_run
+            && !next.has_key(key)
+        {
+            self.text_run = None;
+            self.running = false;
+        }
 
         let keys: Vec<String> = self.editing.keys().cloned().collect();
         for key in keys {
@@ -574,7 +586,12 @@ impl Client {
             None => (None, 0),
         };
         let anchor = self.focus.as_ref().and_then(|key| self.editing.get(key)?.anchor);
-        Focus { node, caret, anchor, pressed, caret_visible: self.caret_on, scrollbar }
+        let run = self.text_run.as_ref().and_then(|(key, ..)| {
+            let index = doc.index_of(key)?;
+            let (from, to) = self.run_of(key)?;
+            Some((index, from, to))
+        });
+        Focus { node, caret, anchor, pressed, caret_visible: self.caret_on, scrollbar, run }
     }
 
     /// Whether keystrokes to this client would land in a text control, which is
@@ -748,9 +765,83 @@ impl Client {
         }
     }
 
-    /// Whether the pointer is dragging a selection out of a text control.
+    /// Whether the pointer is dragging a selection out of a text control, or
+    /// a run out of static text. One question, because the screen arms one
+    /// drag for both and the difference is this file's business.
     pub fn selecting(&self) -> bool {
-        self.selecting.is_some()
+        self.selecting.is_some() || self.running
+    }
+
+    /// What the compositor's edit menu would offer over a point, or `None`
+    /// when the point is not on text at all and the press belongs to the
+    /// application.
+    ///
+    /// Takes focus on the way, when the press is on a control that did not
+    /// have it, so that Paste has somewhere to land. A control that is
+    /// already focused is left exactly as it is, selection and all: a
+    /// right-press on words you have just dragged out must not throw them
+    /// away before offering to copy them.
+    pub fn arm_edit(&mut self, fonts: &Fonts, x: i32, y: i32) -> Option<editmenu::Offer> {
+        let doc = self.doc.as_ref()?;
+        if let Some(index) = self.layout.hit(&doc.tree, x, y) {
+            let node = doc.tree.node(index);
+            if !node.tag.is_text() || node.disabled() || doc.tree.blocked(index) {
+                return None;
+            }
+            let key = doc.key(index).to_owned();
+            // A cell is the exception. Cut, copy and paste over a grid are
+            // about cells, not about the characters inside one, and the
+            // compositor knows nothing about which cells are chosen: a run
+            // across a grid is the application's state, reported to it and
+            // painted by it. So the other button on a cell stays the
+            // application's, and its menu is the one that can say
+            // "paste as values". Once a cell is being typed into it is a
+            // field like any other, and then the words in it are the
+            // compositor's to offer.
+            if node.tag == Tag::Cell
+                && !(self.focus.as_deref() == Some(key.as_str())
+                    && self.editing.contains_key(&key))
+            {
+                return None;
+            }
+            let editable = node.tag != Tag::Cell || node.flag("editable");
+            if self.focus.as_deref() != Some(key.as_str()) {
+                let caret = self.caret_at(fonts, index, x, y);
+                let value = match node.attr("value") {
+                    Some(value) => value.to_owned(),
+                    None if node.tag == Tag::Cell => node.text.clone(),
+                    None => String::new(),
+                };
+                self.focus = Some(key.clone());
+                self.text_run = None;
+                let state = self.editing.entry(key.clone()).or_insert(Editing {
+                    value,
+                    caret: 0,
+                    anchor: None,
+                    outstanding: Vec::new(),
+                });
+                state.caret = caret.min(state.value.chars().count());
+                state.anchor = None;
+            }
+            let selection = self.editing.get(&key).and_then(Editing::selected).is_some();
+            return Some(editmenu::Offer { selection, editable });
+        }
+
+        // Words on a page: nothing can be pasted into them, and there is
+        // something to copy only if a run is being held over this one.
+        let words = self.layout.text_at(&doc.tree, x, y)?;
+        let key = doc.key(words).to_owned();
+        Some(editmenu::Offer { selection: self.run_of(&key).is_some(), editable: false })
+    }
+
+    /// The run of static text the human is holding, if any.
+    fn run_of(&self, key: &str) -> Option<(usize, usize)> {
+        let (held, anchor, caret) = self.text_run.as_ref()?;
+        if held != key {
+            return None;
+        }
+        let (from, to) = (*anchor.min(caret), *anchor.max(caret));
+        (from != to).then_some((from, to))
     }
 
     /// Whether a column edge is being dragged.
@@ -866,19 +957,108 @@ impl Client {
 
     /// Extend the selection to wherever the pointer has got to.
     pub fn drag_select(&mut self, fonts: &Fonts, x: i32, y: i32) -> bool {
+        if self.running {
+            return self.drag_text(fonts, x, y);
+        }
         let Some(key) = self.selecting.clone() else { return false };
         let Some(doc) = &self.doc else { return false };
         let Some(index) = doc.index_of(&key) else { return false };
         let caret = self.caret_at(fonts, index, x, y);
         let Some(state) = self.editing.get_mut(&key) else { return false };
-        if state.caret == caret {
+        state.drag(caret)
+    }
+
+    /// Carry a run of static text out under the pointer.
+    fn drag_text(&mut self, fonts: &Fonts, x: i32, y: i32) -> bool {
+        let Some((key, _, caret)) = self.text_run.clone() else { return false };
+        let Some(doc) = &self.doc else { return false };
+        let Some(index) = doc.index_of(&key) else { return false };
+        let reached = self.offset_at(fonts, index, x, y);
+        if reached == caret {
             return false;
         }
-        state.caret = caret;
+        if let Some((_, _, caret)) = &mut self.text_run {
+            *caret = reached;
+        }
         true
     }
 
+    /// Copy the run of static text the human is holding, if that is what this
+    /// keystroke means. `None` when there is no run, or when the key is
+    /// something a run has no answer for.
+    fn copy_run(&mut self, clipboard: &mut Clipboard, key: Key) -> Option<bool> {
+        let (held, ..) = self.text_run.clone()?;
+        let (from, to) = self.run_of(&held)?;
+        let doc = self.doc.as_ref()?;
+        let index = doc.index_of(&held)?;
+        let words: String = doc.tree.node(index).text.chars().skip(from).take(to - from).collect();
+        match key {
+            Key::Copy | Key::Cut => {
+                // Cut is a copy here: there is nothing to take words out of.
+                clipboard.set_text(&words);
+                self.note = format!("copied {} character(s)", words.chars().count());
+                Some(true)
+            }
+            Key::Escape => {
+                self.text_run = None;
+                self.note = "let go of the words".into();
+                Some(true)
+            }
+            _ => None,
+        }
+    }
+
+    /// Carry the far end of a run of static text with the keyboard.
+    ///
+    /// Less than a text box gets, because there is less: no caret to put
+    /// down, so a run has to be started by pressing on the words. Once there
+    /// is one, shift and an arrow reach further and Ctrl+A takes the whole
+    /// paragraph, which is what the two of them mean everywhere.
+    fn reach_run(&mut self, key: Key) -> Option<bool> {
+        let (held, ..) = self.text_run.clone()?;
+        let doc = self.doc.as_ref()?;
+        let index = doc.index_of(&held)?;
+        let length = doc.tree.node(index).text.chars().count();
+        let (_, anchor, caret) = self.text_run.as_mut()?;
+        match key {
+            Key::ShiftLeft => *caret = caret.saturating_sub(1),
+            Key::ShiftRight => *caret = (*caret + 1).min(length),
+            Key::ShiftHome | Key::Home => *caret = 0,
+            Key::ShiftEnd | Key::End => *caret = length,
+            Key::SelectAll => {
+                *anchor = 0;
+                *caret = length;
+            }
+            _ => return None,
+        }
+        Some(true)
+    }
+
+    /// Which character of a static text element a point lands on.
+    fn offset_at(&self, fonts: &Fonts, index: usize, x: i32, y: i32) -> usize {
+        let Some(doc) = &self.doc else { return 0 };
+        ui::text_offset_at(
+            fonts,
+            &doc.tree.node(index).text,
+            &ui::style_at(&doc.tree, index),
+            self.layout.rect_of(index),
+            (x, y),
+        )
+    }
+
     pub fn end_select(&mut self) {
+        if self.running {
+            self.running = false;
+            // A run of nothing is kept rather than dropped, unlike a
+            // control's anchor. Nothing is painted for it and nothing can be
+            // copied from it, and it is what shift and an arrow reach out
+            // from: a press on words is the only way to say where a run over
+            // them starts, since there is no caret to put down in a
+            // paragraph. The reason a control's anchor cannot be kept the
+            // same way is that a control can be typed into, and a leftover
+            // anchor made the next character replace a run nobody dragged.
+            return;
+        }
         let Some(key) = self.selecting.take() else { return };
         if let Some(state) = self.editing.get_mut(&key)
             && state.anchor == Some(state.caret)
@@ -972,7 +1152,34 @@ impl Client {
             return true;
         }
 
+        // Any press puts down whatever run of words was being held. A press
+        // that lands on text starts a new one below.
+        self.text_run = None;
+
         let Some(index) = hit else {
+            // Nothing pressable here, but there may be something to read. A
+            // press on words starts a run the human can copy: an agent's
+            // answer is the thing in this system most worth copying, and it
+            // is a `text` element like any other.
+            if let Some(words) = self.layout.text_at(&doc.tree, x, y) {
+                let key = doc.key(words).to_owned();
+                let at = self.offset_at(fonts, words, x, y);
+                let content = doc.tree.node(words).text.clone();
+                let count = self.presses.press(x, y);
+                // A double click takes the word, a third takes the line, and
+                // the boundaries come from the same two functions a text box
+                // uses, because a word is a word wherever it is written.
+                let (from, to) = match count {
+                    1 => (at, at),
+                    2 => text::word_at(&content, at),
+                    _ => text::line_at(&content, at),
+                };
+                self.text_run = Some((key.clone(), from, to));
+                self.running = true;
+                self.focus = None;
+                self.note = format!("holding the words in {key} from {from} to {to}");
+                return true;
+            }
             // Clicking the gap between two controls is a real thing to have
             // done: it takes focus off whatever had it.
             self.focus = None;
@@ -1028,17 +1235,18 @@ impl Client {
             }
 
             let caret = self.caret_at(fonts, index, x, y);
-            let state = self.editing.entry(key.clone()).or_insert(Editing {
-                value,
-                caret: 0,
-                anchor: None,
-                outstanding: Vec::new(),
-            });
-            state.caret = caret.min(state.value.chars().count());
+            let count = self.presses.press(x, y);
+            let state = self.editing.entry(key.clone()).or_insert(Editing::new(value));
             // The press is where a selection starts; the drag is what makes
             // it one. A press that never moves leaves anchor and caret in the
-            // same place, which is no selection at all.
-            state.anchor = Some(state.caret);
+            // same place, which is no selection at all. A second press in the
+            // same place takes the word under it and a third takes the line,
+            // which is what every desktop does.
+            if count > 1 {
+                state.press_again(caret, count);
+            } else {
+                state.press(caret);
+            }
             self.selecting = Some(key);
             self.note = format!("caret in {id} at {caret}");
             return true;
@@ -1548,6 +1756,16 @@ impl Client {
             return self.focus_next();
         }
 
+        // A run of words held over static text answers to copy and to nothing
+        // else. There is no caret in it to move, nothing to cut out of it and
+        // nowhere in it to paste, so this is the whole of what it does.
+        if let Some(words) = self.copy_run(clipboard, key) {
+            return words;
+        }
+        if let Some(reached) = self.reach_run(key) {
+            return reached;
+        }
+
         let Some(doc) = &self.doc else { return false };
         let Some(focus_key) = self.focus.clone() else { return false };
         let Some(index) = doc.index_of(&focus_key) else { return false };
@@ -1587,6 +1805,15 @@ impl Client {
                 Key::Down | Key::Enter => return self.move_cell(fonts, 0, 1),
                 Key::Left if !typing => return self.move_cell(fonts, -1, 0),
                 Key::Right if !typing => return self.move_cell(fonts, 1, 0),
+                // Shift and an arrow reach one cell further instead of
+                // moving, which is what they do in every spreadsheet. Up and
+                // down do it even mid-edit, exactly as the plain ones leave a
+                // half-typed cell; left and right mean the caret once there
+                // is one to move.
+                Key::ShiftUp => return self.extend_cells(0, -1),
+                Key::ShiftDown => return self.extend_cells(0, 1),
+                Key::ShiftLeft if !typing => return self.extend_cells(-1, 0),
+                Key::ShiftRight if !typing => return self.extend_cells(1, 0),
                 Key::Escape if typing => {
                     // Give the cell back the value the application last sent.
                     // Every keystroke was already reported, so undoing has to
@@ -1612,88 +1839,47 @@ impl Client {
         // which is what every spreadsheet does and what the human expects
         // when they select a cell and start typing.
         let fresh = tag == Tag::Cell && !typing;
-        let state = self.editing.entry(focus_key.clone()).or_insert(Editing {
-            value: if fresh { String::new() } else { seed.clone() },
-            caret: 0,
-            anchor: None,
-            outstanding: Vec::new(),
-        });
-        state.caret = state.caret.min(state.value.chars().count());
-
-        // The clipboard. None of this is in the display protocol: what the
-        // application hears is the value the control ended up with, exactly
-        // as if the human had typed it out.
-        match key {
-            Key::SelectAll => {
-                state.anchor = Some(0);
-                state.caret = state.value.chars().count();
-                self.note = format!("selected all of {id}");
-                return true;
-            }
-            Key::Copy | Key::Cut => {
-                let Some(selected) = state.selected_text() else { return false };
-                clipboard.set_text(&selected);
-                if key == Key::Copy {
-                    self.note = format!("copied {} character(s)", selected.chars().count());
-                    return true;
-                }
-                state.delete_selection();
-            }
-            Key::Paste => {
-                let Some(words) = clipboard.text().map(str::to_owned) else {
-                    self.note = "nothing on the clipboard this can take".into();
-                    return true;
-                };
-                state.delete_selection();
-                let at = byte_at(&state.value, state.caret);
-                state.value.insert_str(at, &words);
-                state.caret += words.chars().count();
-                state.anchor = None;
-            }
-            _ => {}
+        // A cell nobody is typing into has no caret and no selection, so
+        // there is nothing in it for a key to move or copy, and starting a
+        // text box for one would blank the cell: the compositor's copy is
+        // what is painted, and a fresh one is empty. Only a key that puts
+        // characters in begins an edit. Ctrl+C over a grid means the chosen
+        // *cells*, which is the application's to answer and not this.
+        if fresh && !matches!(key, Key::Char(_) | Key::Paste) {
+            return false;
         }
+        let state = self.editing.entry(focus_key.clone()).or_insert_with(|| {
+            let mut state = Editing::new(if fresh { String::new() } else { seed.clone() });
+            // Focus arrived without a press, from Tab or from an agent, so
+            // there is no point to put the caret at.
+            state.caret = 0;
+            state
+        });
 
-        let mut changed = matches!(key, Key::Paste | Key::Cut);
-        if !changed {
+        // Everything a text box does with a key is one implementation, in
+        // `text.rs`. This was the third place that needed it and the only one
+        // that had it: the start menu's prompt and the navigation bar's
+        // rename field had `push` and `pop` and nothing else, so neither
+        // could be selected in, copied out of or pasted into. None of it
+        // reaches the application, which hears only the value the control
+        // ended up with.
+        let outcome = state.key(key, clipboard, tag == Tag::Editor);
+        let mut changed = outcome == Edit::Changed;
+
+        if outcome == Edit::Ignored {
             match key {
-                Key::Char(character) => {
-                    state.delete_selection();
-                    state.value.insert(byte_at(&state.value, state.caret), character);
-                    state.caret += 1;
-                    changed = true;
-                }
-                Key::Backspace => {
-                    if state.delete_selection() {
-                        changed = true;
-                    } else if state.caret == 0 {
-                        return false;
-                    } else {
-                        state.caret -= 1;
-                        state.value.remove(byte_at(&state.value, state.caret));
-                        changed = true;
-                    }
-                }
-                // Moving the caret drops the selection, the way it does
-                // everywhere: the arrow keys are how you stop having one.
-                Key::Left => {
-                    state.anchor = None;
-                    state.caret = state.caret.saturating_sub(1);
-                }
-                Key::Right => {
-                    state.anchor = None;
-                    state.caret = (state.caret + 1).min(state.value.chars().count());
-                }
-                Key::Up | Key::Down if tag == Tag::Editor => {
-                    state.anchor = None;
-                    state.caret = move_line(&state.value, state.caret, key == Key::Down);
-                }
-                // Enter confirms a field and inserts a newline in an editor. That is
-                // the whole reason the two elements are separate: an editor offers no
-                // `submit` because Enter already means something else in it.
-                // An editor marked `enter-submits` swaps the two: Enter
-                // confirms and Shift+Enter breaks the line. In a field the
-                // shift is simply not load-bearing: there is no line to
-                // break, so both confirm.
+                // Enter confirms a field and inserts a newline in an editor.
+                // That is the whole reason the two elements are separate: an
+                // editor offers no `submit` because Enter already means
+                // something else in it. An editor marked `enter-submits`
+                // swaps the two: Enter confirms and Shift+Enter breaks the
+                // line. In a field the shift is simply not load-bearing:
+                // there is no line to break, so both confirm.
+                //
+                // Not in `text.rs` because what Enter means is exactly what
+                // differs between the boxes that share it: here it submits,
+                // in the start menu it makes a workspace, in the navigation
+                // bar it commits a name.
                 Key::Enter | Key::ShiftEnter => {
                     let newline = match tag {
                         Tag::Editor if enter_submits => key == Key::ShiftEnter,
@@ -1701,13 +1887,11 @@ impl Client {
                         _ => false,
                     };
                     if newline {
-                        state.delete_selection();
-                        state.value.insert(byte_at(&state.value, state.caret), '\n');
-                        state.caret += 1;
+                        state.insert("\n");
                         changed = true;
                     } else {
-                        self.note = format!("submitted {id}");
                         let value = state.value.clone();
+                        self.note = format!("submitted {id}");
                         self.emit(&id, display::ACTION_SUBMIT, &value);
                         return true;
                     }
@@ -1717,7 +1901,8 @@ impl Client {
         }
 
         if !changed {
-            self.note = format!("caret in {id} at {}", state.caret);
+            let caret = state.caret;
+            self.note = format!("caret in {id} at {caret}");
             return true;
         }
 
@@ -1774,7 +1959,72 @@ impl Client {
         }
 
         self.focus = Some(target_key);
+        // A plain arrow is how a run of cells stops being one: the cursor
+        // moves and the next shift starts again from where it landed.
+        self.cell_extent = None;
         let _ = self.act(fonts, target, "select", "");
+        true
+    }
+
+    /// Carry the far corner of a run of cells with the keyboard.
+    ///
+    /// Shift and an arrow over a grid mean what they mean in every
+    /// spreadsheet: the chosen cell stays where it is and the run reaches one
+    /// cell further. The near corner is the focused cell and the far corner
+    /// is remembered between keystrokes, so holding shift and pressing right
+    /// twice reaches two cells rather than the same one twice.
+    ///
+    /// It ends in the same `select-range` a drag across the grid does,
+    /// because it is the same gesture said with the other hand: the
+    /// application hears one event naming two corners and paints the run
+    /// itself.
+    fn extend_cells(&mut self, across: i32, down: i32) -> bool {
+        let Some(doc) = &self.doc else { return false };
+        let Some(key) = self.focus.clone() else { return false };
+        let Some(anchor) = doc.index_of(&key) else { return false };
+        if doc.tree.node(anchor).tag != Tag::Cell {
+            return false;
+        }
+        let anchor_id = doc.tree.node(anchor).id().unwrap_or_default().to_owned();
+
+        // Where the run reaches now: the last cell it was carried to, or the
+        // chosen one when this is the first keystroke of a run.
+        let reached = self
+            .cell_extent
+            .as_ref()
+            .and_then(|id| self.node_by_id(id))
+            .filter(|&index| self.doc.as_ref().is_some_and(|doc| doc.tree.node(index).tag == Tag::Cell))
+            .unwrap_or(anchor);
+
+        let Some(doc) = &self.doc else { return false };
+        let Some((row_at, column_at)) = doc.tree.cell_position(reached) else { return false };
+        let Some(table) = doc.tree.table_of(reached) else { return false };
+        if doc.tree.table_of(anchor) != Some(table) {
+            return false;
+        }
+
+        let rows = doc.tree.rows(table);
+        if rows.is_empty() {
+            return false;
+        }
+        let row = (row_at as i32 + down).clamp(0, rows.len() as i32 - 1) as usize;
+        let cells = doc.tree.cells(rows[row]);
+        if cells.is_empty() {
+            return false;
+        }
+        let column = (column_at as i32 + across).clamp(0, cells.len() as i32 - 1) as usize;
+        let target = cells[column];
+        let target_id = doc.tree.node(target).id().unwrap_or_default().to_owned();
+        if target_id.is_empty() || self.cell_extent.as_deref() == Some(target_id.as_str()) {
+            // Already at the edge of what the application sent. A row past
+            // the window is not in the tree to name, which is the same
+            // answer a drag gets there.
+            return false;
+        }
+
+        self.cell_extent = Some(target_id.clone());
+        self.note = format!("{anchor_id} through {target_id}");
+        self.emit(&anchor_id, display::ACTION_SELECT_RANGE, &target_id);
         true
     }
 
@@ -1847,55 +2097,8 @@ impl Client {
     }
 }
 
-impl Editing {
-    /// The selected run, low to high, or `None` when the caret is a point.
-    fn selected(&self) -> Option<(usize, usize)> {
-        let anchor = self.anchor?;
-        let (from, to) = (anchor.min(self.caret), anchor.max(self.caret));
-        (from != to).then_some((from, to))
-    }
 
-    fn selected_text(&self) -> Option<String> {
-        let (from, to) = self.selected()?;
-        Some(self.value.chars().skip(from).take(to - from).collect())
-    }
 
-    /// Remove the selected run, leaving the caret where it was. Returns
-    /// whether there was anything to remove, which is what tells a backspace
-    /// whether it has already done its work.
-    fn delete_selection(&mut self) -> bool {
-        let Some((from, to)) = self.selected() else { return false };
-        let start = byte_at(&self.value, from);
-        let end = byte_at(&self.value, to);
-        self.value.replace_range(start..end, "");
-        self.caret = from;
-        self.anchor = None;
-        true
-    }
-}
-
-/// The byte offset of a character position.
-fn byte_at(text: &str, caret: usize) -> usize {
-    text.char_indices()
-        .nth(caret)
-        .map_or(text.len(), |(at, _)| at)
-}
-
-/// Move a caret one line up or down, keeping the column where it can.
-fn move_line(value: &str, caret: usize, down: bool) -> usize {
-    let (row, column) = ui::caret_position(value, caret, Tag::Editor);
-    let target = if down { row + 1 } else { row.checked_sub(1).unwrap_or(row) };
-
-    let mut at = 0;
-    for (index, line) in value.split('\n').enumerate() {
-        let length = line.chars().count();
-        if index == target {
-            return at + column.min(length);
-        }
-        at += length + 1;
-    }
-    caret
-}
 
 #[cfg(test)]
 mod tests {
@@ -2297,6 +2500,228 @@ mod tests {
             Err(agent::REASON_UNSUPPORTED),
             "a tab that cannot be moved was moved"
         );
+    }
+
+    /// Words on a page can be dragged out and copied, and the application is
+    /// never told any of it happened.
+    ///
+    /// This is the half of the clipboard that was missing. A field and an
+    /// editor could always be selected in; an agent's answer, which is the
+    /// thing in this system most worth copying, is a `text` element, and
+    /// `Layout::hit` only ever answered with controls, so a press on one
+    /// landed on nothing at all.
+    #[test]
+    fn words_on_a_page_can_be_dragged_out_and_copied() {
+        let source = r#"<window pad="none"><vstack>
+             <text>the agent said something worth keeping</text>
+           </vstack></window>"#;
+        let (fonts, mut client, mut peer) = framed(source, Rect::new(0, 0, 400, 200));
+        let mut clipboard = Clipboard::default();
+        let words = client.doc.as_ref().unwrap().tree.nodes.len() - 1;
+        let rect = client.layout.rect_of(words);
+
+        client.handle(
+            &fonts,
+            Event::ButtonPressed { button: Button::Left, x: rect.x + 1, y: rect.y + 2 },
+            &mut clipboard,
+        );
+        assert!(client.selecting(), "a press on words did not take hold of them");
+        assert!(client.drag_select(&fonts, rect.x + 60, rect.y + 2), "the drag reported nothing");
+        client.end_select();
+
+        client.handle(&fonts, Event::KeyPressed(Key::Copy), &mut clipboard);
+        let copied = clipboard.text().unwrap_or_default().to_owned();
+        assert!(!copied.is_empty(), "copy put nothing on the clipboard");
+        assert!(
+            "the agent said something worth keeping".starts_with(&copied),
+            "copied something that is not the start of the words: {copied:?}"
+        );
+
+        // None of it reached the application. A selection is the compositor's
+        // and static text has no events at all.
+        assert!(said(&mut peer).is_empty(), "the application was told about a selection");
+
+        // A press that never moves selects nothing, the way it does in a
+        // control: the anchor is set on every press because a press is where
+        // a drag would start. Somewhere else on the line, so it is a fresh
+        // press rather than the second half of a double click.
+        client.handle(
+            &fonts,
+            Event::ButtonPressed { button: Button::Left, x: rect.x + 120, y: rect.y + 2 },
+            &mut clipboard,
+        );
+        client.end_select();
+        clipboard.set_text("what was there before");
+        client.handle(&fonts, Event::KeyPressed(Key::Copy), &mut clipboard);
+        assert_eq!(
+            clipboard.text(),
+            Some("what was there before"),
+            "a press that selected nothing overwrote the clipboard"
+        );
+
+        // Two presses in the same place take the word under them, on a page
+        // exactly as in a text box.
+        for _ in 0..2 {
+            client.handle(
+                &fonts,
+                Event::ButtonPressed { button: Button::Left, x: rect.x + 20, y: rect.y + 2 },
+                &mut clipboard,
+            );
+            client.end_select();
+        }
+        client.handle(&fonts, Event::KeyPressed(Key::Copy), &mut clipboard);
+        let word = clipboard.text().unwrap_or_default().to_owned();
+        assert_ne!(word, "what was there before", "a double click selected nothing");
+        assert!(
+            "the agent said something worth keeping".contains(&word),
+            "a double click took {word:?}, which is not part of the words"
+        );
+    }
+
+    /// A key that cannot edit a cell must not start editing it.
+    ///
+    /// A cell being typed into is a different thing from a cell that is
+    /// merely chosen: the arrows stop meaning the grid and start meaning the
+    /// caret, which is right. So a key that starts an edit nobody asked for
+    /// takes the arrow keys away from the spreadsheet. Ctrl+C found it, and
+    /// copy over a grid is the one that should least have done it: what it
+    /// means is the chosen *cells*, which is the application's answer to
+    /// give and not the compositor's.
+    #[test]
+    fn a_key_that_cannot_edit_a_cell_does_not_start_editing_it() {
+        let (fonts, mut client, mut peer) = framed(&window(0, &[1]), Rect::new(0, 0, 400, 300));
+        let mut clipboard = Clipboard::default();
+        // An editable cell: a cell the application will not take text for
+        // never starts a box at all, so it could not have shown this.
+        let a1 = client.layout.rect_of(client.node_by_id("A1").unwrap());
+        client.handle(
+            &fonts,
+            Event::ButtonPressed { button: Button::Left, x: a1.x + 2, y: a1.y + 2 },
+            &mut clipboard,
+        );
+        let _ = said(&mut peer);
+
+        for key in [Key::Copy, Key::SelectAll, Key::Home] {
+            client.handle(&fonts, Event::KeyPressed(key), &mut clipboard);
+        }
+        assert!(said(&mut peer).is_empty(), "the application was told about a key that did nothing");
+
+        // The arrows still mean the grid. They stop meaning it the moment a
+        // cell is being typed into, which is right, so a key that starts an
+        // edit nobody asked for takes the arrow keys away from the
+        // spreadsheet: pressing an arrow after Ctrl+C moved a caret inside
+        // the cell instead of moving to the cell beside it.
+        client.handle(&fonts, Event::KeyPressed(Key::Right), &mut clipboard);
+        let moved = said(&mut peer);
+        assert!(
+            moved.iter().any(|fields| fields[3] == display::ACTION_SELECT),
+            "the arrows stopped moving around the grid: {moved:?}"
+        );
+    }
+
+    /// Shift and an arrow over a grid reach one cell further, which is what
+    /// they do in every spreadsheet and what they did nowhere here: a chosen
+    /// cell has no caret, so the keystroke fell through the text box and out
+    /// the bottom. It ends in the same `select-range` a drag across the grid
+    /// does, because it is the same gesture said with the other hand.
+    #[test]
+    fn shift_and_an_arrow_reach_further_across_a_grid() {
+        let (fonts, mut client, mut peer) = framed(&window(0, &[1, 2]), Rect::new(0, 0, 400, 300));
+        let mut clipboard = Clipboard::default();
+        let a1 = client.layout.rect_of(client.node_by_id("A1").unwrap());
+        client.handle(
+            &fonts,
+            Event::ButtonPressed { button: Button::Left, x: a1.x + 2, y: a1.y + 2 },
+            &mut clipboard,
+        );
+        let _ = said(&mut peer);
+
+        client.handle(&fonts, Event::KeyPressed(Key::ShiftRight), &mut clipboard);
+        let run = said(&mut peer);
+        let event = run
+            .iter()
+            .find(|fields| fields[3] == display::ACTION_SELECT_RANGE)
+            .unwrap_or_else(|| panic!("shift and right reached nothing: {run:?}"));
+        assert_eq!(event[2], "A1", "the run does not start at the chosen cell");
+        assert_eq!(event[4], "B1", "the run does not reach one cell across");
+
+        // The far corner is remembered, so a second keystroke reaches further
+        // rather than the same place again.
+        client.handle(&fonts, Event::KeyPressed(Key::ShiftDown), &mut clipboard);
+        let run = said(&mut peer);
+        let event = run
+            .iter()
+            .find(|fields| fields[3] == display::ACTION_SELECT_RANGE)
+            .unwrap_or_else(|| panic!("the second keystroke reached nothing: {run:?}"));
+        assert_eq!(event[4], "B2", "the run did not carry on from where it had got to");
+
+        // At the edge of what the application sent there is nothing to name,
+        // which is the same answer a drag gets there.
+        client.handle(&fonts, Event::KeyPressed(Key::ShiftDown), &mut clipboard);
+        assert!(said(&mut peer).is_empty(), "a run past the last row was reported anyway");
+
+        // A plain arrow is how it stops being a run: the cursor moves and the
+        // next shift starts again from where it landed.
+        client.handle(&fonts, Event::KeyPressed(Key::Right), &mut clipboard);
+        let moved = said(&mut peer);
+        assert!(
+            moved.iter().any(|fields| fields[3] == display::ACTION_SELECT && fields[2] == "B1"),
+            "a plain arrow did not move the cursor: {moved:?}"
+        );
+        client.handle(&fonts, Event::KeyPressed(Key::ShiftDown), &mut clipboard);
+        let run = said(&mut peer);
+        let event = run
+            .iter()
+            .find(|fields| fields[3] == display::ACTION_SELECT_RANGE)
+            .unwrap_or_else(|| panic!("the run did not start again: {run:?}"));
+        assert_eq!(event[2], "B1", "the new run does not start where the cursor landed");
+        assert_eq!(event[4], "B2", "the new run kept the old corner");
+    }
+
+    /// Which presses the compositor's edit menu takes, and which it leaves to
+    /// the application.
+    ///
+    /// The rule is about what cut, copy and paste would mean. Over a field or
+    /// an editor they mean the characters in it, which are the compositor's.
+    /// Over a cell they mean cells, which are the application's: a run across
+    /// a grid is its state, reported to it and painted by it, and the
+    /// compositor could not copy one if it wanted to. So the other button on
+    /// a cell stays the spreadsheet's, until the cell is being typed into and
+    /// is a field like any other.
+    #[test]
+    fn the_edit_menu_takes_text_and_leaves_the_grid_alone() {
+        let (fonts, mut client, _peer) = framed(&window(0, &[1, 2]), Rect::new(0, 0, 400, 300));
+        let a1 = client.layout.rect_of(client.node_by_id("A1").unwrap());
+        assert!(
+            client.arm_edit(&fonts, a1.x + 2, a1.y + 2).is_none(),
+            "the compositor took the other button on a cell nobody is typing into"
+        );
+
+        // Typing into it makes it a field, and then the words in it are the
+        // compositor's to offer.
+        let mut clipboard = Clipboard::default();
+        client.handle(
+            &fonts,
+            Event::ButtonPressed { button: Button::Left, x: a1.x + 2, y: a1.y + 2 },
+            &mut clipboard,
+        );
+        client.handle(&fonts, Event::KeyPressed(Key::Char('x')), &mut clipboard);
+        assert!(
+            client.arm_edit(&fonts, a1.x + 2, a1.y + 2).is_some(),
+            "a cell being typed into offered nothing"
+        );
+
+        // An editor always does, and a press on it that lands somewhere new
+        // takes focus so a paste has a caret to land at.
+        let source = r#"<window pad="none"><editor id="note" value="hello"
+                          description="Somewhere to write"/></window>"#;
+        let (fonts, mut client, _peer) = framed(source, Rect::new(0, 0, 400, 200));
+        let note = client.layout.rect_of(client.node_by_id("note").unwrap());
+        let offer = client
+            .arm_edit(&fonts, note.x + 4, note.y + 4)
+            .expect("an editor offered nothing");
+        assert!(offer.editable, "an editor was not offered a paste");
+        assert!(!offer.selection, "nothing was selected and copy was offered anyway");
     }
 
     /// A strip is a cap, the tabs, a foot and a hairline.

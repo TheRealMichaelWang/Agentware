@@ -171,6 +171,47 @@ pub fn taskbar_inset() -> i32 { sc(8) }
 pub fn control_h(fonts: &Fonts) -> i32 {
     fonts.line_height(&Style { size: body_size(), ..Style::default() }) + control_pad() * 2
 }
+/// How tall a window's menu bar is: one control's worth, which is what makes
+/// it the same height as the taskbar's row and every other band on screen.
+fn menu_band_h(fonts: &Fonts) -> i32 {
+    control_h(fonts)
+}
+/// The margin before the first menu in the bar, so the words do not start
+/// flush against the window's edge.
+fn menu_lead() -> i32 { sc(6) }
+/// The space between one menu title and the next.
+fn menu_gap() -> i32 { sc(2) }
+
+/// The band a window's menus stand in: one row across the whole width of it.
+///
+/// One function, because the row the menus are laid out in and the band that
+/// is painted under them have to be the same rectangle, and because the
+/// content below starts where this ends.
+fn menu_band(fonts: &Fonts, area: Rect) -> Rect {
+    Rect::new(area.x, area.y, area.w, menu_band_h(fonts))
+}
+
+/// Whether a window has a menu bar, which is whether it has any menus.
+fn has_menus(tree: &Tree, index: usize) -> bool {
+    tree.node(index).tag == Tag::Window
+        && tree.node(index).children.iter().any(|&child| tree.node(child).tag == Tag::Menu)
+}
+
+/// How wide a window has to be to show its own menu bar.
+fn menu_bar_width(fonts: &Fonts, tree: &Tree, index: usize) -> i32 {
+    let menus: Vec<usize> = tree
+        .node(index)
+        .children
+        .iter()
+        .copied()
+        .filter(|&child| tree.node(child).tag == Tag::Menu)
+        .collect();
+    if menus.is_empty() {
+        return 0;
+    }
+    let titles: i32 = menus.iter().map(|&menu| natural_width(fonts, tree, menu)).sum();
+    titles + menu_gap() * (menus.len() as i32 - 1) + menu_lead() * 2
+}
 /// The icon on a tile button, and the room around it.
 fn tile_icon() -> i32 { sc(28) }
 fn tile_pad() -> i32 { sc(10) }
@@ -476,6 +517,14 @@ pub struct Focus {
     /// lingers briefly after, which is what lets it sit over the content's edge
     /// without permanently covering anything.
     pub scrollbar: Option<usize>,
+    /// A run of static text the human has dragged out: which node, and the
+    /// two character offsets into it.
+    ///
+    /// Apart from `node` and `anchor` because it is a different thing. Those
+    /// are a control's caret, which is where the next keystroke goes; this is
+    /// words on a page that nothing can be typed into, and the only reason
+    /// the compositor knows about them is so they can be copied.
+    pub run: Option<(usize, usize, usize)>,
 }
 
 pub struct Layout {
@@ -512,6 +561,23 @@ impl Layout {
                     && !tree.folded(index)
                     && self.visible_at(index, x, y)
             })
+    }
+
+    /// The words under a point: the topmost `text` element with something in
+    /// it, where nothing pressable is in the way.
+    ///
+    /// Separate from [`Layout::hit`] because that answers "what would a press
+    /// act on", and static text is not something a press acts on. It is
+    /// something a press can start selecting, which is a different question
+    /// with a different answer, and folding them together would put a control
+    /// and a caption in the same list.
+    pub fn text_at(&self, tree: &Tree, x: i32, y: i32) -> Option<usize> {
+        (0..tree.nodes.len()).rev().find(|&index| {
+            tree.node(index).tag == Tag::Text
+                && !tree.node(index).text.trim().is_empty()
+                && !tree.blocked(index)
+                && self.visible_at(index, x, y)
+        })
     }
 
     /// The control under a point, with a dropdown's floating options taking
@@ -619,6 +685,24 @@ pub fn layout_chrome(
     let columns = HashMap::new();
     let mut state =
         Ephemeral { scroll, scroll_x: &mut across, columns: &columns, context_at: None };
+    layout(fonts, doc, frame, &mut state)
+}
+
+/// Chrome with a point for an open menu to hang from.
+///
+/// The compositor's own edit menu is a document like any other, and it hangs
+/// where the other button was pressed through exactly the machinery an
+/// application's context menu uses: one open `menu`, no label, and a point.
+pub fn layout_menu_at(fonts: &Fonts, doc: &Document, frame: &Frame, at: (i32, i32)) -> Layout {
+    let mut down = HashMap::new();
+    let mut across = HashMap::new();
+    let columns = HashMap::new();
+    let mut state = Ephemeral {
+        scroll: &mut down,
+        scroll_x: &mut across,
+        columns: &columns,
+        context_at: Some(at),
+    };
     layout(fonts, doc, frame, &mut state)
 }
 
@@ -817,7 +901,10 @@ fn measure(fonts: &Fonts, tree: &Tree, index: usize, width: i32) -> i32 {
             } else {
                 0
             };
-            height + padding + title
+            // The menu bar is a band above the padding rather than a child in
+            // it, so a window that has one is that much taller.
+            let bar = if has_menus(tree, index) { menu_band_h(fonts) } else { 0 };
+            height + padding + title + bar
         }
     }
 }
@@ -828,9 +915,12 @@ fn measure_children(fonts: &Fonts, tree: &Tree, node: &Node, inner: i32) -> i32 
     let mut height = 0;
     let mut position = 0;
     for &child in &node.children {
-        // A dialog floats over its window rather than stacking in it, so it
-        // adds nothing to the window's height.
-        if node.tag == Tag::Window && tree.node(child).tag == Tag::Dialog {
+        // A dialog floats over its window rather than stacking in it, and a
+        // menu stands in the bar across the top of it, so neither adds
+        // anything to the height of what is stacked.
+        if node.tag == Tag::Window
+            && matches!(tree.node(child).tag, Tag::Dialog | Tag::Menu)
+        {
             continue;
         }
         if position > 0 {
@@ -931,18 +1021,48 @@ impl Placer<'_> {
             clip
         };
 
-        // A window's dialogs float over its content, centred, rather than
-        // stacking below it. They are pulled out of the flow here and placed
-        // after the rest, at a dialog's width and their own height, so an
-        // application opens one by adding it to its tree and closes one by
-        // leaving it out, and never says where it goes.
+        // Two of a window's children are not in its flow, and neither of them
+        // is placed by the application.
+        //
+        // Its **menus** are its menu bar: one row across the top of the
+        // window, under the title bar the compositor draws and above
+        // everything the application put inside. An application says it has
+        // an Edit menu; where a menu bar goes is not a thing an application
+        // gets an opinion about, which is why the parser refuses a `menu`
+        // anywhere else.
+        //
+        // Its **dialogs** float over the content, centred, so an application
+        // opens one by adding it to its tree and closes one by leaving it
+        // out, and never says where it goes.
         if tag == Tag::Window {
+            let menus: Vec<usize> = children
+                .iter()
+                .copied()
+                .filter(|&child| tree.node(child).tag == Tag::Menu)
+                .collect();
             let dialogs: Vec<usize> = children
                 .iter()
                 .copied()
                 .filter(|&child| tree.node(child).tag == Tag::Dialog)
                 .collect();
-            children.retain(|child| tree.node(*child).tag != Tag::Dialog);
+            children.retain(|child| !matches!(tree.node(*child).tag, Tag::Dialog | Tag::Menu));
+
+            let mut inner = inner;
+            if !menus.is_empty() {
+                let band = menu_band(self.fonts, area);
+                let row = Rect::new(
+                    band.x + menu_lead(),
+                    band.y,
+                    (band.w - menu_lead() * 2).max(0),
+                    band.h,
+                );
+                self.place_row(&menus, row, menu_gap(), inside);
+                // The content starts under the bar, and is padded from there
+                // as it would have been from the top of the window.
+                let below = Rect::new(area.x, band.y + band.h, area.w, (area.h - band.h).max(0));
+                inner = below.inset(padding);
+            }
+
             self.place_column(&children, inner, gap, inside);
             for dialog in dialogs {
                 let w = dialog_w().min(inner.w);
@@ -1504,11 +1624,13 @@ fn viewport_min() -> i32 { sc(180) }
 fn wanted_width(fonts: &Fonts, tree: &Tree, index: usize) -> i32 {
     let node = tree.node(index);
     let style = style_at(tree, index);
-    let children = |skip_dialogs: bool| {
+    let children = |floating: bool| {
         node.children
             .iter()
             .copied()
-            .filter(move |&child| !(skip_dialogs && tree.node(child).tag == Tag::Dialog))
+            .filter(move |&child| {
+                !(floating && matches!(tree.node(child).tag, Tag::Dialog | Tag::Menu))
+            })
             .map(|child| wanted_width(fonts, tree, child))
     };
     match node.tag {
@@ -1546,10 +1668,14 @@ fn wanted_width(fonts: &Fonts, tree: &Tree, index: usize) -> i32 {
             children(false).sum::<i32>() + gaps
         }
         // A dialog floats and sizes itself, so it asks the window for
-        // nothing; the window's own content is what the window is for.
+        // nothing; the window's own content is what the window is for. The
+        // menus are a row rather than one of the stacked children, so they
+        // ask for their sum, and the window is at least wide enough to show
+        // its own menu bar.
         Tag::Window => {
             let widest = children(true).max().unwrap_or(0);
-            widest + if padded(node) { padding() * 2 } else { 0 }
+            let content = widest + if padded(node) { padding() * 2 } else { 0 };
+            content.max(menu_bar_width(fonts, tree, index))
         }
         Tag::Dialog => children(false).max().unwrap_or(0) + padding() * 2,
         _ => children(false).max().unwrap_or(0),
@@ -2012,17 +2138,36 @@ fn paint_node(
     };
 
     canvas.clipped(clip, |canvas| match node.tag {
-        Tag::Window => canvas.fill_rect(rect, background()),
+        Tag::Window => {
+            canvas.fill_rect(rect, background());
+            // The menu bar's band, drawn by the window rather than by the
+            // menus in it, because a bar is a bar all the way across and not
+            // only where a title happens to sit. A raised strip with a
+            // hairline under it, which is what every other band on screen is.
+            if has_menus(tree, index) {
+                let band = menu_band(fonts, rect);
+                canvas.fill_rect(band, surface());
+                canvas.fill_rect(Rect::new(band.x, band.y + band.h - 1, band.w, 1), border());
+            }
+        }
 
         // Text sits in the vertical middle of whatever box it was given. In a
         // column the box is exactly its lines and this changes nothing; in a
         // row beside buttons the box is the row's height, and a label at the
         // top of it reads as misplaced next to controls whose text is centred.
         Tag::Text => {
-            let step = fonts.line_height(&style);
-            let lines = wrap(fonts, label_of(node), &style, rect.w);
-            let block = lines.len() as i32 * step;
-            let top = rect.y + ((rect.h - block) / 2).max(0);
+            let words = label_of(node);
+            // The run the human dragged out, behind the words, so they stay
+            // readable. Static text is not a control and holds no caret; the
+            // compositor tracks a run over it for one reason, which is that
+            // an answer worth reading is an answer worth copying.
+            if let Some((node, from, to)) = focus.run
+                && node == index
+            {
+                paint_text_run(canvas, fonts, words, &style, rect, (from, to));
+            }
+            let lines = wrap(fonts, words, &style, rect.w);
+            let (top, step) = text_rows(fonts, lines.len(), &style, rect);
             for (row, line) in lines.into_iter().enumerate() {
                 canvas.draw_text(fonts, line, rect.x, top + row as i32 * step, &style, ink);
             }
@@ -2662,6 +2807,77 @@ pub fn text_scroll(
 ///
 /// The shift is computed from the caret as it stands, because that is the
 /// shift the content was painted with: a click lands on what the human sees.
+/// Where a text element's wrapped lines are drawn: the top of the first one
+/// and the step between them.
+///
+/// One function, because a run the human drags out has to land on the
+/// characters they saw, which means the hit test and the paint have to agree
+/// about where those characters are.
+fn text_rows(fonts: &Fonts, lines: usize, style: &Style, rect: Rect) -> (i32, i32) {
+    let step = fonts.line_height(style);
+    let block = lines as i32 * step;
+    (rect.y + ((rect.h - block) / 2).max(0), step)
+}
+
+/// Which character of a wrapped text element a point lands on.
+///
+/// The wrapped lines come from the same cache the layout and the paint use,
+/// so this costs a lookup rather than breaking the text again.
+pub fn text_offset_at(
+    fonts: &Fonts,
+    text: &str,
+    style: &Style,
+    rect: Rect,
+    at: (i32, i32),
+) -> usize {
+    let lines = fonts.break_lines(text, style, rect.w);
+    if lines.is_empty() {
+        return 0;
+    }
+    let (top, step) = text_rows(fonts, lines.len(), style, rect);
+    let row = (((at.1 - top) / step.max(1)).max(0) as usize).min(lines.len() - 1);
+    let (from, to) = lines[row];
+    let line = &text[from as usize..to as usize];
+    // The offset is counted in characters from the start of the whole string,
+    // so what is before this line counts too.
+    let before = text[..from as usize].chars().count();
+    before + caret_from_x(fonts, line, style, rect.x, at.0)
+}
+
+/// Paint the highlight behind a run of *wrapped* text.
+///
+/// The twin of [`paint_selection`], which walks the newlines an editor's value
+/// carries. This one walks the lines the compositor chose when it broke the
+/// text to the width it was given, because static text has no newlines of its
+/// own to walk.
+fn paint_text_run(
+    canvas: &mut Canvas,
+    fonts: &Fonts,
+    text: &str,
+    style: &Style,
+    rect: Rect,
+    (from, to): (usize, usize),
+) {
+    let lines = fonts.break_lines(text, style, rect.w);
+    let (top, step) = text_rows(fonts, lines.len(), style, rect);
+    for (row, &(start, end)) in lines.iter().enumerate() {
+        let line = &text[start as usize..end as usize];
+        let before = text[..start as usize].chars().count();
+        let length = line.chars().count();
+        let head = from.max(before);
+        let tail = to.min(before + length);
+        if head >= tail {
+            continue;
+        }
+        let x0 = rect.x + fonts.measure(prefix(line, head - before), style);
+        let x1 = rect.x + fonts.measure(prefix(line, tail - before), style);
+        canvas.fill_rect(
+            Rect::new(x0, top + row as i32 * step, (x1 - x0).max(1), step),
+            selected(),
+        );
+    }
+}
+
 pub fn caret_at_point(
     fonts: &Fonts,
     value: &str,
@@ -2877,6 +3093,47 @@ mod tests {
         assert_eq!(tab_slot(&rects, 0, 160), 1, "past it now");
     }
 
+
+    /// A window's menus are a bar across the top of it, and the content it
+    /// stacks starts underneath. The application says it has an Edit menu;
+    /// where a menu bar goes is the compositor's, exactly as where the window
+    /// goes is.
+    #[test]
+    fn a_windows_menus_are_a_bar_across_the_top_of_it() {
+        let source = r#"<window title="Sheet">
+            <menu id="edit" label="Edit" description="Commands">
+              <menuitem id="clear" label="Clear" description="Empties it"/>
+            </menu>
+            <menu id="view" label="View" description="What is shown">
+              <menuitem id="zoom" label="Zoom" description="Bigger"/>
+            </menu>
+            <text>content</text>
+          </window>"#;
+        let (doc, layout) = placed(source, Rect::new(0, 0, 600, 400));
+        let fonts = Fonts::load().unwrap();
+
+        let edit = layout.rect_of(doc.index_of("#edit").expect("the Edit menu"));
+        let view = layout.rect_of(doc.index_of("#view").expect("the View menu"));
+        let text = layout.rect_of(doc.tree.node(Tree::ROOT).children[2]);
+
+        assert_eq!(edit.y, 0, "the bar does not start at the top of the window");
+        assert_eq!(edit.h, menu_band_h(&fonts), "a menu is not the height of the bar");
+        assert_eq!(view.y, edit.y, "the menus are not in one row");
+        assert!(view.x > edit.x + edit.w - 1, "the second menu is not after the first");
+        assert!(
+            text.y >= edit.y + edit.h,
+            "the content did not start under the bar: {text:?} against {edit:?}"
+        );
+
+        // No menus, no bar: a window without one starts its content where it
+        // always did.
+        let (plain, layout) = placed(
+            r#"<window title="Sheet"><text>content</text></window>"#,
+            Rect::new(0, 0, 600, 400),
+        );
+        let only = layout.rect_of(plain.tree.node(Tree::ROOT).children[0]);
+        assert!(only.y < menu_band_h(&fonts), "a window with no menus reserved a bar anyway");
+    }
 
     /// Line breaking carries a running width forward instead of measuring the
     /// whole prefix again at every character. The prefix version was

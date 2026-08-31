@@ -179,9 +179,21 @@ A tab marked `movable` can be dragged along its strip, and the slot it lands in 
 
 An agent has `move` too, since where a sheet sits in a workbook is the document's business rather than the screen's, unlike a window, which an agent may never arrange. A tab nobody marked `movable` offers no `move`, and asking for one is answered `unsupported-action`.
 
-The strip holds the tabs and whatever else belongs in the bar beside them: the plus that adds one is an ordinary `button`, and a menu can stand there too, the way the navigation bar carries its own plus and its stop. Its children being controls in the tree rather than chrome is what makes them addressable — an agent adds a sheet by pressing the plus, and the compositor's own plus, being chrome, is invisible to it.
+The strip holds the tabs and whatever else belongs in the bar beside them: the plus that adds one is an ordinary `button`, the way the navigation bar carries its own plus and its stop. Its children being controls in the tree rather than chrome is what makes them addressable — an agent adds a sheet by pressing the plus, and the compositor's own plus, being chrome, is invisible to it. A `menu` is not one of the things that may stand there; see below.
 
-Which content belongs to the chosen tab is the application's business, and it renders that itself; a strip that also owned panels would be the one container in the catalogue deciding what was inside it.
+Which content belongs to the chosen tab is the application's business, and it renders that itself; a strip that also owned panels would be the one container in the catalogue deciding what was inside it. A whole strip, as a spreadsheet writes one:
+
+```xml
+<tabs gap="sm">
+  <tab id="tab-1" label="Sheet 1" selected="true" closable="true" movable="true"
+       description="Shows Sheet 1"/>
+  <tab id="tab-2" label="Sheet 2" closable="true" movable="true"
+       description="Shows Sheet 2"/>
+  <button id="new-sheet" label="+" description="Adds a sheet"/>
+</tabs>
+```
+
+Nothing in there says where the strip is, how tall it is, what colour the band behind it is, or which tab is drawn as the current one beyond `selected`. Those are the compositor's, which is why an application's tabs and the navigation bar's are the same tabs.
 
 `item` has both `click` and `select` because they are different intentions: clicking a file opens it, selecting it marks it for a subsequent operation.
 
@@ -210,11 +222,32 @@ A column's width is in `chars`, not pixels, because a column's width is a proper
 | `menu` | `label` | `open` | `focus` `open` `close` |
 | `menuitem` | `label`, `icon` | `disabled` | `focus` `click` |
 
-A `menu` is a dropdown by another name, and deliberately the same machinery: its items float below it while it is open, painted last and hit first, and fold away to nothing when it is closed, exactly as a `select`'s options do. Both verbs are offered whatever the state, so an intent says what should be true and one that already is does nothing.
+**A `menu` is a child of `window` and of nothing else.** A window's menus are its menu bar, and the compositor lays them out as one row across the top of the window, under the title bar it draws and above everything the application put inside; the content stacks below. An application says it has an Edit menu. Where a menu bar goes is not a thing an application gets an opinion about, any more than where its window goes is, so a `menu` anywhere else is a parse error and the document is refused whole.
+
+That rule exists because the first thing anyone did with a menu that could go anywhere was put one in a strip of tabs, where it came out as a tab that was not one: a word sitting in a row of things you choose, that opens instead of choosing. Nothing in the markup was wrong; the markup simply allowed a sentence with no meaning. A closed vocabulary that lets you say that is not closed.
+
+A menu bar, as the same spreadsheet writes one:
+
+```xml
+<window title="Sheet">
+  <menu id="edit" label="Edit" description="Commands for the chosen cells">
+    <menuitem id="menu-fill" label="Fill from the first"
+              description="Copies the first chosen cell into the rest"/>
+    <menuitem id="menu-clear" label="Clear" description="Empties every chosen cell"/>
+  </menu>
+  <vstack gap="sm" grow="true">
+    ...
+  </vstack>
+</window>
+```
+
+The machinery under it is a dropdown's, deliberately: its items float below it while it is open, painted last and hit first, and fold away to nothing when it is closed, exactly as a `select`'s options do. Both verbs are offered whatever the state, so an intent says what should be true and one that already is does nothing.
 
 **Right-click belongs to the application, not to the vocabulary.** The other mouse button sends a `context` event naming whatever was under it, and that is all it does: what it means is the application's to decide, and what it usually decides is to open a menu. The compositor then hangs that menu's items from where the press landed, which is what makes a context menu appear under the hand. Nothing in the tree says so; the compositor knows because it saw the press, and a press with the ordinary button clears it again.
 
-An agent has no right-click and needs none: it opens a menu by naming it, which reaches the same commands without a pointer. A menu with no label draws nothing at all and still holds a place in the tree, which is how an application offers a context menu that is not also a menu bar.
+**Except over words, where the compositor keeps it.** The selection and the clipboard are the compositor's and are never told to anyone, so the menu that acts on them is the compositor's too: the other button over a `field`, an `editor`, or any `text` element opens a Cut / Copy / Paste of its own, and the application hears nothing. Over a `cell` the press stays the application's, because cut and copy over a grid mean *cells*, and which cells are chosen is the application's state, reported to it and painted by it; the compositor could not copy a run of them if it wanted to. A cell that is being typed into is a field like any other, and then the words in it are the compositor's again. Neither menu is in any tree and neither reaches an agent, which has no other button and needs none.
+
+An agent has no right-click and needs none: it opens a menu by naming it, which reaches the same commands without a pointer. A menu with no label draws no title in the bar and still holds a place in the tree, which is how an application offers a context menu that is not also a menu the human can pull down.
 | `dialog` | `label` | — | — |
 | `popover` | `label` | `open` | `close` |
 
@@ -259,6 +292,20 @@ A row nobody sent is the one thing revealing cannot fix, and that is not scrolli
 Neither is in the protocol, in either direction.
 
 Highlighting is the human's: a press anchors, a drag extends, and the run between is painted behind the words. Ctrl+A, Ctrl+C, Ctrl+X and Ctrl+V are recognised by the compositor against its own copy of a text control, so what an application receives from a paste is a `type-text` carrying the value the control now has, exactly what it would have received had the human typed the words out. No application needs to know a clipboard exists, and none can read one it was not given. No modifier ever reaches the event vocabulary: the keyboard layer turns the chord into the intention before anything else sees it.
+
+**There is one text box on this machine**, `haimanager/src/text.rs`, and an application's `field`, an `editor`, a `cell` being typed into, the start menu's prompt and the navigation bar's rename field are all it. That is worth stating because it was not true: the two chrome boxes had `push` and `pop` and nothing else, so neither could be selected in, copied out of, pasted into, or have its caret moved by an arrow key. A text box that cannot be pasted into is not a text box, and there was no reason for these to be a different thing from the others. What each of them keeps for itself is only what Enter means, which is the one thing that genuinely differs: a field submits, an editor breaks the line, the prompt makes a workspace, the rename field commits a name.
+
+What the one text box does, everywhere:
+
+* A press puts the caret down and anchors a run; a drag extends it.
+* **A second press in the same place takes the word under it, and a third takes the line.** Letters, digits and underscores are one word, a run of spaces is one thing, and punctuation is taken a character at a time, so a double click on `foo.bar` takes `foo`.
+* **Shift with an arrow drags a run out from the keyboard**, from wherever the caret is and whether or not anything is selected yet: the first such keystroke is what anchors the run. Home and End go to the ends of the line, with shift held or without. An arrow without shift collapses a run to the end it was moving toward rather than to wherever the caret happened to be.
+* Backspace eats back, Delete eats forward, and either takes the whole run when there is one.
+* Ctrl+A, Ctrl+C, Ctrl+X, Ctrl+V.
+
+Static `text` is selectable too, and that is not the same machinery, because a paragraph on a page is not a control: it has no value an application tracks, no caret, and nothing that can be typed into it. What it has is a run, started by pressing on the words, taken whole by a double or triple click, reached further with shift and an arrow, and copied with Ctrl+C. A press on words is the only way to say where such a run begins, since there is no caret to put down in a paragraph, so a press that selects nothing is kept as an empty run rather than dropped: it paints nothing, copies nothing, and is what the first shift reaches out from. A run stops at one element, so an agent's answer selects whole and an answer plus the label above it does not.
+
+**Shift with an arrow over a grid means cells, not characters.** A chosen cell has no caret, so there is nothing in it for a run of text to be; what the keystroke means there is the same thing it means in every spreadsheet, one cell further, and it ends in the same `select-range` a drag across the grid sends. The far corner is remembered between keystrokes, so shift and right twice reaches two cells. A plain arrow is how it stops being a run. A cell that is being typed into is a text box again, and then shift with left or right is characters; up and down stay the grid's, exactly as the plain ones do, because a spreadsheet that trapped the cursor in a half-typed cell would be unusable.
 
 ## Reading a collection too large to send
 
