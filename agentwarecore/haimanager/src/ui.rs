@@ -243,6 +243,22 @@ const EDITOR_LINES: i32 = 4;
 /// A ceiling rather than a limit anyone should reach: these are numbers a
 /// client chose, and the geometry is computed from them once a frame.
 const MAX_SHEET_SIDE: u32 = 100_000;
+
+/// How far a spreadsheet element says its sheet runs, columns then rows.
+///
+/// In one place because there are two readers and a disagreement between them
+/// is invisible: laying the grid out decides what can be seen and reached, and
+/// cutting the sheet decides what is kept, so a shape read differently by the
+/// two is either cells held and never drawn or cells drawn and then dropped.
+/// An absent or unreadable number is one, which is a sheet with a single cell
+/// rather than a sheet of nothing, so an element that declares no shape still
+/// has somewhere to put a value.
+pub fn sheet_shape(node: &Node) -> (u32, u32) {
+    let number = |name: &str| {
+        node.attr(name).and_then(|value| value.parse::<u32>().ok()).unwrap_or(1)
+    };
+    (number("columns").clamp(1, MAX_SHEET_SIDE), number("rows").clamp(1, MAX_SHEET_SIDE))
+}
 /// How much of a sheet a window opens showing, when nothing else decides.
 const SHEET_ROWS_MIN: i32 = 12;
 const SHEET_COLUMNS_MIN: i32 = 5;
@@ -1436,13 +1452,9 @@ impl Placer<'_> {
 
         let source = node.attr("source").unwrap_or_default().to_owned();
         let row_h = control_height(self.fonts, tree, index);
-        let number = |name: &str, fallback: u32| {
-            node.attr(name).and_then(|value| value.parse::<u32>().ok()).unwrap_or(fallback)
-        };
         // Bounded, because these are numbers a client chose and the arithmetic
         // below runs per frame. A sheet wider than this is not a sheet.
-        let rows = number("rows", 1).clamp(1, MAX_SHEET_SIDE);
-        let columns = number("columns", 1).clamp(1, MAX_SHEET_SIDE);
+        let (columns, rows) = sheet_shape(node);
 
         // The gutter is as wide as the largest row number it will ever show,
         // so it does not change width as the sheet is scrolled.

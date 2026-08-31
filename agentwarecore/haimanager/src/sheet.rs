@@ -37,6 +37,12 @@ pub struct Sheet {
     /// What the application says the sheet's version is, after everything
     /// applied so far.
     version: u64,
+    /// One past the furthest column and row anything has been written to.
+    /// An upper bound rather than a measurement: it grows as cells are
+    /// written and is never walked back when one is emptied, because what it
+    /// is for is answering "can a shape this size cut anything?" in two
+    /// comparisons, and for that an answer that is never too small is enough.
+    reach: Ref,
 }
 
 impl Sheet {
@@ -74,13 +80,29 @@ impl Sheet {
             // A snapshot: forget what was here. One code path for the first
             // frame and for a recovery, because they are the same thing.
             self.cells.clear();
+            self.reach = (0, 0);
+            // A snapshot carrying nothing is an application saying the sheet
+            // is empty, which is the one moment it is worth handing the table
+            // back: it is what a workbook closing a sheet sends, and there is
+            // nothing about to be written into the space. A snapshot that
+            // does carry values is the first of many runs refilling the
+            // sheet, so shrinking there would be a realloc immediately undone.
+            if values.is_empty() {
+                self.cells.shrink_to_fit();
+            }
         } else if base != self.version {
             return false;
         }
 
         let (column, row) = at;
+        if !values.is_empty() {
+            self.reach = (
+                self.reach.0.max(column.saturating_add(values.len() as u32)),
+                self.reach.1.max(row.saturating_add(1)),
+            );
+        }
         for (step, value) in values.iter().enumerate() {
-            let at = (column + step as u32, row);
+            let at = (column.saturating_add(step as u32), row);
             // An empty value is an empty cell, and an empty cell is one that
             // is not there: a sheet stays sparse however much is cleared.
             if value.is_empty() {
@@ -90,6 +112,36 @@ impl Sheet {
             }
         }
         self.version = version;
+        true
+    }
+
+    /// Cut the sheet to a shape, dropping whatever falls outside it. Returns
+    /// whether anything was dropped.
+    ///
+    /// This is the whole of resizing, and it is deliberately one-sided.
+    /// **Growing costs nothing**: a cell's place in the picture is arithmetic
+    /// rather than a node, so a sheet that becomes ten times taller moves
+    /// nothing, allocates nothing and is not diffed. There is nothing here to
+    /// do for it, which is why the fast path is a pair of comparisons and a
+    /// return.
+    ///
+    /// **Shrinking is where a sheet gives memory back.** A cell outside the
+    /// shape is not a cell that is merely off screen: the shape is what the
+    /// application says the sheet *is*, so it is gone, and holding it would be
+    /// holding data nothing can paint, reach or name. It is dropped and the
+    /// table is handed back its slack, which is the only place in the system
+    /// where a client's memory shrinks on its say-so.
+    ///
+    /// The pass is over the cells that have something in them, not over the
+    /// shape, so cutting a thousand-column sheet to ten costs what the sheet
+    /// holds and not what it declares.
+    pub fn fit(&mut self, columns: u32, rows: u32) -> bool {
+        if self.reach.0 <= columns && self.reach.1 <= rows {
+            return false;
+        }
+        self.cells.retain(|&(column, row), _| column < columns && row < rows);
+        self.cells.shrink_to_fit();
+        self.reach = (self.reach.0.min(columns), self.reach.1.min(rows));
         true
     }
 }
@@ -179,6 +231,67 @@ mod tests {
         assert_eq!(parse("b7"), None);
     }
 
+    /// A snapshot carrying nothing is how an application says a sheet is
+    /// empty, and it has to be sayable: a workbook switching to a blank sheet
+    /// or closing one has nothing to publish, and "publish nothing" cannot
+    /// mean "leave what is there", or an empty sheet is the one state that
+    /// cannot be reached. This is exactly the shape of the bug that made
+    /// switching to an empty tab keep the previous sheet on screen.
+    #[test]
+    fn a_snapshot_of_nothing_empties_a_sheet() {
+        let mut sheet = Sheet::default();
+        assert!(sheet.apply(0, 1, (0, 0), &["Region".into(), "Q1".into()]));
+        assert!(sheet.apply(1, 2, (0, 9), &["down here".into()]));
+
+        assert!(sheet.apply(0, 3, (0, 0), &[]));
+        assert_eq!(sheet.used(), None);
+        assert_eq!(sheet.get((0, 0)), None);
+        assert_eq!(sheet.get((0, 9)), None);
+        // Emptied, not forgotten: the version carries on, so the next delta
+        // applies rather than provoking a resend of a sheet with nothing in
+        // it.
+        assert_eq!(sheet.version(), 3);
+        assert!(sheet.apply(3, 4, (0, 0), &["fresh".into()]));
+        assert_eq!(sheet.get((0, 0)), Some("fresh"));
+    }
+
+    /// Resizing is one-sided, and this is the whole of it: growing is a shape
+    /// nobody has to do anything about, shrinking is cells the sheet stops
+    /// holding. The part worth a test is that the fast path really is the
+    /// usual one, since a walk on every render would be the cost this element
+    /// exists to avoid.
+    #[test]
+    fn a_smaller_shape_is_the_one_thing_that_costs_a_sheet_anything() {
+        let mut sheet = Sheet::default();
+        assert!(sheet.apply(0, 1, (0, 0), &["Region".into(), "Q1".into()]));
+        assert!(sheet.apply(1, 2, (1, 499), &["far down".into()]));
+        assert_eq!(sheet.used(), Some(((0, 0), (1, 499))));
+
+        // Growing, and re-asserting the shape it already has, are both
+        // nothing at all: no walk, and every cell still there.
+        assert!(!sheet.fit(26, 1000));
+        assert!(!sheet.fit(26, 1000));
+        assert!(!sheet.fit(100, 100_000));
+        assert_eq!(sheet.get((1, 499)), Some("far down"));
+
+        // Shrinking past a filled cell drops it, and says so, because the
+        // caller has to know whether anything happened.
+        assert!(sheet.fit(26, 100));
+        assert_eq!(sheet.get((1, 499)), None);
+        assert_eq!(sheet.get((0, 0)), Some("Region"));
+        // And `used` follows, which is what an agent reads to decide what to
+        // ask for: a sheet that says it stops at row 100 and reports a cell
+        // at row 500 is telling it to read cells that are not there.
+        assert_eq!(sheet.used(), Some(((0, 0), (1, 0))));
+
+        // Narrower as well as shorter, and the version is untouched: a shape
+        // is not a delta, so an application's next run still applies.
+        assert!(sheet.fit(1, 100));
+        assert_eq!(sheet.get((1, 0)), None);
+        assert_eq!(sheet.version(), 2);
+        assert!(sheet.apply(2, 3, (0, 0), &["kept up".into()]));
+    }
+
     /// A run applies to the version it says it applies to, and to no other.
     /// The whole of the protocol's safety is this one comparison: a delta that
     /// cannot be placed is refused rather than written into a picture that is
@@ -238,4 +351,9 @@ impl Sheets {
         self.by_source.get(source).map_or(0, Sheet::version)
     }
 
+    /// Cut one sheet to a shape. Returns whether anything was dropped, which
+    /// is what decides whether the screen has to be repainted for it.
+    pub fn fit(&mut self, source: &str, columns: u32, rows: u32) -> bool {
+        self.by_source.get_mut(source).is_some_and(|sheet| sheet.fit(columns, rows))
+    }
 }

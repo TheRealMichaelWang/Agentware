@@ -704,6 +704,59 @@ top to row 989, with the application hearing nothing at all: `query rows`,
 went with it. What the compositor holds is what the application *chose to
 publish*, and it scrolls the shape the element declares.
 
+**A `source` is a sheet, not an application**, and the compositor holds one
+per source whether or not an element points at it. That is what makes a
+workbook cheap: `awsheet` gives each sheet a stream of its own (`book/1`,
+numbered so a closed sheet's name dies with it), so switching tabs is a
+different `source` in the next tree, with no cells on the wire, nothing
+diffed and nothing thrown away.
+
+It used to share one stream between the three sheets and republish on every
+tab click, which was both the cost and a bug: `publish_all` sends one run per
+row that has anything in it, so a sheet with nothing in it sent nothing at
+all, `restart` was a flag waiting for a run that never came, and the
+compositor went on showing the sheet before it. **An empty sheet has to be
+sayable**, so `SheetOut::restart` now sends a snapshot carrying no values,
+which is also the only way to tell the compositor a stream is finished; a
+snapshot that brings nothing hands the table's memory back rather than
+keeping an empty husk.
+
+And the check that would have caught it did not exist. The version on the
+element was written down as re-asserted on every render and read by nobody;
+`Client::fit_sheets` now compares it with the version held and answers
+`sheet-resend` when they differ, once per disagreement rather than once per
+render. The documents claimed divergence was caught on the next frame for as
+long as it took for divergence to actually happen.
+
+**Resizing is declaring a different shape**, and there is no resize message
+because the tree already answers that question on every render. The two
+directions cost very different things, which is the point. Growing is free at
+both ends: a cell's place is arithmetic rather than a node, so `rows="1000"`
+becoming `rows="100000"` moves nothing, allocates nothing and is not diffed.
+Shrinking is the one place in the system where a client's memory shrinks on
+its say-so: a cell outside the shape is not scrolled away, it is not in the
+sheet, so `Sheet::fit` drops it and hands the table back its slack. The pass
+is over what the sheet holds, not over what it declares, so cutting a hundred
+thousand columns to ten costs the filled cells and nothing else. Deciding
+between the two is two comparisons against a bound written as cells arrive
+(`Sheet::reach`, an upper bound that is never walked back when a cell is
+emptied, because all it has to answer is "can this shape cut anything?"), so
+the usual case, a render re-asserting the shape it already had, walks nothing.
+
+It is safe only because of the publish order. Cells go up before the tree that
+claims them, so a value written past the old shape is always followed by the
+shape that makes room for it, and a cut can only drop what the application has
+just said is not in the sheet. A well-behaved application therefore never
+relies on it: `awsheet` empties the row it is about to lose. The cut is what
+guarantees the compositor cannot hold, paint or report a cell outside the
+declared shape whatever an application does, which matters most for `used`,
+the one attribute an agent reads to decide what to ask for.
+
+There is **no 26-column cap** anywhere: the lettering runs A, B, … Z, AA as far
+as it is asked, `parse` takes four letters, and both axes are capped at 100,000
+only because the geometry is arithmetic a client chose the inputs to. The 26 in
+`awsheet` is `awsheet`'s.
+
 The honest limit: an application whose sheet is too large to publish whole
 has no way to be told where the view is, so it cannot stream a band. Nothing
 needs that yet — a sparse sheet of a hundred thousand filled cells is about
