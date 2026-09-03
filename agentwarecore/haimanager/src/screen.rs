@@ -727,11 +727,6 @@ impl Screen {
             other => return Err(format!("unknown handoff {other:?}")),
         };
 
-        let pid: i32 = match kind {
-            Kind::App => field(3).parse().unwrap_or(0),
-            _ => field(2).parse().unwrap_or(0),
-        };
-
         // The name arrived in the supervisor's handoff tag, which is the only
         // identity an app has; its icon is read from the package under that
         // name, so an app cannot wear another's.
@@ -739,7 +734,7 @@ impl Screen {
             self.images.icons.prepare(&name, &[title_icon(), dock_icon()]);
         }
 
-        let client = Client::adopt(kind, desk, name, pid, UnixStream::from(fd))
+        let client = Client::adopt(kind, desk, name, UnixStream::from(fd))
             .map_err(|err| format!("could not adopt the descriptor: {err}"))?;
         let label = client.label();
         let fd = client.fd();
@@ -1556,15 +1551,25 @@ impl Screen {
                 true
             }
 
-            // Lifetime belongs to PID 1, so closing a window is a request rather
-            // than a socket the compositor drops. Dropping it would leave a
-            // process alive with nothing to draw on and nobody tracking it.
+            // The cross asks, and that is the whole of it. Only the application
+            // knows whether there is anything to lose, so only it can say what
+            // closing means: it exits, or it puts a question up first and exits
+            // when that is answered.
+            //
+            // There is no second press that closes the window regardless, and
+            // nothing here can end a process. Every application on this machine
+            // is written here, so one that hears this and does nothing is a bug
+            // to fix in it, not a case for the compositor to carry machinery
+            // about. That machinery cost more than it bought: a flag on every
+            // window, a clock to tell one gesture from two, and the compositor
+            // reaching into a client's tree looking for a dialog to work out
+            // whether it had been answered.
             Title::Close => {
                 let desk = self.workspaces[at].id;
-                let pid = self.client(fd).map(|client| client.pid).unwrap_or(0);
-                self.requests
-                    .push(vec!["close-app".into(), desk.to_string(), pid.to_string()]);
-                self.notes.push(format!("workspace {desk}: closing pid {pid}"));
+                if let Some(client) = self.client_mut(fd) {
+                    client.ask_to_close();
+                }
+                self.notes.push(format!("workspace {desk}: asked {fd} to close"));
                 true
             }
         }
@@ -3290,5 +3295,46 @@ mod tests {
         // agent where to look without reading a screenful to find out.
         assert!(reply[2].contains("used=\"A1:B500\""), "{}", reply[2]);
         assert!(!reply[2].contains("<cell"), "a cell reached the agent: {}", reply[2]);
+    }
+
+    /// The cross asks the application, and does nothing else.
+    ///
+    /// It used to be a SIGTERM through PID 1 with no warning, which is why this
+    /// exists: an application with unsaved work had no moment in which to say
+    /// so. What it must not do is end anything itself, so the assertion that
+    /// matters as much as the event is the one that nothing was asked of PID 1.
+    #[test]
+    fn the_cross_asks_the_application_and_does_nothing_else() {
+        ui::set_scale(1.0);
+        let fonts = Fonts::load().expect("the faces are compiled in");
+        let mut screen = Screen::new(Rect::new(0, 0, 1200, 800), &fonts);
+
+        let (mut app, app_end) = UnixStream::pair().expect("a socketpair");
+        let app_fd = app_end.as_raw_fd();
+        screen
+            .attach(
+                &fonts,
+                &["app-attached".into(), "1".into(), "awsheet".into(), "0".into()],
+                OwnedFd::from(app_end),
+            )
+            .expect("the application attached");
+        app.write_all(&encode(&["render", "1", "<window><text>x</text></window>"])).unwrap();
+        screen.readable(app_fd, &fonts);
+
+        // The press reaches the application, and reaches nobody else.
+        assert!(screen.title_action(&fonts, app_fd, Title::Close, 0, 0));
+        let said = frame(&mut app);
+        assert_eq!(said[0], awproto::display::MSG_EVENT);
+        assert_eq!(said[2], "", "the window is the one thing with no node to name");
+        assert_eq!(said[3], awproto::display::ACTION_CLOSE);
+        assert!(screen.requests.is_empty(), "the compositor asked PID 1 to end something");
+
+        // Pressing it again asks again. There is no second press that closes
+        // the window regardless, and nothing here can end a process: the
+        // application exits when it is ready, and the window goes when its
+        // connection does.
+        assert!(screen.title_action(&fonts, app_fd, Title::Close, 0, 0));
+        assert_eq!(frame(&mut app)[3], awproto::display::ACTION_CLOSE);
+        assert!(screen.requests.is_empty(), "a second press forced the window shut");
     }
 }

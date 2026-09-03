@@ -39,9 +39,11 @@ agentwarecore/          cargo workspace
 agentwareapps/          cargo workspace: first-party applications
   awcalc/               a calculator, the first real application
   awfiles/              a file explorer, and where the shared dialogs are seen
-home/                   sample files, staged to /home on the system image; what
-                        is saved there persists across boots, and is reset
-                        when `make pack` rebuilds the image
+  awsheet/              a spreadsheet: one open CSV file per tab
+home/                   the skeleton for /home: what a machine has the first
+                        time it boots. Copied onto the state volume when there
+                        is nothing there yet, and never read again, so a
+                        person's files survive `make pack`
 default_wallpapers/     the wallpapers that ship, staged to /default_wallpapers
 default_themes/         the palettes that ship, one XML each; dark.xml is the
                         palette the compositor paints with unless told otherwise
@@ -319,6 +321,23 @@ by the prompt: one adds 12 + 34 on the calculator and reads back 46, and one
 whose prompt says "file" marks welcome.txt, opens Copy to..., is told
 `blocked` for a control behind the dialog, walks into notes and confirms.
 
+`awsheet` is a spreadsheet, and **one tab is one open file**. It reads and
+writes CSV, which is the only format it knows and the only one it claims:
+there are no formulas and no arithmetic, and a cell holds the text typed into
+it. The File menu is New, Open, Save and Save as, each answered by an `awkit`
+dialog filtered to `.csv`; a name saved without an extension gets one, since
+the format it writes is the format it reads. A tab whose sheet has changed
+since it was saved carries a `*`, and closing one asks first, through
+`Confirm` in the app's own tree like every other question. A clean tab closes
+without a word: a dialog that appears when nothing is at stake is one people
+learn to click through. Opening a file that is already open shows that tab
+rather than opening it twice, because two tabs on one file are two sets of
+edits with one place to put them. Saving writes to a scratch file and renames
+it into place, so a failure halfway leaves what was there rather than half of
+what was coming. What is written is the rectangle from A1 to the furthest
+cell with anything in it, which is the only part of a thousand-row sheet
+worth writing down.
+
 **A window opens at the size its content asks for.** AWML has no width to
 declare, so both are derived on the first tree (`ui::document_width`,
 `ui::natural_height`): the width is what the tree wants so every control sits
@@ -497,13 +516,32 @@ drive, the machine comes up with a live supervisor saying "no volume at
 Everything else is the **system volume**, `system.img` on `/dev/vda`
 (`agentware.system=` overrides): the supervisor mounts it at `/system` and
 bind-mounts its top-level directories (`bin`, `apps`, the wallpapers and
-themes, `home`) over the root, so no path anywhere else in the userland
+themes) over the root, so no path anywhere else in the userland
 changed. The kernel demand-pages all of it, so code is in memory only while
-it runs. Writes are real: files in `/home` persist across boots like an
-actual OS, and are reset when `make pack` rewrites the image, which is a
-reinstall. Workspaces and conversations still die at reboot; they always
+it runs. Workspaces and conversations still die at reboot; they always
 were process state. At shutdown the binds come off and the volume properly
 unmounts, which PID 1 living off-disk is what makes possible.
+
+**`/home` is not on that volume, and putting it there was a real bug.** Files
+were part of the OS image, so they were rebuilt every time it was: `make pack`
+writes the image whole and `make run` packs first, which made every boot during
+development a reinstall and every saved file disappear. Nothing an application
+could do would have survived it. So the image's `home/` is a **skeleton** now,
+what an installer would call it: `early::mount_home` copies it onto the state
+volume the first time there is nothing there to copy to, and never reads it
+again. `/home` is a bind out of `/state/home`, a reinstall leaves a person's
+files alone, and `make cleanstate` is what erases them, which is the gesture
+that already meant this machine has never been booted. Without a state volume
+the image's copy is bound instead, read-write in RAM, and the log says it will
+not last, which is the same graceful degradation settings get.
+
+The other half of that bug was in the application, and it is the older trap:
+**a rename without an fsync gives you the new name and the old contents, or
+none.** `awsheet` wrote its scratch file and renamed it, unsynced, so the
+directory entry reached the disk and the bytes did not. The save said it had
+worked, the next boot showed an empty file, and it read exactly like a fault in
+the state volume. Write, `sync_all`, rename, then sync the directory, which is
+what `awproto::settings` already did and the reason it was already right.
 
 ## Verifying graphics
 
@@ -590,6 +628,19 @@ is the list so it does not get relitigated.
 * Window chrome is the **compositor's**: title bar, shadow, and the three dots.
   They are the only controls that are not AWML, so no application decides
   whether it is closable and no agent sees the button that destroys its window.
+  **The cross asks, and that is all it does.** It sends `close` with an empty
+  target; the application exits, or puts a question up and exits when that is
+  answered. Only the application knows whether there is anything to lose, so
+  only it can decide what closing means. Nothing in the compositor can end a
+  process and there is no verb at PID 1 for it either: `close-app` is gone,
+  along with the pid the compositor used to keep in order to name one. The
+  window goes when its connection does. **This assumes applications written in
+  good faith**, which on this machine they are, and it is worth what it saves:
+  the alternative carried a second press that closed the window anyway, a flag
+  on every window, a clock to tell one gesture from two, and the compositor
+  reaching into a client's tree for a dialog to decide whether it had been
+  answered. An application that ignores being asked is a bug in that
+  application.
 * An agent's typed text goes in **one character at a time**, producing one event
   per keystroke. A value set in one step is something no human could produce.
 * A human's click and an agent's intent end in **one function**. Nothing else may
@@ -706,7 +757,7 @@ publish*, and it scrolls the shape the element declares.
 
 **A `source` is a sheet, not an application**, and the compositor holds one
 per source whether or not an element points at it. That is what makes a
-workbook cheap: `awsheet` gives each sheet a stream of its own (`book/1`,
+workbook cheap: `awsheet` gives each open file a stream of its own (`book/1`,
 numbered so a closed sheet's name dies with it), so switching tabs is a
 different `source` in the next tree, with no cells on the wire, nothing
 diffed and nothing thrown away.
@@ -814,8 +865,8 @@ tabs' rectangles and nothing else, so a burst of motions between two
 repaints all agree. What it cannot share is what happens next: the bar's
 order is the compositor's and it rearranges itself, while an application's
 order is the application's, so a `movable` tab's drag sends `move` naming
-the slot and the application answers with a new tree, the way it answers a
-table's `scroll`. An agent has `move` too: where a sheet sits in a workbook
+the slot and the application answers with a new tree, the way it answers
+every other event. An agent has `move` too: where a sheet sits in a workbook
 is the document's business, unlike a window, which it may never arrange.
 A positional tab id does not survive this, which is why `awsheet` numbers
 its sheets: the tab a name refers to would change under the hand carrying

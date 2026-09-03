@@ -105,6 +105,10 @@ fn main() {
     // because it needs /dev, and before any service, because the first thing
     // to ask for a setting writes the defaults if there are none.
     early::mount_state();
+    // A person's files, which live on the state volume rather than in the OS
+    // image so that reinstalling the OS does not take them with it. After both
+    // volumes, because on a first run it copies one onto the other.
+    early::mount_home();
     // The resolver's one file, so the agent can turn a hostname into an
     // address. The interface itself is the kernel's, from the ip= boot
     // argument; the supervisor only says whether one exists.

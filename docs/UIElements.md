@@ -320,7 +320,17 @@ The complete closed set. Nothing else exists.
 | `deselect` | — | Remove from the selection. |
 | `set-value` | number | Set a numeric value. |
 | `open` | — | Expand a menu, dropdown or popover. |
-| `close` | — | Collapse it. |
+| `close` | — | Collapse it, or close a `closable` tab. With an **empty target**, close the window. |
+
+### Closing a window is a request
+
+An application never sees the cross on its title bar: that is chrome, and no agent has it in its vocabulary. But the human's press reaches the application, as an ordinary `close` event whose target is empty, because the window is the one thing they can act on that has no node to name.
+
+It is a request, and the answer is either to exit or to render a `dialog` the way an application answers any other question. Only the application knows whether there is anything to lose, so only it can decide what closing means. Nothing forces it: there is no second press that closes the window regardless, and no way for the compositor or PID 1 to end an application's process. The window goes when its connection does.
+
+That trusts applications to answer, which is a choice rather than an oversight. One that ignores this is a bug in that application, and paying for it here meant a second press that could destroy the very work the question was about, plus the machinery to tell one gesture from two.
+
+It arrives as an event rather than as a message of its own, and that is not incidental. An application's loop blocks in `next_event`, so a message would have been read, remembered, and never acted on: there is no event coming after it.
 
 
 ### Scrolling is not in the vocabulary

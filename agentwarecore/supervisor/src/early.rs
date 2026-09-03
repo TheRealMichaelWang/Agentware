@@ -168,7 +168,12 @@ const SYSTEM_DEVICE: &str = "/dev/vda";
 /// The directories the system volume provides, bound over the root so that
 /// no path anywhere else in the userland changes: `/bin/haimanager` is
 /// `/system/bin/haimanager` without any process having to know it.
-const SYSTEM_DIRS: &[&str] = &["bin", "apps", "default_wallpapers", "default_themes", "home"];
+/// `home` is deliberately not here. It used to be, and that made a person's
+/// files part of the OS image: `make pack` rewrites that image, `make run`
+/// packs first, so every boot during development was a reinstall and anything
+/// saved was gone. Files are the machine's, not the install's, so `/home` comes
+/// off the state volume instead. See [`mount_home`].
+const SYSTEM_DIRS: &[&str] = &["bin", "apps", "default_wallpapers", "default_themes"];
 
 /// How long to wait for a volume's device to appear. virtio-blk is built in
 /// and there before init runs; the bound keeps a machine without a drive
@@ -276,6 +281,95 @@ pub fn mount_state() {
     }
 }
 
+/// Where a person's files are: `/home`.
+pub const HOME_DIR: &str = "/home";
+
+/// Put `/home` on the state volume, seeding it from the image on a first run.
+///
+/// **Files are the machine's, not the install's.** `/home` used to be a
+/// directory of the system volume, bound over the root like `bin` and `apps`,
+/// which meant it was rebuilt every time the OS image was: `make pack` writes
+/// that image whole and `make run` packs first, so a file saved in one session
+/// was gone by the next boot. That is not a person losing work to a bug, it is
+/// the OS reinstalling itself under them, and no amount of care in an
+/// application could have survived it.
+///
+/// So the image's `home/` is now what an installer would call the skeleton: it
+/// is copied onto the state volume the first time there is nowhere to copy it
+/// to, and never consulted again. A reinstall (`make pack`) leaves a person's
+/// files alone. `make cleanstate` is what erases them, which is the gesture
+/// that already meant "this machine has never been booted".
+///
+/// Without a state volume this still binds nothing and leaves the image's
+/// files visible read-write in RAM, which is the same graceful degradation
+/// settings get: the machine works, and the log says what will not last.
+pub fn mount_home() {
+    let seed = format!("{SYSTEM_DIR}/home");
+    let home = format!("{STATE_DIR}/home");
+
+    // Nothing was mounted on /state, so there is no disk to put files on. The
+    // image's own home/ is already bound nowhere; expose it as it is.
+    if !is_mount_point(STATE_DIR) {
+        if Path::new(&seed).is_dir() {
+            let _ = fs::create_dir_all(HOME_DIR);
+            match mount::mount_bind(&seed, HOME_DIR) {
+                Ok(()) => kwarn!("home: no state volume; {HOME_DIR} is the image's and will not outlive this boot"),
+                Err(err) => kwarn!("home: could not bind {seed} on {HOME_DIR}: {err}"),
+            }
+        }
+        return;
+    }
+
+    if !Path::new(&home).exists() {
+        match copy_tree(Path::new(&seed), Path::new(&home)) {
+            Ok(n) => kinfo!("home: first run, copied {n} file(s) from the image"),
+            Err(err) => kwarn!("home: could not seed {home} from {seed}: {err}"),
+        }
+    }
+    if let Err(err) = fs::create_dir_all(&home) {
+        kwarn!("home: could not create {home}: {err}");
+        return;
+    }
+    if let Err(err) = fs::create_dir_all(HOME_DIR) {
+        kwarn!("home: could not create {HOME_DIR}: {err}");
+        return;
+    }
+    match mount::mount_bind(&home, HOME_DIR) {
+        Ok(()) => kinfo!("home: {HOME_DIR} is {home}, on the state volume"),
+        Err(err) => kwarn!("home: could not bind {home} on {HOME_DIR}: {err}"),
+    }
+}
+
+/// Whether anything is mounted at a path, by asking whether it and its parent
+/// are on the same device. A mount point is the one place they differ.
+fn is_mount_point(path: &str) -> bool {
+    let Ok(here) = fs::metadata(path) else { return false };
+    let Some(parent) = Path::new(path).parent() else { return false };
+    let Ok(above) = fs::metadata(parent) else { return false };
+    std::os::unix::fs::MetadataExt::dev(&here) != std::os::unix::fs::MetadataExt::dev(&above)
+}
+
+/// Copy a directory tree, returning how many files were written.
+///
+/// Only what a skeleton holds: directories and ordinary files. It runs once, on
+/// a machine's first boot, over the handful of files the image ships.
+fn copy_tree(from: &Path, to: &Path) -> io::Result<usize> {
+    fs::create_dir_all(to)?;
+    let mut written = 0;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let target = to.join(entry.file_name());
+        if kind.is_dir() {
+            written += copy_tree(&entry.path(), &target)?;
+        } else if kind.is_file() {
+            fs::copy(entry.path(), &target)?;
+            written += 1;
+        }
+    }
+    Ok(written)
+}
+
 /// Point the resolver at a nameserver, and say whether there is a network.
 ///
 /// The kernel configures the interface itself from the `ip=` boot argument
@@ -322,6 +416,10 @@ fn kernel_arg(key: &str) -> Option<String> {
 /// state volume goes first and gets a proper unmount attempt before the lazy
 /// one, since it is the one filesystem whose contents matter afterwards.
 pub fn unmount_all() {
+    // /home is a bind out of the state volume, so it comes off before the
+    // volume under it or the proper unmount below can never succeed and the
+    // one filesystem whose contents matter would always get the lazy one.
+    let _ = mount::unmount(HOME_DIR, UnmountFlags::DETACH);
     if mount::unmount(STATE_DIR, UnmountFlags::empty()).is_err()
         && let Err(err) = mount::unmount(STATE_DIR, UnmountFlags::DETACH)
     {

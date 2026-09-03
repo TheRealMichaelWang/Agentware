@@ -81,6 +81,26 @@ pub const ACTION_DESELECT: &str = "deselect";
 /// A dropdown asked to show or hide its options. The application owns the
 /// `open` state, as it owns every other, and answers by re-rendering.
 pub const ACTION_OPEN: &str = "open";
+/// Something asked to close: a dropdown's options, a `closable` tab, or, when
+/// the **target is empty, the window itself**.
+///
+/// The window is the only one of those with no node to name, because its cross
+/// is compositor chrome and an application never sees it. It is still the same
+/// word doing the same thing: a request the application answers by going away,
+/// or by rendering a question the way it answers a tab's cross. Both are a
+/// human asking to close something the application knows more about than the
+/// compositor does.
+///
+/// Nothing forces it. There is no second press that closes the window
+/// regardless and no verb at PID 1 for ending an application, so an application
+/// that hears this and does nothing keeps its window: that is a bug in the
+/// application, and the machinery to defend against it cost more than it was
+/// worth. The window goes when the process does.
+///
+/// It arrives as an ordinary event, and that is deliberate rather than
+/// incidental: an application's loop is built around `next_event`, which blocks
+/// until one arrives. A message of its own would have been read, remembered and
+/// never acted on, because there is no event coming after it.
 pub const ACTION_CLOSE: &str = "close";
 /// A run of cells chosen at once: the target is one corner and the value is
 /// the id of the other. One event for one gesture, because a drag across a
@@ -224,7 +244,15 @@ impl Surface {
         event.version != self.version
     }
 
-    fn note_resend(&mut self, fields: &[String]) {
+    /// Keep what the compositor said that was not an event.
+    ///
+    /// Anything not understood is ignored, so a client does not die because a
+    /// later compositor started saying something it has never heard of. That
+    /// tolerance is also why anything an application must *act* on travels as
+    /// an event instead: a message noted here is only looked at when the
+    /// application next comes round its loop, and it comes round its loop when
+    /// an event arrives.
+    fn note(&mut self, fields: &[String]) {
         if fields.first().map(String::as_str) == Some(MSG_SHEET_RESEND)
             && let Some(source) = fields.get(1)
         {
@@ -312,7 +340,7 @@ impl Surface {
                 Some(fields) => match Event::from_fields(&fields) {
                     Some(event) => return Ok(Some(event)),
                     None => {
-                        self.note_resend(&fields);
+                        self.note(&fields);
                         continue;
                     }
                 },
@@ -337,7 +365,7 @@ impl Surface {
                 match Event::from_fields(&fields) {
                     Some(event) => return Ok(Some(event)),
                     None => {
-                        self.note_resend(&fields);
+                        self.note(&fields);
                         continue;
                     }
                 }

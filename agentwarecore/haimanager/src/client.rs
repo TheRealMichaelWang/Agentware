@@ -106,11 +106,6 @@ pub struct Client {
     /// The workspace this connection belongs to, as the supervisor stated it.
     pub desk: u32,
     pub name: String,
-    /// The process behind this connection, as the supervisor stated it.
-    ///
-    /// Needed to close one window without closing the workspace: lifetime
-    /// belongs to PID 1, so the compositor names the process and asks.
-    pub pid: i32,
     /// The last thing that happened, for the status strip.
     pub note: String,
 
@@ -223,19 +218,18 @@ pub struct Progress {
 }
 
 impl Client {
-    pub fn adopt(
-        kind: Kind,
-        desk: u32,
-        name: String,
-        pid: i32,
-        stream: UnixStream,
-    ) -> io::Result<Self> {
+    /// Take on a descriptor the supervisor handed over.
+    ///
+    /// The pid it also states is deliberately not kept. The compositor held it
+    /// to name a process to PID 1 when a window was closed; the cross asks the
+    /// application now, so there is nothing to name, and a compositor that
+    /// cannot identify a process is a compositor that cannot end one.
+    pub fn adopt(kind: Kind, desk: u32, name: String, stream: UnixStream) -> io::Result<Self> {
         stream.set_nonblocking(true)?;
         Ok(Client {
             kind,
             desk,
             name,
-            pid,
             note: "connected, nothing rendered yet".into(),
             stream,
             decoder: Decoder::with_limit(MAX_TREE),
@@ -452,6 +446,17 @@ impl Client {
 
     fn node_count(&self) -> usize {
         self.doc.as_ref().map_or(0, |doc| doc.tree.nodes.len())
+    }
+
+    /// Tell the application the human pressed the cross on its window.
+    ///
+    /// An ordinary event with no target, because the window is the one thing
+    /// the human can act on that has no node: its chrome is the compositor's
+    /// and the application never sees it. An event rather than a message of its
+    /// own because an application's loop blocks in `next_event`, so anything it
+    /// has to act on has to be one.
+    pub fn ask_to_close(&mut self) {
+        self.emit("", display::ACTION_CLOSE, "");
     }
 
     /// Make the sheets agree with the tree that just arrived: cut each one to
@@ -2368,7 +2373,7 @@ mod tests {
         let fonts = Fonts::load().expect("the faces are compiled in");
         let (ours, peer) = UnixStream::pair().expect("a socketpair");
         let mut client =
-            Client::adopt(Kind::App, 1, "test".to_owned(), 0, ours).expect("adopted");
+            Client::adopt(Kind::App, 1, "test".to_owned(), ours).expect("adopted");
         client.apply(&fonts, source, 1, &mut Vec::new());
         client.set_frame(&fonts, Frame::Whole(frame));
         (fonts, client, peer)
