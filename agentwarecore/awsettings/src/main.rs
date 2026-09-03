@@ -121,6 +121,15 @@ fn main() {
             }
         };
 
+        // The cross on the window. It asks rather than closing, because an
+        // application may have something to lose; this one writes every change
+        // straight to the settings file, so it answers by going. An application
+        // that says nothing here is closed by the human's next press instead,
+        // which is a click they should not have to spend.
+        if event.action == display::ACTION_CLOSE && event.target.is_empty() {
+            return;
+        }
+
         if !app.accept(&surface, &event) {
             continue;
         }

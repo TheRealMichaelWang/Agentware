@@ -1,1 +1,1 @@
-A grid of cells to type numbers and words into, a thousand rows deep.
+A spreadsheet. Reads and writes CSV files, one open file per tab.

@@ -369,14 +369,12 @@ impl Control {
             },
         ),
 
-        "close-app" => {
-            let id = parse_id(1);
-            let pid = arg(2)
-                .and_then(|text| text.parse::<i32>().ok())
-                .ok_or_else(|| "missing or malformed pid".to_owned());
-            id.and_then(|id| pid.and_then(|pid| desks.close_app(id, pid))).map(|()| vec![])
-        }
-
+        // There is deliberately no verb here for closing an application. The
+        // cross on a window asks the application, which exits when it is ready,
+        // so nothing needs PID 1 to end an app's process and nothing may: a
+        // request that can kill an application at any instant is one more way
+        // for work to be lost, and the only reason to have kept it was for
+        // applications written badly enough to ignore being asked.
         "interrupt" => parse_id(1).and_then(|id| desks.interrupt(id)).map(|()| vec![]),
 
         "close-desk" => parse_id(1).and_then(|id| desks.close(id)).map(|()| vec![]),

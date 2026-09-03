@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 # An application needs a socket it was handed and a way to format markup, and
-# no access to the display, the input devices or the filesystem.
+# no access to the display or the input devices. It reads and writes files in
+# process, the way the file dialog lists them, because nothing is namespaced
+# yet; the portal that hands back a descriptor instead is the later step.
 [dependencies]
 awproto = { path = "../../agentwarecore/awproto" }
+awkit = { path = "../../agentwarecore/awkit" }

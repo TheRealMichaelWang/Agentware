@@ -76,11 +76,6 @@ impl Broker {
             .ok_or_else(|| "no pid in the reply".to_owned())
     }
 
-    /// Close one application, leaving the rest of the workspace alone.
-    pub fn close_app(&mut self, desk: u32, pid: i32) -> Result<(), String> {
-        self.ask(&["close-app", &desk.to_string(), &pid.to_string()]).map(|_| ())
-    }
-
     /// Ask for an agent process to run one turn.
     ///
     /// No prompt and no conversation crosses this call. The supervisor is told

@@ -193,8 +193,11 @@ pack: build
 	mkdir -p $(FS_DIR)/default_themes
 	cp default_themes/*.xml $(FS_DIR)/default_themes/
 
-	# 3b''. /home, where the file browser opens, with a few files to find.
-	# In RAM like everything else: what is made there lasts until power off.
+	# 3b''. The skeleton for /home: what a machine starts with the first time
+	# it is booted, with a few files to find. The supervisor copies this onto
+	# the state volume when there is nothing there yet and never reads it
+	# again, so /home is the machine's rather than the image's and rebuilding
+	# the image here does not take a person's files with it.
 	rm -rf $(FS_DIR)/home
 	cp -r home $(FS_DIR)/home
 
@@ -275,7 +278,7 @@ selftest: pack
 # Utilities
 # ---------------------------------------------------------
 cleanstate:
-	@echo "==> Removing the state volume; the next boot is a first run."
+	@echo "==> Removing the state volume: settings and /home go with it. The next boot is a first run."
 	rm -f $(STATE_IMG)
 
 clean:
