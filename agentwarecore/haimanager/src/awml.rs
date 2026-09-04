@@ -799,6 +799,18 @@ fn emit(tree: &Tree, sheets: &Sheets, index: usize, depth: usize, out: &mut Stri
 mod tests {
     use super::*;
 
+    /// An attribute value may contain newlines, because a text editor's whole
+    /// document is one: it is an `editor`'s `value`, and unlike a sheet's cells
+    /// it travels in the tree like everything else.
+    #[test]
+    fn an_attribute_value_carries_the_newlines_in_it() {
+        let tree = parse("<window><editor id=\"body\" value=\"one\ntwo\n\nfour\" \
+                          description=\"The text\"/></window>")
+            .expect("the document parsed");
+        let editor = tree.nodes.iter().find(|node| node.tag == Tag::Editor).expect("an editor");
+        assert_eq!(editor.attr("value"), Some("one\ntwo\n\nfour"));
+    }
+
     /// docs/UIElements.md: a password field reports its value as a masked
     /// placeholder in the agent's view, never the contents. The same rule the
     /// paint path applies, kept here because the API key entered in Settings

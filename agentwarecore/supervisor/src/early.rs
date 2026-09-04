@@ -12,6 +12,7 @@
 
 use std::fs;
 use std::io;
+use std::io::Write as _;
 use std::path::Path;
 
 use rustix::mount::{self, MountFlags, UnmountFlags};
@@ -353,6 +354,13 @@ fn is_mount_point(path: &str) -> bool {
 ///
 /// Only what a skeleton holds: directories and ordinary files. It runs once, on
 /// a machine's first boot, over the handful of files the image ships.
+///
+/// Every file is synced, and so is the directory holding it. That is not
+/// caution, it is the bug this had: `fs::copy` leaves the contents in the page
+/// cache, so a machine switched off soon after its first boot came back with
+/// `/home` full of files of the right names and zero length. It looked like a
+/// broken application, since what noticed was a text editor opening a file and
+/// finding nothing in it.
 fn copy_tree(from: &Path, to: &Path) -> io::Result<usize> {
     fs::create_dir_all(to)?;
     let mut written = 0;
@@ -363,10 +371,14 @@ fn copy_tree(from: &Path, to: &Path) -> io::Result<usize> {
         if kind.is_dir() {
             written += copy_tree(&entry.path(), &target)?;
         } else if kind.is_file() {
-            fs::copy(entry.path(), &target)?;
+            let bytes = fs::read(entry.path())?;
+            let mut file = fs::File::create(&target)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
             written += 1;
         }
     }
+    fs::File::open(to)?.sync_all()?;
     Ok(written)
 }
 

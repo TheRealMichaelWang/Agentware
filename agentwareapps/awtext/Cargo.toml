@@ -1,0 +1,11 @@
+[package]
+name = "awtext"
+version = "0.1.0"
+edition = "2024"
+
+# A socket it was handed, a way to format markup, and the shared dialogs. It
+# reads and writes files in process, the way the file dialog lists them,
+# because nothing is namespaced yet.
+[dependencies]
+awproto = { path = "../../agentwarecore/awproto" }
+awkit = { path = "../../agentwarecore/awkit" }

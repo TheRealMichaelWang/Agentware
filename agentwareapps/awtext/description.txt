@@ -1,0 +1,1 @@
+A text editor. Reads and writes plain text files, one open file per tab.

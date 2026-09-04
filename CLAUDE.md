@@ -40,6 +40,7 @@ agentwareapps/          cargo workspace: first-party applications
   awcalc/               a calculator, the first real application
   awfiles/              a file explorer, and where the shared dialogs are seen
   awsheet/              a spreadsheet: one open CSV file per tab
+  awtext/               a text editor: one open text file per tab
 home/                   the skeleton for /home: what a machine has the first
                         time it boots. Copied onto the state volume when there
                         is nothing there yet, and never read again, so a
@@ -337,6 +338,23 @@ it into place, so a failure halfway leaves what was there rather than half of
 what was coming. What is written is the rectangle from A1 to the furthest
 cell with anything in it, which is the only part of a thousand-row sheet
 worth writing down.
+
+`awtext` is a text editor, and the same shape: one tab is one open file, the
+same File menu, the same `*` on a changed tab, the same question before closing
+one. Where it differs is the whole point of the spreadsheet's exception. A
+document is one string in one `editor`, so it goes the **ordinary** way: the
+whole tree every time, the compositor diffs it, and a file of a few thousand
+characters costs about what a dialog costs. Cells are the only thing in the
+system that had to leave the tree, and they had to earn it. The caret, the
+selection and the scroll position inside the box are the compositor's and never
+appear in the application at all, so what it owns is the text, which is what a
+file is.
+
+The two applications duplicate their file handling: New, Open, Save, Save as,
+the dirty flag, the confirmations, the atomic write. It is about a hundred
+lines each and it will drift. The shape it wants is a piece of `awkit` holding
+the open-file list and the dialogs, parameterised by how a document is read and
+written, which is the one thing they genuinely differ about.
 
 **A window opens at the size its content asks for.** AWML has no width to
 declare, so both are derived on the first tree (`ui::document_width`,
