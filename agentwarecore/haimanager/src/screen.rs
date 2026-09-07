@@ -2975,38 +2975,20 @@ impl Screen {
             .map(|held| (held.id, held.at_x - held.grab_dx));
 
         // The held tab is lifted out of the row and rides under the pointer.
-        // Without this the only feedback was the row rearranging once the
-        // pointer crossed a neighbour's midpoint, which for the first half of
-        // any drag is no feedback at all: the mechanism worked and the
-        // interaction still read as dead.
+        // An application's strip does the same, from the same function.
         if let Some((id, ghost_x)) = dragging
             && let Some((_, home)) = self.nav_tab_rects().into_iter().find(|(tab, _)| *tab == id)
             && let Some(workspace) = self.workspaces.iter().find(|w| w.id == id)
         {
-            // Blank the tab's resting place so it reads as picked up. The nav
-            // document's own window paints the background colour across the
-            // bar, so that is what the empty slot has to be; the raised
-            // colour here left a grey patch
-            // over the black.
-            canvas.fill_rect(home, ui::background());
-
-            let ghost = Rect::new(ghost_x, home.y, home.w, home.h);
-            let active = current_id == Some(id);
-            canvas.shadow(ghost, ui::radius_control(), ui::sc(8), 110);
-            canvas.fill_round_rect(ghost, ui::radius_control(), if active { ui::accent() } else { ui::pressed() });
-            let style = Style { size: 11.0 * ui::scale(), ..Style::default() };
-            let label = self.tab_name(workspace);
-            canvas.clipped(ghost.inset(2), |canvas| {
-                canvas.draw_text(
-                    fonts,
-                    &label,
-                    ghost.x + ui::sc(12),
-                    ghost.y + (ghost.h - fonts.line_height(&style)) / 2,
-                    &style,
-                    ui::text(),
-                );
-            });
-            ui::draw_tab_close(canvas, ghost, active);
+            ui::draw_tab_ghost(
+                canvas,
+                fonts,
+                home,
+                Rect::new(ghost_x, home.y, home.w, home.h),
+                &self.tab_name(workspace),
+                current_id == Some(id),
+                true,
+            );
         }
 
         let _ = rect;

@@ -1747,6 +1747,51 @@ pub fn draw_tab_close(canvas: &mut Canvas, tab: Rect, active: bool) {
     canvas.stroke_line(cx - r, cy + r, cx + r, cy - r, thickness, ink);
 }
 
+/// Draw a tab being carried: blank where it rests, and the tab itself riding
+/// under the pointer.
+///
+/// **This is what a tab drag's feedback is**, and both strips need it for the
+/// same reason. Without it the only sign anything is happening is the row
+/// rearranging once the pointer crosses a neighbour's midpoint, which for the
+/// first half of any drag is no feedback at all: the mechanism works and the
+/// interaction reads as dead. The navigation bar had this and an application's
+/// strip did not, which is the whole of why one felt worse than the other.
+///
+/// It is here rather than in either caller because two of it would drift, and
+/// this is exactly the thing the tabs element was collapsed into one
+/// implementation to stop happening.
+pub fn draw_tab_ghost(
+    canvas: &mut Canvas,
+    fonts: &Fonts,
+    home: Rect,
+    ghost: Rect,
+    label: &str,
+    active: bool,
+    closable: bool,
+) {
+    // Blank the tab's resting place so it reads as picked up. The colour is
+    // the one the strip stands on rather than the raised one, which left a
+    // grey patch where the row's own background should be.
+    canvas.fill_rect(home, background());
+
+    canvas.shadow(ghost, radius_control(), sc(8), 110);
+    canvas.fill_round_rect(ghost, radius_control(), if active { accent() } else { pressed() });
+    let style = Style { size: 11.0 * scale(), ..Style::default() };
+    canvas.clipped(ghost.inset(2), |canvas| {
+        canvas.draw_text(
+            fonts,
+            label,
+            ghost.x + sc(12),
+            ghost.y + (ghost.h - fonts.line_height(&style)) / 2,
+            &style,
+            text(),
+        );
+    });
+    if closable {
+        draw_tab_close(canvas, ghost, active);
+    }
+}
+
 /// Room at a dropdown's right end for the chevron that says it opens.
 fn chevron_w() -> i32 { sc(22) }
 /// Whether a document's top-level content asks to fill whatever it is given.

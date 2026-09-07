@@ -350,11 +350,13 @@ selection and the scroll position inside the box are the compositor's and never
 appear in the application at all, so what it owns is the text, which is what a
 file is.
 
-The two applications duplicate their file handling: New, Open, Save, Save as,
-the dirty flag, the confirmations, the atomic write. It is about a hundred
-lines each and it will drift. The shape it wants is a piece of `awkit` holding
-the open-file list and the dialogs, parameterised by how a document is read and
-written, which is the one thing they genuinely differ about.
+The two share the *dialogs* and not the workflow, deliberately. `FileDialog`
+and `Confirm` are `awkit`'s, so what a person is asked and how it looks is one
+implementation. What each application keeps for itself is what happens around
+them: which tab is blank enough to reuse, what a new document starts as, when
+something counts as changed. That is policy an application should be able to
+disagree about, and it is about a hundred lines each. Shared dialogs, private
+decisions.
 
 **A window opens at the size its content asks for.** AWML has no width to
 declare, so both are derived on the first tree (`ui::document_width`,
@@ -884,7 +886,19 @@ repaints all agree. What it cannot share is what happens next: the bar's
 order is the compositor's and it rearranges itself, while an application's
 order is the application's, so a `movable` tab's drag sends `move` naming
 the slot and the application answers with a new tree, the way it answers
-every other event. An agent has `move` too: where a sheet sits in a workbook
+every other event.
+
+**The feedback is shared too, and for a while it was not, which is the only
+reason one felt worse than the other.** `ui::draw_tab_ghost` lifts the held tab
+out of the row and rides it under the pointer, blanking where it rests, and
+both strips call it. Without it the only sign anything was happening was the
+row rearranging once a neighbour's midpoint was crossed, which for the first
+half of any drag is nothing at all: the mechanism worked and the gesture read
+as dead. The bar had the ghost from the day it was written and an application's
+strip had only the mechanism. The movement threshold came across with it, so a
+press that does not travel is still a press and tells the application nothing.
+
+An agent has `move` too: where a sheet sits in a workbook
 is the document's business, unlike a window, which it may never arrange.
 A positional tab id does not survive this, which is why `awsheet` numbers
 its sheets: the tab a name refers to would change under the hand carrying
