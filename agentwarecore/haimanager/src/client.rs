@@ -168,10 +168,8 @@ pub struct Client {
     /// started from, and the cell the run currently reaches.
     cell_drag: Option<(String, sheet::Ref)>,
     cell_extent: Option<sheet::Ref>,
-    /// A tab being carried to another position: its key, and the slot it was
-    /// last told to take. The slot is remembered so that crossing the same
-    /// midpoint twice in one burst does not tell the application twice.
-    tab_drag: Option<(String, usize)>,
+    /// A tab being carried to another position.
+    tab_drag: Option<TabDrag>,
     /// Where the last right-press landed, while it still stands. An open menu
     /// hangs from here, which is what makes a context menu appear under the
     /// hand rather than wherever the application happened to put the menu.
@@ -200,6 +198,23 @@ pub struct Client {
 }
 
 /// What happened when a client was read from.
+/// A tab of an application's strip being carried to another position.
+///
+/// The same five things the navigation bar's drag keeps, because it is the same
+/// gesture: which tab, where it started, where inside it the hand took hold so
+/// the ghost rides under the pointer rather than snapping a corner to it, where
+/// the pointer is now, and whether it has travelled far enough to be a drag at
+/// all. The slot is remembered as well, so crossing the same midpoint twice in
+/// one burst does not tell the application twice.
+struct TabDrag {
+    key: String,
+    slot: usize,
+    from: i32,
+    grab: i32,
+    at: i32,
+    moved: bool,
+}
+
 pub struct Progress {
     pub gone: bool,
     pub dirty: bool,
@@ -898,6 +913,12 @@ impl Client {
             &self.layout,
             &self.focus_state(),
         );
+
+        // The one thing that is in no tree: a tab being carried. Drawn last so
+        // it rides over its neighbours, the same as the navigation bar's.
+        if let Some((home, ghost, label, active, closable)) = self.carried() {
+            ui::draw_tab_ghost(canvas, fonts, home, ghost, &label, active, closable);
+        }
     }
 
     /// A one-line description of the focused node as an agent would see it.
@@ -1101,24 +1122,62 @@ impl Client {
     /// order is the compositor's, so it reorders itself, and an application's
     /// is the application's, so it is told and answers with a new tree. One
     /// event per slot crossed, the way a run of cells sends one per cell.
+    ///
+    /// The pointer is followed whether or not a slot was crossed, because the
+    /// held tab is drawn under it. A repaint is asked for either way: a drag
+    /// where nothing moves until a midpoint is passed is the thing that made
+    /// this feel worse than the bar doing the same job.
     pub fn drag_tabs(&mut self, fonts: &Fonts, x: i32) -> bool {
-        let Some((key, last)) = self.tab_drag.clone() else { return false };
+        let Some(held) = &mut self.tab_drag else { return false };
+        held.at = x;
+        // A press that has not travelled is still a press. Below this the tab
+        // has not been picked up, so nothing is drawn lifted and the
+        // application is told nothing.
+        if !held.moved && (x - held.from).abs() < ui::sc(4) {
+            return false;
+        }
+        held.moved = true;
+        let (key, last) = (held.key.clone(), held.slot);
+
         let Some(doc) = &self.doc else { return false };
         let Some(index) = doc.index_of(&key) else { return false };
         let Some(strip) = doc.tree.node(index).parent else { return false };
         let tabs = doc.tree.tabs(strip);
-        let Some(held) = tabs.iter().position(|&tab| tab == index) else { return false };
+        let Some(at) = tabs.iter().position(|&tab| tab == index) else { return false };
         let rects: Vec<Rect> = tabs.iter().map(|&tab| self.layout.rect_of(tab)).collect();
-        let slot = ui::tab_slot(&rects, held, x);
+        let slot = ui::tab_slot(&rects, at, x);
         if slot == last {
-            return false;
+            // The ghost still moved, so the screen still changed.
+            return true;
         }
-        self.tab_drag = Some((key, slot));
-        self.act(fonts, index, "move", &slot.to_string()).is_ok()
+        if let Some(held) = &mut self.tab_drag {
+            held.slot = slot;
+        }
+        let _ = self.act(fonts, index, "move", &slot.to_string());
+        true
     }
 
     pub fn end_tab_drag(&mut self) {
         self.tab_drag = None;
+    }
+
+    /// Where the tab being carried rests and where it is being carried to, with
+    /// what to draw on it. `None` when nothing is held, or when the press has
+    /// not travelled far enough to be a drag.
+    fn carried(&self) -> Option<(Rect, Rect, String, bool, bool)> {
+        let held = self.tab_drag.as_ref().filter(|held| held.moved)?;
+        let doc = self.doc.as_ref()?;
+        let index = doc.index_of(&held.key)?;
+        let node = doc.tree.node(index);
+        let home = self.layout.rect_of(index);
+        let ghost = Rect::new(held.at - held.grab, home.y, home.w, home.h);
+        Some((
+            home,
+            ghost,
+            node.attr("label").unwrap_or_default().to_owned(),
+            node.flag("selected"),
+            node.flag("closable"),
+        ))
     }
 
     /// Extend the selection to wherever the pointer has got to.
@@ -1477,7 +1536,14 @@ impl Client {
             _ => display::ACTION_CLICK,
         };
         if let Some(slot) = carried {
-            self.tab_drag = Some((key, slot));
+            self.tab_drag = Some(TabDrag {
+                key,
+                slot,
+                from: x,
+                grab: x - rect.x,
+                at: x,
+                moved: false,
+            });
         }
         let _ = self.act(fonts, index, action, "");
         true
@@ -2934,8 +3000,15 @@ North	1240
         assert_eq!(event[2], "three", "the wrong tab was carried");
         assert_eq!(event[4], "0", "the slot is not where the pointer is");
 
-        // The same slot again says nothing: one event per slot crossed.
-        assert!(!client.drag_tabs(&fonts, one.x + 3), "the same slot was sent twice");
+        // The same slot again tells the application nothing: one event per slot
+        // crossed. It still answers true, because the tab being carried is
+        // drawn under the pointer and the pointer moved, so the screen did.
+        // The wire is what this is about, so the wire is what is checked.
+        assert!(client.drag_tabs(&fonts, one.x + 3), "the ghost did not follow the pointer");
+        assert!(
+            !said(&mut peer).iter().any(|fields| fields[3] == display::ACTION_MOVE),
+            "the same slot was sent twice"
+        );
 
         // A tab nobody marked movable is not one, and an agent asking is
         // told so rather than quietly reordering somebody's sheets.
