@@ -23,6 +23,7 @@ use crate::backend::{
     Assistant, Backend, BackendError, Block, Delta, ModelMessage, Role, Stop, ToolDef, Usage,
 };
 use crate::http::{self, SseReader};
+use crate::interrupt::{self, Watch};
 
 const HOST: &str = "api.anthropic.com";
 const PATH: &str = "/v1/messages";
@@ -99,7 +100,15 @@ impl Backend for Claude {
                         response.drain();
                         self.client.recycle(response);
                     }
+                    // An interrupted stream goes with its connection: the
+                    // API ends the generation when the socket closes, and
+                    // the next exchange makes a fresh one.
                     return result;
+                }
+                // The watch fired before the answer began. Not a fault in
+                // the connection, so not something to try again.
+                Err(err) if interrupt::is_interrupted(&err) => {
+                    return Err(BackendError::Interrupted);
                 }
                 Ok(mut response) => {
                     let status = response.status;
@@ -138,6 +147,10 @@ impl Backend for Claude {
             }
         }
         unreachable!("the attempt loop returns before running out");
+    }
+
+    fn watch(&mut self, watch: Option<Watch>) {
+        self.client.watch(watch);
     }
 }
 
@@ -278,6 +291,7 @@ fn consume_stream(reader: &mut dyn Read, on: &mut dyn FnMut(Delta)) -> Result<As
         let event = match events.next_event() {
             Ok(Some(event)) => event,
             Ok(None) => break,
+            Err(err) if interrupt::is_interrupted(&err) => return Err(BackendError::Interrupted),
             Err(err) => return Err(BackendError::new(format!("the stream broke: {err}"))),
         };
         let data: Value = serde_json::from_str(&event.data)
@@ -583,6 +597,6 @@ mod tests {
 
         let wire = "event: error\ndata: {\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n";
         let err = consume_stream(&mut wire.as_bytes(), &mut |_| {}).unwrap_err();
-        assert!(err.message.contains("busy"));
+        assert!(err.to_string().contains("busy"));
     }
 }

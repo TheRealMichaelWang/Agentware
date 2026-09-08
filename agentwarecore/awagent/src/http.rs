@@ -15,8 +15,11 @@
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::os::fd::AsFd;
 use std::sync::Arc;
 use std::time::Duration;
+
+use crate::interrupt::{self, Watch};
 
 /// How long to wait for the TCP connection. Slirp answers quickly or not at
 /// all, so a stuck connect means no network, and the turn should say so
@@ -34,32 +37,58 @@ const READ_TIMEOUT: Duration = Duration::from_secs(120);
 /// and must be encrypted; the local backend talks to a server on the same
 /// host, over a loopback the packets never leave, where TLS would buy nothing
 /// and cost a certificate nobody can issue for `10.0.2.2`.
-enum Wire {
+enum Transport {
     Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
     Plain(TcpStream),
 }
 
+/// The connection, and the one thing that may cut a read on it short.
+///
+/// A model's answer streams for seconds, and for all of them this is the
+/// only socket being read. With a [`Watch`] set, every read that would block
+/// waits on the watched descriptor as well, and the watch firing comes back
+/// as [`interrupt::interrupted`] instead of bytes: the workspace changed, and
+/// the rest of this answer is about a workspace that no longer exists.
+struct Wire {
+    transport: Transport,
+    watch: Option<Watch>,
+}
+
 impl Read for Wire {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
-            Wire::Tls(stream) => stream.read(buf),
-            Wire::Plain(stream) => stream.read(buf),
+        if let Some(watch) = self.watch {
+            match &mut self.transport {
+                // Plaintext rustls has already decrypted is handed over
+                // without touching the socket; only a read that would go to
+                // the socket waits on the watch too.
+                Transport::Tls(stream) => match stream.conn.reader().read(buf) {
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        watch.wait(stream.sock.as_fd(), READ_TIMEOUT)?;
+                    }
+                    other => return other,
+                },
+                Transport::Plain(stream) => watch.wait(stream.as_fd(), READ_TIMEOUT)?,
+            }
+        }
+        match &mut self.transport {
+            Transport::Tls(stream) => stream.read(buf),
+            Transport::Plain(stream) => stream.read(buf),
         }
     }
 }
 
 impl Write for Wire {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self {
-            Wire::Tls(stream) => stream.write(buf),
-            Wire::Plain(stream) => stream.write(buf),
+        match &mut self.transport {
+            Transport::Tls(stream) => stream.write(buf),
+            Transport::Plain(stream) => stream.write(buf),
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        match self {
-            Wire::Tls(stream) => stream.flush(),
-            Wire::Plain(stream) => stream.flush(),
+        match &mut self.transport {
+            Transport::Tls(stream) => stream.flush(),
+            Transport::Plain(stream) => stream.flush(),
         }
     }
 }
@@ -83,6 +112,9 @@ pub struct Client {
     tls: Option<Arc<rustls::ClientConfig>>,
     /// The live connection, when the last response left one usable.
     idle: Option<Stream>,
+    /// What may cut a response short. Set on every connection this client
+    /// reads from, kept or fresh.
+    watch: Option<Watch>,
 }
 
 impl Client {
@@ -103,12 +135,18 @@ impl Client {
             port: 443,
             tls: Some(Arc::new(config)),
             idle: None,
+            watch: None,
         })
     }
 
     /// A client that speaks plain HTTP to a host and port.
     pub fn http(host: &str, port: u16) -> Client {
-        Client { host: host.to_owned(), port, tls: None, idle: None }
+        Client { host: host.to_owned(), port, tls: None, idle: None, watch: None }
+    }
+
+    /// Set, or clear, the descriptor whose readability ends a response.
+    pub fn watch(&mut self, watch: Option<Watch>) {
+        self.watch = watch;
     }
 
     /// One HTTPS POST. Returns the status and a reader over the decoded body.
@@ -125,13 +163,19 @@ impl Client {
         // or inside the response head and looks like nothing else, so one
         // retry on a fresh connection is the whole of what recovery means
         // here. The request is not resent over a connection that answered:
-        // only over one that never spoke at all.
-        if let Some(Ok(response)) =
-            self.idle.take().map(|stream| send(stream, request.as_bytes(), body))
-        {
-            return Ok(response);
+        // only over one that never spoke at all. And not over one the watch
+        // cut short, which is not a fault in the connection.
+        if let Some(mut stream) = self.idle.take() {
+            stream.get_mut().watch = self.watch;
+            match send(stream, request.as_bytes(), body) {
+                Ok(response) => return Ok(response),
+                Err(err) if interrupt::is_interrupted(&err) => return Err(err),
+                Err(_) => {}
+            }
         }
-        send(BufReader::new(self.connect()?), request.as_bytes(), body)
+        let mut fresh = BufReader::new(self.connect()?);
+        fresh.get_mut().watch = self.watch;
+        send(fresh, request.as_bytes(), body)
     }
 
     /// Keep the connection under a finished response, if it can be kept.
@@ -157,13 +201,16 @@ impl Client {
         let _ = tcp.set_nodelay(true);
 
         let Some(config) = &self.tls else {
-            return Ok(Wire::Plain(tcp));
+            return Ok(Wire { transport: Transport::Plain(tcp), watch: None });
         };
         let name = rustls::pki_types::ServerName::try_from(self.host.clone())
             .map_err(|_| io::Error::other(format!("{} is not a valid server name", self.host)))?;
         let connection =
             rustls::ClientConnection::new(Arc::clone(config), name).map_err(io::Error::other)?;
-        Ok(Wire::Tls(Box::new(rustls::StreamOwned::new(connection, tcp))))
+        Ok(Wire {
+            transport: Transport::Tls(Box::new(rustls::StreamOwned::new(connection, tcp))),
+            watch: None,
+        })
     }
 
     /// The host and port, for an error message that says where it was trying

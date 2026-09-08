@@ -28,6 +28,11 @@ agentwarecore/          cargo workspace
   supervisor/           PID 1: init, service table, spawn broker
     src/bin/            awtest awstubborn awctl awui: self-test stand-ins
   haimanager/           the compositor: DRM, input, AWML, layout, paint, clients
+    src/ui/             layout.rs is where everything goes, paint.rs is what it
+                        looks like, mod.rs the theme and metrics both read
+    src/trail.rs        the agent's cursor and the queue of places it has yet
+                        to be seen. Draws; decides nothing
+    src/slider.rs       the slider element's arithmetic and painting
     src/startmenu.rs    the start menu panel: prompt and application grid
     assets/             the Agentware mark, compiled in
   agentdesk/            the workspace process: conversation, turns, taskbar clock
@@ -36,6 +41,10 @@ agentwarecore/          cargo workspace
                         loop and both channels, a Backend trait that is one
                         streamed model exchange, and backends/claude.rs
                         speaking the Anthropic API over rustls
+    src/consequences.rs waiting for what a run of actions did, and turning
+                        the notices into what the model reads
+    src/interrupt.rs    the watch that ends a model exchange when the
+                        workspace changes under it
 agentwareapps/          cargo workspace: first-party applications
   awcalc/               a calculator, the first real application
   awfiles/              a file explorer, and where the shared dialogs are seen
@@ -424,14 +433,14 @@ surface: `list_apps`, `read_app`, `act` (the fourteen-verb vocabulary as an
 enum), and `open_app` (up the turn channel, then polling `apps()` until the
 app appears). A rejection (`blocked`, `disabled`, `unsupported-action`) goes back as
 a tool result for the model to reason about, which is rejections-as-answers
-carried one level up. The agent wire also carries one unsolicited word,
-`changed <app>`, sent when an application's tree genuinely differed on a
-re-render; the harness answers it itself, re-reading each changed app after
-the tools run (a 150ms settle first, so the drain does not race the very
-re-render it exists to catch) and attaching the fresh views to the tool
-results, so the model sees the consequences of its actions without spending
-an exchange asking. The name crosses, never the diff: the remedy is a whole
-fresh view, for the same reason apps send whole trees. Thinking streams into the pane as `thought` telemetry
+carried one level up. The agent wire also carries two unsolicited words,
+`changed <app>` and `data-changed <app> <source> <element> <range>`, and the
+harness answers both itself after the tools run, attaching fresh views and
+changed cells to the tool results so the model sees the consequences of its
+actions without spending an exchange asking (see **Consequences** below for
+how it waits for them, and what happens when one arrives mid-answer). The
+name crosses, never the diff: the remedy is a whole fresh view, for the same
+reason apps send whole trees. Thinking streams into the pane as `thought` telemetry
 a line at a time, narration between tool calls as `result` lines, every act
 as an `action` line with its outcome, and the model's final message, the one
 with no tool calls, is the reply. While a turn runs the transcript ends with
@@ -535,10 +544,78 @@ order they happened however far behind the machine that leaves it. A human
 watching has to be able to trust that what they saw is what happened, so the
 queue never skips and never reorders.
 
-The harness pipelines to match (`Link::send_intent` and `Link::next_outcome`,
-the two halves of `act`): a run of consecutive `act` calls goes out together
-and the outcomes are collected after. Every answer is still the true one,
-because every one of them was decided on arrival.
+**A batch is performed in order, each action the moment the last was
+accepted, until one is refused.** `batched_acts` in `awagent/src/main.rs`
+sends an intent, takes its answer (microseconds: the haimanager answers when
+it has checked the intent and synthesized its events), and sends the next.
+The first refusal stops the batch and the rest are answered "not attempted,
+the batch stopped when ...", so the model knows the machine is exactly as far
+as the last accepted action.
+
+**Every event synthesized for an agent is vouched for**
+(`Event.vouched`, `Client::act_for_agent`, `Surface::is_stale`). This was a
+real bug and a bad one. Every application drops a stale click, correctly,
+because the version stamp is what guarantees a human's click landed on what
+they saw. But every event in an agent's batch is stamped with the version at
+the moment the batch was performed, and the application re-renders after the
+first, so every event after it arrived stale: **a six-click batch on the
+calculator landed one click** (`awcalc: discarded a click on digit-2 against
+v1, now on v2`) while the harness answered `done` for all six, and the model
+recovered by clicking one at a time, eleven exchanges for a four-exchange
+task. It had been that way since actions stopped waiting out the animation,
+because the 600ms each one used to wait was long enough for the tree to
+arrive in between. So the haimanager marks an agent's events, and `is_stale`
+is never true for a marked one: the intent was checked against the tree the
+haimanager held, the agent was told the outcome, and the application acts on
+what it was sent. A human's events carry no mark and their check stands.
+
+Measured on a real turn before the mark: six actions in **18ms**, of which
+five never happened. `acting` is 0.1% of a turn either way.
+
+**Nothing is drawn for a workspace nobody is watching.** `Trail::follow` is
+called with whatever is on screen, and switching agentdesks throws the flight
+and the whole queue away. An agent working where nobody is looking queues no
+stops at all, so it costs no frames and runs at the speed of the machine.
+Coming back begins a fresh queue rather than replaying the backlog: a person
+returning to a workspace wants to see what it is doing, not a recording of
+what they missed.
+
+**The cursor stays where it stopped.** It used to vanish the moment a turn
+ended. An agent that has finished working has not left the machine, and a
+pointer that disappears when it stops moving is one nobody can find again. It
+goes when the workspace changes, and when the last agent does.
+
+**Movement is paced; a press is not.** How fast the cursor travels is a
+preference (below); how a button behaves when pressed is what the control
+does, and an agent pressing one should look exactly like a person pressing
+one. `PRESS` is untouched at 240ms. The flash is also **deferred to arrival**:
+`Screen::begin` takes it off the client with `take_press` and hands it to the
+trail, which puts it back through `show_press` when the cursor lands. Firing
+it with the event lit buttons up before the cursor reached them, which is what
+made the whole thing look wrong.
+
+**How long a flight takes is a setting, and a function of the queue.**
+`awproto::pace::Pace` holds two ends and `Pace::of(waiting)` is
+`min + (max - min) * 0.55^waiting`: nothing queued is exactly the maximum, and
+each action waiting closes 55% of what is left towards the minimum, approached
+and never reached, so a cursor far behind is still drawing rather than
+skipping. `Trail::hurry` also shortens a flight already in the air when the
+queue grows behind it, or the first action of a burst would keep the unhurried
+pace it was given when it was alone. Both ends are on the Settings app's Agent
+page under **Computer Use** (`awsettings/src/computeruse.rs`), as two
+`slider`s; dragging is not saving, because every save is a synced write to the
+state volume.
+
+**`slider` is a new element** (`docs/UIElements.md`, `haimanager/src/slider.rs`).
+One number along a track, taking `focus` and `set-value`. `set-value` had been
+in the vocabulary and the agent's tool enum since the beginning with **no
+element accepting it and no handler anywhere**; this is its first real user. A
+human drag becomes a run of `set-value` events, one per value the thumb passes,
+on the same principle as one event per keystroke; an agent sends exactly one,
+naming the number, and never anything about where a thumb should sit. The
+arithmetic is one pair of inverse functions with a test asserting they are
+inverses, because a slider whose position and value disagree creeps as it is
+used.
 
 **The agent can find an application by what it is for.** It could not, and a
 benchmark found it the hard way: asked to put text files in a spreadsheet, the
@@ -568,23 +645,69 @@ possible rather than where it starts being refused. A name outside it is
 answered at once instead of after five seconds of polling for something that
 was never going to start.
 
+**Consequences: the agent waits for the answer, not for a clock.** An
+intent is answered `done` the moment the haimanager performs it, which is
+before the application has heard of it; the application's reply comes back
+as a tree or a run of cells, a socket hop and a render later, and only then
+can the haimanager say anything changed. The harness used to bridge that gap
+with a fixed 150ms sleep, which was wrong in both directions: 150ms of
+nothing on every exchange that clicked a calculator button, and a silent
+miss for any application slower than that, indistinguishable from "nothing
+changed". Now `awagent/src/consequences.rs` waits for every application the
+exchange acted on (told `done`, or opened) to have answered at least once,
+then for the socket to have been quiet for `QUIET` (50ms, ten times a frame,
+because a seventeen-character `type-text` is seventeen re-renders and the
+view must be read after the last one, not the first), all under a ceiling of
+`CONSEQUENCES` (800ms) that only an action changing nothing an agent can see
+ever reaches. A click on a calculator waits as long as the calculator takes.
+The log says what each wait found, `notices after 63ms: awsheet view,
+awsheet book/1 sheet B7`, so a run can be read for what the haimanager
+reported against what the model was then told.
+
+**Two kinds of change, two words.** `changed <app>` is the interface moving:
+decided on the agent's *view* (`Client::view_digest`), not on the screen
+diff, so anything an agent could read differently counts however small, and
+a re-render that altered only what it cannot see (a colour, a spreadsheet's
+`version` claiming a publish) says nothing. `data-changed <app> <source>
+<element> <range>` is a sheet moving: cells arrived on their own frames, and
+the rectangle they landed in is named, with the element that shows the
+source, so the agent reads that much (`read_cells`, attached automatically
+when it is `CELLS_ATTACHED` = 400 cells or fewer, a screenful, the number
+that took cells out of the tree in the first place) and never the sheet.
+The cell arithmetic moved to `awproto::cells` for this, because both ends now
+name rectangles.
+
+**A change mid-answer interrupts the model.** While a model streams, the
+harness reads nothing else, and that was a choice rather than a law: closing
+the socket aborts the generation at the server. `awagent/src/interrupt.rs`
+is a `Watch` on the haimanager link's descriptor; `http::Wire` polls it
+beside the model's socket on every read that would block, and its firing
+comes back through every `io::Result` as `interrupt::Interrupted` (kind
+`Other`, deliberately: `ErrorKind::Interrupted` is EINTR and every read loop
+retries it), which the backends turn into `BackendError::Interrupted`, never
+retried. The harness attaches what changed to the end of the message the
+model was answering and asks again; the prefix cache holds. `INTERRUPTIONS`
+(3) per exchange is the guard against an application that moves
+continuously, after which the exchange runs to its end and the change waits
+for it. Rustls buffered plaintext is served without touching the socket, so
+the poll happens only on a read that would genuinely block.
+
 **A turn stops when it stops getting anywhere.** There is still no exchange
 ceiling, deliberately, but sixty-four exchanges of alternating `open_app
 awspreadsheet` and `open_app awcalc` is not a long-running turn, it is a
 stopped one. The harness hashes what each exchange left behind (every tool
-result and the fresh views that rode back) and keeps the set of states this
-turn has reached: an exchange reaching a state never seen before is progress
-and resets the count, and `STUCK` exchanges in a row reaching only states
-already visited ends the turn with an honest reply. `NUDGE` in a row says so
-in the tool result first, because a model going in circles has usually not
-noticed.
+result and the fresh views that rode back) and keeps the set of states the
+turn has reached: an exchange reaching a new one is progress and resets the
+count, `NUDGE` in a row reaching only old ones says so in the tool result, and
+`STUCK` in a row ends the turn with an honest reply. Both numbers are guesses
+until the task suite tunes them.
 
-Getting the *unit* right took two wrong tries, and both are worth remembering
-because both looked correct. Counting a call by its name and arguments calls a
-directory walk a loop, since `up` is clicked from every folder. Counting
-whether that call changed anything calls it a loop too, since `up` from
-anywhere under `/apps` lands back at `/apps`, an identical state reached
-honestly. Both ask of one call a question only the whole turn can answer.
+Getting the *unit* right took two wrong tries and both looked correct.
+Counting a call by its name and arguments calls a directory walk a loop, since
+`up` is clicked from every folder. Counting whether that call changed anything
+calls it a loop too, since `up` from anywhere under `/apps` lands back at
+`/apps`, an identical state reached honestly. Both ask of one call a question
+only the whole turn can answer.
 
 **The guest has a network, for the agent alone.** QEMU adds a slirp NIC
 (`-netdev user`), the kernel configures it itself from the `ip=` boot
@@ -718,6 +841,88 @@ view when its first tree arrives, so the reduced schema can be read against the
 document that produced it, and prints a line per tree after that saying what the
 diff found, which is how "the application resent something identical" is told
 apart from "the screen is stale".
+
+## Measuring the agent
+
+Three tools, and they answer different questions. Everything below runs
+against a **local model on the host**, which the guest reaches at `10.0.2.2`
+over the slirp NIC with no port forwarding, because slirp maps the gateway to
+the host's loopback.
+
+### Serving a model
+
+```
+llama-server -m ~/llm/models/Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf \
+  -ngl 99 -c 131072 -fa on --jinja --spec-type draft-mtp \
+  --host 127.0.0.1 --port 8080
+```
+
+**No `-md`.** That model's MTP draft head is inside the same file, so naming
+it as the draft model loads a second complete 25.3 GiB copy and OOMs the
+machine. The dense 27B is the other way round, with a separate 2.95 GiB draft
+file, and does want `-md ~/llm/models/mtp-Qwen3.8-27B-Q8_0.gguf -ngld 99`.
+See the gotcha about GTT below: on this APU it is pinned system RAM, so a
+model "on the GPU" is competing with the desktop and QEMU's guest.
+
+### `tools/modelbench.py`: how fast is the model
+
+Host side, no guest, seconds per run. Measures prefill and generation the way
+an agentic loop actually uses them: a growing conversation prefilled again and
+a short tool call generated, with the same tool schemas the harness sends.
+
+```
+tools/modelbench.py                    # every group
+tools/modelbench.py --only exchange --only repeat --greedy
+```
+
+`--greedy` is what makes two configurations comparable: at temperature 0.7 the
+model answers one prompt with 50 tokens and the next with 300, and a
+tokens-per-second figure read off two different answers compares two different
+pieces of work.
+
+### `tools/tasksuite.py`: is it doing the right thing
+
+The only thing that can tell a fast model from a good one. Each task is a
+prompt and an assertion, run several times for a pass rate rather than a
+boolean, unattended.
+
+```
+tools/tasksuite.py                                  # every task, 3 runs each
+tools/tasksuite.py --only traverse --runs 5 --keep
+tools/tasksuite.py --backend claude-opus-5 --json out.json
+```
+
+Assertions are made from outside the guest against two things the machine
+leaves behind. **Files**, read back out of a per-run copy of `state.img` with
+`debugfs`, the same no-sudo trick `make configure_anthropic_key` uses, so a
+spreadsheet the agent saved is checked against what it actually saved rather
+than against its account of it. And **the serial log**, which carries the
+telemetry, the reply, and the `turn:` accounting line; that line is the
+end-of-turn marker a headless run needs, and it is why this needed no guest
+changes beyond logging the reply.
+
+`--backend` names the configuration explicitly, through **`agentware.backend=`**
+on the kernel command line (read by the haimanager, validated against
+`turn::BACKENDS`, passed with its boot `create-desk`). The backend used to be
+implied by whether an API key was set, which stops being an answer the moment
+a key exists for testing the hosted model.
+
+`--keep` leaves each run's state image and serial log behind, which is how a
+failing task gets diagnosed.
+
+### What has been measured
+
+In `docs/OnDevice.md`, with `docs/OnDevicePlan.md` for what is left. The
+headlines: the 35B-A3B MoE is 2.8x the generation and 3.1x the prefill of the
+dense 27B and holds 128k of context for 2.5 GiB more than 32k; prefill rather
+than generation is the dominant cost of an exchange; and the largest free win
+was one paragraph of the system prompt telling the model it *should* batch
+tool calls rather than that it *may*.
+
+**Not yet measured, and the blocking item:** pass rates. The suite exists and
+runs, but no full table has been produced for any configuration, so nothing
+here separates "faster" from "better". Claude is the control group every other
+number needs and it wants a key in `state.img`.
 
 ## Working conventions
 
@@ -1260,6 +1465,35 @@ them is part of the application catalogue and none reaches an agent.
   roughly nine thousand lines, and every render sends all of them. Windowing
   the transcript is the known fix and is deliberately not built; see the note
   about what is left being linear and small.
+* **An answer of `done` from the haimanager is not an action performed by
+  the application.** The haimanager checks an intent and synthesizes the
+  events; whether the application acts on them is the application's, and
+  for a whole session every application was dropping the second and later
+  events of every batch as stale while the agent was told they were done.
+  Nothing in the agent's log could show it; the application's own log
+  (`discarded a click on ...`) did, and only because `awcalc` writes one.
+  When a batch "works" in the harness log, read the application's log too.
+* **A fixed sleep standing in for a missing signal is wrong in both
+  directions, and the short direction is silent.** The harness slept 150ms
+  after acting so the haimanager's `changed` notice could arrive before the
+  drain. Every fast application paid 150ms of nothing; any application
+  slower than that was missed, and a miss looked exactly like "nothing
+  changed", so the model reasoned about a stale view with no way to know.
+  The signal existed (the notice itself); what was missing was waiting *for*
+  it, per application acted on, with a bound for the no-change case that
+  genuinely has no signal. Same shape as the task suite's power cut: a
+  false negative that reads like a true one.
+* **A test harness that reads the disk must not power-cut the machine
+  first.** `tools/tasksuite.py` killed QEMU two seconds after the turn ended,
+  so saves that had reached the guest's filesystem never reached the image. It
+  scored every file-writing task a failure while every reply-checking one
+  passed, and the agent was doing everything right: the screen even read
+  "saved /home/quarter.csv". The suite's first result was a false negative
+  about the thing it exists to check. It now sends `sendkey ctrl-alt-delete`,
+  which PID 1 answers with its orderly teardown, and `-no-reboot` turns the
+  reboot at the end of that into an exit. ACPI powerdown was the obvious first
+  try and this guest does not handle it: nothing in the userland listens for a
+  power button.
 * **A cost that grows with use cannot be photographed.** Every capture starts
   from a fresh boot with an empty conversation, so the quadratic line
   breaking and the paint that walked scrolled-away nodes were invisible to

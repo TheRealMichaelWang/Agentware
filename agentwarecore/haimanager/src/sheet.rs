@@ -21,12 +21,10 @@
 
 use std::collections::HashMap;
 
-/// A cell's coordinates: column then row, both counted from zero.
-///
-/// Kept as numbers rather than as the `B7` an application writes, because
-/// painting a screenful means walking a rectangle of them and arithmetic is
-/// what a rectangle is made of.
-pub type Ref = (u32, u32);
+/// The notation is the protocol crate's, because the agent hears which
+/// rectangle of a sheet changed in the same `A1:C5` the application publishes
+/// in, and one copy of the arithmetic is what keeps the two ends agreeing.
+pub use awproto::cells::{Ref, column_name, name, parse, parse_range};
 
 /// One application's sheet.
 #[derive(Default)]
@@ -146,90 +144,9 @@ impl Sheet {
     }
 }
 
-/// Turn `B7` into the coordinates it names, or `None` when it is not a
-/// reference at all.
-///
-/// The lettering is the spreadsheet's own, base 26 with no zero: A to Z, then
-/// AA. It is the compositor's rather than the application's because a
-/// spreadsheet's columns are named this way everywhere and an application that
-/// had to say so would only ever say the same thing.
-pub fn parse(at: &str) -> Option<Ref> {
-    let letters = at.len() - at.trim_start_matches(|c: char| c.is_ascii_uppercase()).len();
-    if letters == 0 || letters > 4 {
-        return None;
-    }
-    let (name, number) = at.split_at(letters);
-
-    let mut column: u32 = 0;
-    for letter in name.bytes() {
-        column = column.checked_mul(26)?.checked_add((letter - b'A' + 1) as u32)?;
-    }
-    let row: u32 = number.parse().ok()?;
-    if row == 0 {
-        return None;
-    }
-    Some((column - 1, row - 1))
-}
-
-/// The name a column has, counting from zero: 0 is A, 25 is Z, 26 is AA.
-pub fn column_name(mut column: u32) -> String {
-    let mut name = Vec::new();
-    loop {
-        name.push(b'A' + (column % 26) as u8);
-        if column < 26 {
-            break;
-        }
-        column = column / 26 - 1;
-    }
-    name.reverse();
-    String::from_utf8(name).unwrap_or_default()
-}
-
-/// The name a cell has: `B7`.
-pub fn name(at: Ref) -> String {
-    format!("{}{}", column_name(at.0), at.1 + 1)
-}
-
-/// The two corners of `A1:C5`, or of a single `B7`.
-pub fn parse_range(text: &str) -> Option<(Ref, Ref)> {
-    match text.split_once(':') {
-        Some((from, to)) => {
-            let (from, to) = (parse(from)?, parse(to)?);
-            Some((
-                (from.0.min(to.0), from.1.min(to.1)),
-                (from.0.max(to.0), from.1.max(to.1)),
-            ))
-        }
-        None => {
-            let one = parse(text)?;
-            Some((one, one))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The lettering is base 26 with no zero, which is the one part of this
-    /// that is easy to write wrong: 26 is AA, not BA, because there is no
-    /// column zero to carry into.
-    #[test]
-    fn columns_are_lettered_the_way_a_spreadsheet_letters_them() {
-        for (column, expected) in
-            [(0, "A"), (25, "Z"), (26, "AA"), (27, "AB"), (51, "AZ"), (52, "BA")]
-        {
-            assert_eq!(column_name(column), expected, "column {column}");
-            assert_eq!(parse(&format!("{expected}1")), Some((column, 0)), "{expected}1");
-        }
-        assert_eq!(parse("B7"), Some((1, 6)));
-        assert_eq!(name((1, 6)), "B7");
-        // Not references.
-        assert_eq!(parse("7"), None);
-        assert_eq!(parse("B"), None);
-        assert_eq!(parse("B0"), None);
-        assert_eq!(parse("b7"), None);
-    }
 
     /// A snapshot carrying nothing is how an application says a sheet is
     /// empty, and it has to be sayable: a workbook switching to a blank sheet

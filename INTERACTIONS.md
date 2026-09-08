@@ -49,6 +49,8 @@ This makes apps immediate-mode and trivially correct: describe the present state
 
 A click, a text submission, a key combination. Each event names the node it happened to and the **version of the tree it was generated against**. Without that version there is a race: the app sends tree v1, the human clicks, the app has already sent v2 in which that node means something else, and the event arrives describing an intention the human never had. The version lets the app discard a stale event instead of acting on it.
 
+An agent's events are the exception, and they say so: the haimanager marks them **vouched**, and `Surface::is_stale` is never true for one. The haimanager checked the agent's intent against the tree it held before synthesizing anything, and an agent's batch of actions is performed in order without waiting for the application to answer each, so every event after the first arrives carrying a version the application has moved past. Dropping those would be dropping actions the haimanager approved and the agent was told were done; it did, silently, until the mark existed, and a six-click batch on the calculator landed one click. The human's protection is untouched: their events carry no mark and the check stands.
+
 **The haimanager owns ephemeral UI state.**
 
 Focus, cursor position within a text field, scroll offset, selection. These are *not* in the tree the app sends. If they were, a full-tree resend would reset the human's cursor on every keystroke, and every app would reimplement their preservation slightly differently.
@@ -66,9 +68,15 @@ An agent has exactly two channels, and neither one is the Supervisor.
 
 Both answers are **scoped to the agent's own agentdesk**. An agent cannot see or address an app in another workspace, and this is not enforced by checking a workspace id the agent supplies. The haimanager knows which workspace a connection belongs to because the Supervisor told it so when it handed the descriptor over. The agent is never asked and cannot lie.
 
-**haimanager → agent: one unsolicited word, `changed <app>`.**
+**haimanager → agent: two unsolicited words, `changed <app>` and `data-changed <app> <source> <element> <range>`.**
 
-When an application in the agent's workspace re-renders and its tree actually differs, the haimanager tells the agent so, by name and nothing more. Deliberately not the difference itself: the remedy is a fresh read of the whole present state, exactly as a human notices movement and then looks, and a pushed diff would reintroduce the failure the whole-tree protocol exists to avoid, where one missed patch leaves two ends silently disagreeing. The agent's harness answers these notices itself, re-reading each changed application between actions and handing the model the fresh view alongside its tool results, so the model sees the consequences of what it did without spending an exchange asking. Desk trees never produce a notice, because chrome is invisible to agents down to its updates.
+An application changes in two ways, and they are two words because an agent answers them at very different cost.
+
+`changed` is the **interface** moving. When an application in the agent's workspace re-renders and what an agent would see of it actually differs, the haimanager says so, by name and nothing more. Deliberately not the difference itself: the remedy is a fresh read of the whole present state, exactly as a human notices movement and then looks, and a pushed diff would reintroduce the failure the whole-tree protocol exists to avoid, where one missed patch leaves two ends silently disagreeing. The test is made on the agent's reduced view rather than on the pixels, so any alteration an agent could read, however small, is a change, and a re-render that altered only what it cannot see (a colour, or a spreadsheet's `version` ticking over to claim a publish) is not.
+
+`data-changed` is a **sheet** moving. Cells arrive on their own frames and never in the tree, and a sheet is the one thing too large to re-read whole, so the notice names the rectangle the cells landed in (`A1:C5`, or nothing for a sheet replaced whole) and the `spreadsheet` element showing that source, which is what `query cells` reads through. The agent reads that much and no more.
+
+The agent's harness answers both itself. After a run of actions it waits for every application it acted on to have answered, and then for the answering to stop, bounded by a ceiling it reaches only when an action changed nothing an agent can see; it then hands the model the fresh views and the changed cells alongside the tool results, so the model sees the consequences of what it did without spending an exchange asking. A notice arriving while the model is mid-answer **interrupts the exchange**: the stream is abandoned, the change is attached to the message the model was answering, and the exchange is started again, since the rest of that answer was about a workspace that no longer exists. Desk trees never produce a notice, because chrome is invisible to agents down to its updates.
 
 **Agent → haimanager: intents, not events.**
 

@@ -28,7 +28,9 @@
 
 mod backend;
 mod backends;
+mod consequences;
 mod http;
+mod interrupt;
 
 use std::collections::HashSet;
 use std::io::Write as _;
@@ -38,7 +40,20 @@ use awproto::agent::{Link, Outcome};
 use awproto::turn::{self, Turn};
 use serde_json::{Value, json};
 
-use backend::{Assistant, Backend, Block, Delta, ModelMessage, Role, Stop, ToolDef, Usage};
+use backend::{
+    Assistant, Backend, BackendError, Block, Delta, ModelMessage, Role, Stop, ToolDef, Usage,
+};
+use interrupt::Watch;
+
+/// How many times one exchange may be started again because the workspace
+/// changed under it, before the change waits for the exchange instead.
+///
+/// An interruption is the right answer to an application that moved once
+/// while the model was answering. It is the wrong answer to one that moves
+/// continuously, a progress bar say, which would otherwise keep the model
+/// from ever finishing a sentence. After this many, the exchange runs to its
+/// end and whatever arrived is attached to its results in the ordinary way.
+const INTERRUPTIONS: u32 = 3;
 
 /// How many exchanges in a row may reach a state this turn has already been
 /// in before the harness says so in the tool result, and before it gives up
@@ -137,13 +152,19 @@ open_app takes only the names that exist, and a guess is a wasted exchange.
 - Issue every action you already know you need in ONE message, as several tool calls. Do \
 not send one action and wait for it. A sequence of buttons, the fields of a form, a set of \
 cells: none of these depend on each other's results, so they are one message. They are \
-performed in the order you give them and you are told the outcome of each. Split only when \
+performed in the order you give them, each the moment the last was accepted, and you are \
+told the outcome of each. The first one refused stops the batch: the rest are answered as \
+not attempted, so the machine is exactly as far as the last accepted action. Split only when \
 you genuinely cannot know the next step until you have seen this one's result. Every extra \
 message is a wait the human sits through.
 - When an application's interface changes, after your actions or on its own, its fresh \
-view is attached to your tool results automatically, marked as re-read for you. You \
-therefore rarely need read_app to confirm a result; use it to look at an app you have \
-not just seen.
+view is attached to your tool results automatically, marked as re-read for you. A \
+spreadsheet's cells changing is reported separately, naming the cells and, for a small \
+rectangle, what they now hold. You therefore rarely need read_app or read_cells to confirm \
+a result; use them to look at what you have not just been shown.
+- If the workspace changes while you are composing an answer, that answer is discarded \
+and you are asked again with the change attached. Nothing from the discarded answer was \
+performed.
 - Plain text you write between tool calls is shown to the human as progress narration; \
 keep it to a line.
 - Your final message, with no tool call, ends the turn and joins the conversation as \
@@ -198,15 +219,20 @@ impl Agent {
 /// a turn spends its wall clock on was arithmetic or an impression. The parts
 /// are chosen to be disjoint and to add up to the whole, which is the only
 /// property that makes the numbers worth anything: `model` is the network and
-/// the model together, `acting` is the compositor performing an intent (the
-/// cursor's flight, the press, the typing), `reading` is answering a query
-/// out of the compositor's memory, `waiting` is this process's own deliberate
-/// sleeps, and whatever the four do not account for is the harness itself and
-/// had better stay small.
+/// the model together, `acting` is the haimanager performing an intent,
+/// `reading` is answering a query out of the haimanager's memory, `waiting`
+/// is this process waiting for something other than the model (an
+/// application answering an action, an application starting), and whatever
+/// the four do not account for is the harness itself and had better stay
+/// small.
 struct Meter {
     started: Instant,
     exchanges: u32,
     actions: u32,
+    /// Exchanges abandoned because the workspace changed under them. Their
+    /// time is in `model`, since that is where it went; this says how much
+    /// of `model` was said twice.
+    interrupts: u32,
     input: u64,
     output: u64,
     cache_read: u64,
@@ -223,6 +249,7 @@ impl Meter {
             started: Instant::now(),
             exchanges: 0,
             actions: 0,
+            interrupts: 0,
             input: 0,
             output: 0,
             cache_read: 0,
@@ -271,7 +298,8 @@ impl Meter {
         let harness = total.saturating_sub(accounted);
         format!(
             "turn: {}ms = model {}ms + acting {}ms + reading {}ms + waiting {}ms + harness {}ms; \
-             {} exchange(s), {} action(s); in {} (cache read {}, write {}) out {}",
+             {} exchange(s), {} action(s); in {} (cache read {}, write {}) out {}; \
+             interrupted {} time(s)",
             total.as_millis(),
             self.model.as_millis(),
             self.acting.as_millis(),
@@ -284,6 +312,7 @@ impl Meter {
             self.cache_read,
             self.cache_write,
             self.output,
+            self.interrupts,
         )
     }
 }
@@ -371,16 +400,47 @@ fn main() {
     // same question over and over is not spending time, it is stuck, and the
     // two are worth telling apart: sixty-four exchanges of alternating
     // `open_app awspreadsheet` and `open_app awcalc` is not work anybody
-    // chose to pay for. `asked` counts what has been requested, by call and
-    // arguments together, so a repeat means the identical question and not
-    // merely the same verb.
+    // chose to pay for. `states` holds every state the workspace has been
+    // left in, so a repeat means the same place reached again and not merely
+    // the same verb.
+    //
+    // While the model answers, a notice from the haimanager ends the exchange:
+    // the model is reasoning about a workspace that has just changed, and the
+    // rest of that reasoning is about a workspace that no longer exists.
+    let watch = Watch::new(agent.link.fd());
     loop {
-        let assistant = match exchange(&mut agent, model.as_mut(), &messages, &tools) {
-            Ok(assistant) => assistant,
-            Err(err) => {
-                agent.say(turn::KIND_ERROR, &err.message);
-                agent.finish(&format!("The turn failed: {}.", err.message));
-                return;
+        let mut interruptions: u32 = 0;
+        let assistant = loop {
+            model.watch((interruptions < INTERRUPTIONS).then_some(watch));
+            match exchange(&mut agent, model.as_mut(), &messages, &tools) {
+                Ok(assistant) => break assistant,
+                Err(BackendError::Interrupted) => {
+                    interruptions += 1;
+                    agent.meter.interrupts += 1;
+                    let notices = match agent.link.take_notices() {
+                        Ok(notices) => notices,
+                        Err(err) => connection_lost(&err),
+                    };
+                    // What changed goes onto the end of the message the
+                    // model was answering, so the answer it gives instead
+                    // is to the same question with more known about it.
+                    // Nothing before the end of that message moves, and the
+                    // prefix cache holds.
+                    if let (Some(text), Some(last)) =
+                        (consequences::describe(&mut agent, &notices), messages.last_mut())
+                    {
+                        agent.say(
+                            turn::KIND_ACTION,
+                            "the workspace changed while the model was answering; asking again",
+                        );
+                        last.content.push(Block::Text(text));
+                    }
+                }
+                Err(err) => {
+                    agent.say(turn::KIND_ERROR, &err.to_string());
+                    agent.finish(&format!("The turn failed: {err}."));
+                    return;
+                }
             }
         };
 
@@ -401,32 +461,44 @@ fn main() {
             agent.say(turn::KIND_RESULT, line.trim());
         }
 
-        let mut acted = false;
+        // The applications this exchange acted on and was told `done`: the
+        // ones whose answer is worth waiting for before asking the model
+        // anything else.
+        let mut expected: HashSet<String> = HashSet::new();
         let mut results = Vec::new();
         // A run of consecutive actions is sent as a run, and their outcomes
         // collected afterwards. See `pipelined_acts` for why that is worth
         // doing and why it changes none of the answers.
         let mut pending = calls.iter().cloned().peekable();
         while let Some((id, name, input)) = pending.next() {
-            acted |= matches!(name.as_str(), "act" | "open_app");
             if name == "act" {
                 let mut run = vec![(id, input)];
                 while pending.peek().is_some_and(|(_, next, _)| next == "act") {
                     let (id, _, input) = pending.next().expect("peeked");
                     run.push((id, input));
                 }
-                results.extend(pipelined_acts(&mut agent, run));
+                results.extend(batched_acts(&mut agent, run, &mut expected));
                 continue;
             }
             let (content, is_error) = run_tool(&mut agent, &name, &input);
+            // An application that opened answers with its first tree, which
+            // is worth the wait for the same reason a click's answer is.
+            if name == "open_app"
+                && !is_error
+                && let Some(app) = field(&input, "name")
+            {
+                expected.insert(app);
+            }
             results.push(Block::ToolResult { id, content, is_error });
         }
 
-        // The automatic re-read. The compositor says which applications'
-        // trees genuinely changed while the tools ran; their present views
-        // ride back with the results, so the model sees the consequences of
-        // its actions without spending an exchange asking.
-        if let Some(refreshed) = refreshed_views(&mut agent, acted) {
+        // The automatic re-read. The haimanager says which applications
+        // changed while the tools ran, and how; the present state of each
+        // rides back with the results, so the model sees the consequences
+        // of its actions without spending an exchange asking. The wait is
+        // for those consequences to have arrived, and no longer.
+        let notices = consequences::await_notices(&mut agent, &expected);
+        if let Some(refreshed) = consequences::describe(&mut agent, &notices) {
             results.push(Block::Text(refreshed));
         }
 
@@ -479,62 +551,6 @@ fn main() {
         messages.push(ModelMessage { role: Role::Assistant, content: assistant.content });
         messages.push(ModelMessage { role: Role::User, content: results });
     }
-}
-
-/// How long an application gets to re-render after an action before the
-/// changed set is drained. An app answers an event in milliseconds; this is
-/// generous for that and nothing against a model exchange.
-const SETTLE: Duration = Duration::from_millis(150);
-
-/// The present views of whatever changed while the tools ran, or `None` when
-/// nothing did.
-///
-/// This is the pull model kept honest rather than replaced: the compositor
-/// never pushes a tree, only the name of an app whose tree moved, and the
-/// harness answers with the same `read_app` the model would have had to
-/// spend a whole model exchange asking for. The model receives state, never
-/// a diff, so there is nothing to misapply.
-fn refreshed_views(agent: &mut Agent, acted: bool) -> Option<String> {
-    if acted {
-        // An action's consequences appear one app round trip later, which is
-        // moments after the intent resolved; without the pause the drain
-        // would race the very re-render it exists to catch.
-        std::thread::sleep(SETTLE);
-        agent.meter.waiting += SETTLE;
-    }
-    let changed = match agent.link.take_changed() {
-        Ok(changed) => changed,
-        Err(err) => {
-            log(&format!("could not drain change notices: {err}"));
-            return None;
-        }
-    };
-    if changed.is_empty() {
-        return None;
-    }
-
-    let mut text = String::from(
-        "The workspace changed while you worked. The present state, re-read for you:\n",
-    );
-    for app in changed {
-        agent.say(turn::KIND_ACTION, &format!("re-reading {app} (it changed)"));
-        let asked = Instant::now();
-        let answer = agent.link.view(&app);
-        agent.meter.reading += asked.elapsed();
-        match answer {
-            Ok(markup) if !markup.is_empty() => {
-                text.push('\n');
-                text.push_str(&markup);
-                text.push('\n');
-            }
-            Ok(_) => {}
-            Err(err) => {
-                log(&format!("could not re-read {app}: {err}"));
-                return Some(text);
-            }
-        }
-    }
-    Some(text)
 }
 
 /// One model exchange, with the deltas streamed into the pane as they come:
@@ -872,40 +888,41 @@ fn search_apps(installed: &[turn::InstalledApp], query: &str, open: &str) -> Str
     out
 }
 
-/// Perform a run of actions as a run, rather than one at a time.
+/// Perform a batch of actions: in order, each the moment the last was
+/// answered, until every one is done or one is refused.
 ///
-/// Every outcome here is the outcome the same actions would have had sent
-/// singly: the compositor validates each intent when it reaches the front of
-/// its queue, after everything before it has actually been performed, and a
-/// rejection is still a rejection. Nothing is assumed and nothing is
-/// answered early.
+/// A batch is the model saying "these, in this order", and it is performed
+/// exactly so. Nothing waits between them: the haimanager answers an intent
+/// when it has checked it and synthesized its events, which is microseconds,
+/// and the application receives the events vouched for so it acts on every
+/// one whatever version it has moved on to. The first refusal ends the batch,
+/// because what the model asked for after that was asked for on the
+/// assumption the refused step had happened; those are answered as not
+/// attempted, naming the step that stopped them, so the model knows exactly
+/// where the machine is.
 ///
-/// What this buys is not the round trips, which are microseconds down a Unix
-/// socket. It is that the compositor can *see* the run. An agent that waited
-/// for each outcome before sending the next left the queue empty by
-/// construction, so the compositor never had any way to know whether the
-/// action it was performing was one gesture or the first of six, and had to
-/// assume the worst and pace every one of them for a human watching a single
-/// deliberate act.
-fn pipelined_acts(agent: &mut Agent, run: Vec<(String, Value)>) -> Vec<Block> {
-    /// A call the model got wrong is answered here and never reaches the
-    /// wire, so exactly one outcome is taken for each intent that was sent.
-    enum Pending {
-        Answered(String),
-        Sent(String),
-    }
-
+/// Every application told `done` is added to `expected`: its answer to the
+/// action is on its way, and the exchange waits for it.
+fn batched_acts(
+    agent: &mut Agent,
+    run: Vec<(String, Value)>,
+    expected: &mut HashSet<String>,
+) -> Vec<Block> {
     let started = Instant::now();
-    let mut pending = Vec::new();
+    let mut results = Vec::new();
+    // What stopped the batch, once something has.
+    let mut stopped: Option<String> = None;
     for (id, input) in &run {
         let (Some(app), Some(action), Some(target)) = (
             field(input, "app"),
             field(input, "action"),
             field(input, "target"),
         ) else {
-            pending.push((id.clone(), Pending::Answered(
-                "act needs an app, an action and a target".to_owned(),
-            )));
+            results.push(Block::ToolResult {
+                id: id.clone(),
+                content: "act needs an app, an action and a target".to_owned(),
+                is_error: true,
+            });
             continue;
         };
         // The one genuinely optional field: most actions carry no payload,
@@ -916,41 +933,37 @@ fn pipelined_acts(agent: &mut Agent, run: Vec<(String, Value)>) -> Vec<Block> {
         } else {
             format!("{action} {value:?} into {target} in {app}")
         };
-        if let Err(err) = agent.link.send_intent(&app, &action, &target, &value) {
-            connection_lost(&err);
+        if let Some(why) = &stopped {
+            agent.say(turn::KIND_ACTION, &format!("{told}: not attempted"));
+            results.push(Block::ToolResult {
+                id: id.clone(),
+                content: format!("not attempted: the batch stopped when {why}"),
+                is_error: false,
+            });
+            continue;
         }
-        pending.push((id.clone(), Pending::Sent(told)));
-    }
-
-    let mut results = Vec::new();
-    for (id, item) in pending {
-        match item {
-            Pending::Answered(why) => {
-                results.push(Block::ToolResult { id, content: why, is_error: true })
+        let outcome = match agent.link.act(&app, &action, &target, &value) {
+            Ok(outcome) => outcome,
+            Err(err) => connection_lost(&err),
+        };
+        agent.meter.actions += 1;
+        let content = match outcome {
+            Outcome::Done => {
+                agent.say(turn::KIND_ACTION, &format!("{told}: done"));
+                expected.insert(app);
+                "done".to_owned()
             }
-            Pending::Sent(told) => {
-                let outcome = match agent.link.next_outcome() {
-                    Ok(outcome) => outcome,
-                    Err(err) => connection_lost(&err),
-                };
-                agent.meter.actions += 1;
-                let content = match outcome {
-                    Outcome::Done => {
-                        agent.say(turn::KIND_ACTION, &format!("{told}: done"));
-                        "done".to_owned()
-                    }
-                    Outcome::Rejected(reason) => {
-                        agent.say(turn::KIND_ACTION, &format!("{told}: {reason}"));
-                        // A rejection is an answer the model reasons about,
-                        // not an error: `blocked` says to look for the dialog
-                        // and `disabled` says the application must change
-                        // first. is_error stays false.
-                        format!("rejected: {reason}")
-                    }
-                };
-                results.push(Block::ToolResult { id, content, is_error: false });
+            Outcome::Rejected(reason) => {
+                agent.say(turn::KIND_ACTION, &format!("{told}: {reason}"));
+                stopped = Some(format!("{told} was rejected ({reason})"));
+                // A rejection is an answer the model reasons about, not an
+                // error: `blocked` says to look for the dialog and `disabled`
+                // says the application must change first. is_error stays
+                // false.
+                format!("rejected: {reason}. The rest of this batch was not attempted.")
             }
-        }
+        };
+        results.push(Block::ToolResult { id: id.clone(), content, is_error: false });
     }
 
     let spent = started.elapsed();

@@ -35,6 +35,7 @@
 
 pub mod agent;
 pub mod broker;
+pub mod cells;
 pub mod display;
 pub mod pace;
 pub mod settings;

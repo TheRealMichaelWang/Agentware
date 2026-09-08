@@ -26,6 +26,7 @@ use crate::backend::{
     Assistant, Backend, BackendError, Block, Delta, ModelMessage, Role, Stop, ToolDef, Usage,
 };
 use crate::http::{self, SseReader};
+use crate::interrupt::{self, Watch};
 
 const PATH: &str = "/v1/chat/completions";
 
@@ -75,7 +76,12 @@ impl Backend for OpenAi {
                         response.drain();
                         self.client.recycle(response);
                     }
+                    // An interrupted stream goes with its connection, which
+                    // is what tells the model server to stop generating.
                     return result;
+                }
+                Err(err) if interrupt::is_interrupted(&err) => {
+                    return Err(BackendError::Interrupted);
                 }
                 Ok(mut response) => {
                     let status = response.status;
@@ -104,6 +110,10 @@ impl Backend for OpenAi {
             delay *= 2;
         }
         unreachable!("the attempt loop returns before running out");
+    }
+
+    fn watch(&mut self, watch: Option<Watch>) {
+        self.client.watch(watch);
     }
 }
 
@@ -277,6 +287,7 @@ fn consume_stream(
         let event = match events.next_event() {
             Ok(Some(event)) => event,
             Ok(None) => break,
+            Err(err) if interrupt::is_interrupted(&err) => return Err(BackendError::Interrupted),
             Err(err) => return Err(BackendError::new(format!("the stream broke: {err}"))),
         };
         // The sentinel that ends an OpenAI stream is not JSON.
@@ -513,6 +524,6 @@ mod tests {
     fn an_error_mid_stream_is_an_error() {
         let wire = "data: {\"error\":{\"message\":\"context shift is disabled\"}}\n\n";
         let err = consume_stream(&mut wire.as_bytes(), &mut |_| {}).unwrap_err();
-        assert!(err.message.contains("context shift"));
+        assert!(err.to_string().contains("context shift"));
     }
 }

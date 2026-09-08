@@ -411,9 +411,14 @@ fn run(
 
                     // A tree that genuinely changed is worth a word to the
                     // agent working in that workspace, so it re-reads instead
-                    // of acting on a view of how things used to be.
+                    // of acting on a view of how things used to be. Cells
+                    // that arrived are a different word, naming how much to
+                    // read back.
                     if progress.updated {
                         screen.notify_agent_of_change(fd);
+                    }
+                    if !progress.data.is_empty() {
+                        screen.notify_agent_of_data(fd, &progress.data);
                     }
 
                     // A first tree is worth printing whole: the reduced schema

@@ -45,6 +45,7 @@ use std::os::unix::net::UnixStream;
 
 use awproto::Decoder;
 use awproto::agent;
+use awproto::cells;
 use awproto::display::{self, MAX_TREE};
 
 use crate::awml::{self, Tag};
@@ -202,6 +203,10 @@ pub struct Client {
     /// is indistinguishable from one that never happened, which matters most
     /// when the thing acting is not the human.
     press: Option<(String, Instant)>,
+    /// True while an agent's action is being performed, so the events it
+    /// produces carry the haimanager's word that they were checked. See
+    /// [`Client::act_for_agent`].
+    vouching: bool,
 }
 
 /// What happened when a client was read from.
@@ -222,13 +227,35 @@ struct TabDrag {
     moved: bool,
 }
 
+/// A sheet that took cells while a client was being read: what the
+/// workspace's agent is told about, and what it can then read back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataChange {
+    /// The stream the cells arrived on.
+    pub source: String,
+    /// The `spreadsheet` element showing that source, if one does. An agent
+    /// reads cells through an element, so without one there is nothing for
+    /// it to ask for yet.
+    pub element: Option<String>,
+    /// The rectangle written, or `None` for a sheet replaced whole.
+    pub range: Option<cells::Range>,
+}
+
 pub struct Progress {
     pub gone: bool,
     pub dirty: bool,
-    /// A tree was installed and actually differed from the held one. What the
-    /// workspace's agent is told about, as distinct from `dirty`, which a
-    /// rejected document also sets for the sake of the status strip.
+    /// A tree was installed and **what an agent sees of it** differs from
+    /// before. What the workspace's agent is told about, and deliberately not
+    /// the same question as `dirty`: a re-render that moved pixels an agent
+    /// cannot see, a colour, or a spreadsheet's version number ticking over
+    /// under a publish, changes nothing an agent could act on differently.
+    /// Judged on the reduced view so that the answer is exactly "would a
+    /// fresh read differ", which is the only reason to ask for one.
     pub updated: bool,
+    /// Sheets that took cells, one entry per source, with the rectangles
+    /// added up. The other kind of change, told apart from `updated` because
+    /// an agent answers it by reading a rectangle rather than a view.
+    pub data: Vec<DataChange>,
     /// A first tree was installed where there was none. The moment a window can
     /// be sized to its content, since before this there was nothing to measure.
     pub first: bool,
@@ -282,6 +309,7 @@ impl Client {
             slider_drag: None,
             scroll_across: false,
             press: None,
+            vouching: false,
         })
     }
 
@@ -313,16 +341,47 @@ impl Client {
             .map(|doc| awml::agent_view(&doc.tree, &self.sheets, &self.name, self.desk))
     }
 
+    /// A number standing for what an agent would see of this client, so two
+    /// trees can be asked whether they differ **to an agent**.
+    ///
+    /// Rendered against no sheets at all, on purpose: `used` is the one
+    /// attribute in the view that comes from the cells rather than the tree,
+    /// and cells moving is the other kind of change, reported on its own.
+    /// With it left out, this answers only "did the interface move".
+    fn view_digest(&self) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let doc = self.doc.as_ref()?;
+        let view = awml::agent_view(&doc.tree, &Sheets::default(), &self.name, self.desk);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        view.hash(&mut hasher);
+        Some(hasher.finish())
+    }
+
+    /// The `spreadsheet` element showing a source, if one does.
+    fn element_showing(&self, source: &str) -> Option<String> {
+        let doc = self.doc.as_ref()?;
+        (0..doc.tree.nodes.len())
+            .map(|index| doc.tree.node(index))
+            .find(|node| node.tag == Tag::Spreadsheet && node.attr("source") == Some(source))
+            .and_then(|node| node.id().map(str::to_owned))
+    }
+
     /// Drain whatever arrived and apply it.
     pub fn readable(&mut self, fonts: &Fonts) -> Progress {
         let mut progress = Progress {
             gone: false,
             dirty: false,
             updated: false,
+            data: Vec::new(),
             first: false,
             log: Vec::new(),
             requests: Vec::new(),
         };
+        // Sheets that took cells in this read, and where. Added up per source
+        // here and named against the tree at the end, because an application
+        // publishes a new sheet's cells *before* the tree that shows them, so
+        // asking which element shows a source mid-way would find nothing.
+        let mut touched: Vec<(String, Option<cells::Range>)> = Vec::new();
         let mut buf = [0u8; 8192];
 
         loop {
@@ -350,14 +409,21 @@ impl Client {
                         // installed, so the markup is copied out first.
                         let source = source.to_owned();
                         let had_doc = self.doc.is_some();
-                        let was_version = self.version();
+                        // Only an application's trees are ever reported to an
+                        // agent, so only an application's view is worth
+                        // rendering twice to compare. A desk's tree is the
+                        // transcript, and its clock ticks once a second.
+                        let seen = (self.kind == Kind::App).then(|| self.view_digest());
                         let (dirty, line) = self.apply(fonts, &source, version, &mut progress.log);
                         progress.dirty |= dirty;
-                        // A tree counts as updated when it was installed and
-                        // repainted: the version moved and the screen did too.
-                        // An identical resend moves the version silently, and
-                        // a rejected document moves neither.
-                        progress.updated |= dirty && self.version() != was_version;
+                        // A tree counts as updated when what an agent would
+                        // read of it differs from what it would have read a
+                        // moment ago. Not when the screen moved: a spreadsheet
+                        // re-rendering to claim a new version after a publish
+                        // repaints and says nothing an agent can see.
+                        if let Some(seen) = seen {
+                            progress.updated |= self.view_digest() != seen;
+                        }
                         // Checked against the document rather than taken from
                         // `apply`, so a first tree that failed to parse does not
                         // count as having arrived.
@@ -381,6 +447,26 @@ impl Client {
                         let source = source.to_owned();
                         if self.sheets.apply(&source, base, version, at, values) {
                             progress.dirty = true;
+                            // What was written: the run's rectangle, or the
+                            // whole sheet for a snapshot, since a snapshot
+                            // forgets everything before it and a reader has
+                            // to be told that the cells it is not naming may
+                            // have gone too. A run of nothing on a version
+                            // wrote nothing and is not a change.
+                            let run = match (base, values.len() as u32) {
+                                (0, _) => None,
+                                (_, 0) => continue,
+                                (_, width) => Some((at, (at.0 + width - 1, at.1))),
+                            };
+                            match touched.iter_mut().find(|(name, _)| *name == source) {
+                                Some((_, sum)) => {
+                                    *sum = match (*sum, run) {
+                                        (Some(sum), Some(run)) => Some(cells::union(sum, run)),
+                                        _ => None,
+                                    };
+                                }
+                                None => touched.push((source.clone(), run)),
+                            }
                         } else {
                             let have = self.sheets.version(&source).to_string();
                             progress.log.push(format!(
@@ -409,6 +495,17 @@ impl Client {
                 }
             }
         }
+
+        // Now that the tree claiming the cells has had its chance to arrive,
+        // name the element each touched source is shown by.
+        progress.data = touched
+            .into_iter()
+            .map(|(source, range)| DataChange {
+                element: self.element_showing(&source),
+                source,
+                range,
+            })
+            .collect();
 
         progress
     }
@@ -1651,6 +1748,29 @@ impl Client {
         self.act_cell(fonts, index, action, value, "")
     }
 
+    /// An agent's action: the same `act_cell`, with every event it produces
+    /// vouched for.
+    ///
+    /// This is the one difference between the two paths, and it is a mark on
+    /// the event rather than a second implementation: the checks above ran
+    /// against the tree held here, the agent was told the outcome, and the
+    /// application is told it may act whatever version it has moved on to
+    /// since. A human's events carry no such mark, because for a human the
+    /// version check is the guarantee that a click lands on what they saw.
+    pub fn act_for_agent(
+        &mut self,
+        fonts: &Fonts,
+        index: usize,
+        action: &str,
+        value: &str,
+        cell: &str,
+    ) -> Result<(), &'static str> {
+        self.vouching = true;
+        let result = self.act_cell(fonts, index, action, value, cell);
+        self.vouching = false;
+        result
+    }
+
     /// The same, naming a cell of a spreadsheet. Everything an agent does to
     /// a grid comes through here, because a cell is not a node and cannot be
     /// the thing an intent names.
@@ -2459,6 +2579,7 @@ impl Client {
             action: action.to_owned(),
             value: value.to_owned(),
             cell: cell.to_owned(),
+            vouched: self.vouching,
         };
         self.pending.extend_from_slice(&event.encode());
         self.flush();
@@ -2608,6 +2729,31 @@ mod tests {
         out
     }
 
+    /// An agent's action produces the same event a human's does, with one
+    /// mark on it: the haimanager's word that it was checked, so the
+    /// application acts on it whatever version it has moved on to. A human's
+    /// carries no mark, and the version check is theirs.
+    #[test]
+    fn an_agents_event_is_vouched_for_and_a_humans_is_not() {
+        let source = r#"<window pad="none">
+             <button id="go" label="Go" description="Does the thing"/>
+           </window>"#;
+        let (fonts, mut client, mut peer) = framed(source, Rect::new(0, 0, 400, 300));
+        let go = client.node_by_id("go").unwrap();
+
+        client.act_for_agent(&fonts, go, display::ACTION_CLICK, "", "").unwrap();
+        client.act(&fonts, go, display::ACTION_CLICK, "").unwrap();
+
+        let said = said(&mut peer);
+        let clicks: Vec<&Vec<String>> =
+            said.iter().filter(|fields| fields[3] == display::ACTION_CLICK).collect();
+        assert_eq!(clicks.len(), 2, "{said:?}");
+        assert_eq!(clicks[0].get(6).map(String::as_str), Some("vouched"));
+        assert_eq!(clicks[1].get(6).map(String::as_str), Some(""));
+        // Nothing lingers: the mark was for that action only.
+        assert!(!client.vouching);
+    }
+
     /// The other button says where it landed and on what, and nothing else.
     /// What it means is the application's to decide.
     #[test]
@@ -2647,6 +2793,71 @@ mod tests {
         client.sheets.apply("book", 2, 3, (0, 499), &["far down".into()]);
         client.apply(fonts, &markup, client.version() + 1, &mut Vec::new());
         client.set_frame(fonts, Frame::Whole(Rect::new(0, 0, 400, 300)));
+    }
+
+    /// Frames as an application sends them, written into the peer end so
+    /// `readable` reads them the way it reads a live client.
+    fn arrives(peer: &mut UnixStream, fields: &[&str]) {
+        peer.write_all(&awproto::encode(fields)).unwrap();
+    }
+
+    /// The two kinds of change an agent is told about, told apart. A tree
+    /// whose only difference is a spreadsheet's version is a publish being
+    /// claimed, and an agent reading the view again would learn nothing; the
+    /// cells that arrived are the change, and the agent hears which.
+    #[test]
+    fn an_agent_is_told_about_the_view_and_the_data_separately() {
+        let (fonts, mut client, mut peer) =
+            framed(r#"<window pad="none"><text>x</text></window>"#, Rect::new(0, 0, 400, 300));
+        let markup = |version: u64, label: &str| {
+            format!(
+                r#"<window pad="none"><vstack><text>{label}</text>
+                     <spreadsheet id="sheet" grow="true" source="book" version="{version}"
+                       rows="1000" columns="26" cursor="A1" description="The grid"/>
+                   </vstack></window>"#
+            )
+        };
+
+        // A first publish and the tree that claims it: the interface moved
+        // (there is a grid where there was none) and the sheet was replaced
+        // whole, through an element the tree now names.
+        arrives(&mut peer, &[display::MSG_SHEET, "book", "1", "0", "A1", "Region", "Q1"]);
+        arrives(&mut peer, &[display::MSG_RENDER, "2", &markup(1, "Budget")]);
+        let progress = client.readable(&fonts);
+        assert!(progress.updated, "a grid appearing is a change to the view");
+        assert_eq!(
+            progress.data,
+            vec![DataChange { source: "book".into(), element: Some("sheet".into()), range: None }]
+        );
+
+        // Cells into a row, then a re-render that only claims the version.
+        // The view is the same view; the data is the rectangle written.
+        arrives(&mut peer, &[display::MSG_SHEET, "book", "2", "1", "B7", "4711"]);
+        arrives(&mut peer, &[display::MSG_SHEET, "book", "3", "2", "C7", "12", "13"]);
+        arrives(&mut peer, &[display::MSG_RENDER, "3", &markup(3, "Budget")]);
+        let progress = client.readable(&fonts);
+        assert!(progress.dirty, "the screen repainted");
+        assert!(!progress.updated, "a version ticking over is not a change an agent can see");
+        assert_eq!(
+            progress.data,
+            vec![DataChange {
+                source: "book".into(),
+                element: Some("sheet".into()),
+                range: Some(((1, 6), (3, 6))),
+            }]
+        );
+
+        // Words changing is the view changing, and no cells came.
+        arrives(&mut peer, &[display::MSG_RENDER, "4", &markup(3, "Budget *")]);
+        let progress = client.readable(&fonts);
+        assert!(progress.updated);
+        assert!(progress.data.is_empty());
+
+        // An identical resend is nothing at all.
+        arrives(&mut peer, &[display::MSG_RENDER, "5", &markup(3, "Budget *")]);
+        let progress = client.readable(&fonts);
+        assert!(!progress.updated);
+        assert!(progress.data.is_empty());
     }
 
     /// A run of cells arrives as a run, applies to the version it names, and

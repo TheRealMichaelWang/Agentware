@@ -45,6 +45,7 @@ name = "awagent"
 version = "0.1.0"
 dependencies = [
  "awproto",
+ "rustix",
  "rustls",
  "serde_json",
  "webpki-roots",

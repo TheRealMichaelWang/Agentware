@@ -150,23 +150,32 @@ impl Assistant {
     }
 }
 
-/// What went wrong, in words meant for the pane: the human reads this, so
-/// "no API key is set: enter one in Settings, on the Agent page" beats an
-/// errno.
+/// Why an exchange did not complete.
 #[derive(Debug)]
-pub struct BackendError {
-    pub message: String,
+pub enum BackendError {
+    /// The watch fired: the workspace changed while the model was answering,
+    /// and the answer was abandoned mid-stream. Not a failure. The harness
+    /// starts the exchange again with the change attached, and nothing here
+    /// is retried, backed off or reported to the human as an error.
+    Interrupted,
+    /// What went wrong, in words meant for the pane: the human reads this, so
+    /// "no API key is set: enter one in Settings, on the Agent page" beats an
+    /// errno.
+    Failed(String),
 }
 
 impl BackendError {
     pub fn new(message: impl Into<String>) -> BackendError {
-        BackendError { message: message.into() }
+        BackendError::Failed(message.into())
     }
 }
 
 impl fmt::Display for BackendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.message)
+        match self {
+            BackendError::Interrupted => f.write_str("the workspace changed mid-answer"),
+            BackendError::Failed(message) => f.write_str(message),
+        }
     }
 }
 
@@ -181,4 +190,8 @@ pub trait Backend {
         tools: &[ToolDef],
         on: &mut dyn FnMut(Delta),
     ) -> Result<Assistant, BackendError>;
+
+    /// Set, or clear, the descriptor whose readability ends an exchange
+    /// early with [`BackendError::Interrupted`].
+    fn watch(&mut self, watch: Option<crate::interrupt::Watch>);
 }

@@ -51,7 +51,7 @@ pub fn from_config(id: &str, settings: &Settings) -> Result<Box<dyn Backend>, St
                 config.model.to_owned(),
                 settings.anthropic_workspace.clone(),
             )
-            .map_err(|err| err.message)?;
+            .map_err(|err| err.to_string())?;
             Ok(Box::new(claude))
         }
         "openai" => Ok(Box::new(openai::OpenAi::new(

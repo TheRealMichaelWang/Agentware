@@ -280,6 +280,8 @@ An agent gets the shape in the view and the values by asking:
 
 `used` is the compositor's, the bounding box of everything published, so an agent knows where to look without reading a screenful to find out. `query cells <app> <id> <range>` answers with one line per row, values separated by tabs. The whole view of a sheet application is **14 lines and 1082 bytes**, against 423 lines and 46,650 before.
 
+`version` is not in the view, and that is what lets the two kinds of change be told apart. A publish is cells on their own frames followed by a tree that claims the new version; the tree differs from the last one by that number and nothing else, so the agent's view is identical and no `changed` is sent for it. What is sent is `data-changed`, naming the element, the source and the rectangle the cells landed in, which is exactly what an agent needs to read back the part that moved. An interface change and a data change are answered by reading different things, a view and a rectangle, and so they are different words on the wire.
+
 ### Menus and overlays
 
 | Element | Attributes | State | Actions |

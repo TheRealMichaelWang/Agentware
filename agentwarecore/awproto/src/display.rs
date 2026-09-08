@@ -162,7 +162,22 @@ pub struct Event {
     /// would mean inventing a separator that no application's id may contain,
     /// which is a rule nobody would remember.
     pub cell: String,
+    /// The haimanager vouches for this one: it was synthesized for an agent's
+    /// intent, which the haimanager had already checked against the tree it
+    /// held. An application should act on it whatever version it is on.
+    ///
+    /// The version check protects a human, whose click may land on a tree
+    /// the application has since replaced. An agent's batch of actions was
+    /// checked once, when it was submitted, and the actions are then
+    /// performed in order without waiting for the application to answer
+    /// each; every event after the first therefore arrives "stale", and an
+    /// application that dropped them would be dropping actions the
+    /// haimanager had approved and the agent had been told were done.
+    pub vouched: bool,
 }
+
+/// The trailing field of an event the haimanager vouches for.
+const VOUCHED: &str = "vouched";
 
 impl Event {
     pub fn encode(&self) -> Vec<u8> {
@@ -173,6 +188,7 @@ impl Event {
             &self.action,
             &self.value,
             &self.cell,
+            if self.vouched { VOUCHED } else { "" },
         ])
     }
 
@@ -186,6 +202,7 @@ impl Event {
             action: fields.get(3)?.clone(),
             value: fields.get(4).cloned().unwrap_or_default(),
             cell: fields.get(5).cloned().unwrap_or_default(),
+            vouched: fields.get(6).map(String::as_str) == Some(VOUCHED),
         })
     }
 }
@@ -258,8 +275,13 @@ impl Surface {
 
     /// True if an event was generated against a tree this client has since
     /// replaced, and should therefore be thrown away rather than acted on.
+    ///
+    /// Never for an event the haimanager vouches for: those are an agent's,
+    /// checked when they were submitted and performed in order after that,
+    /// and the version they carry is the one the batch was checked against
+    /// rather than a claim about what the application is on now.
     pub fn is_stale(&self, event: &Event) -> bool {
-        event.version != self.version
+        !event.vouched && event.version != self.version
     }
 
     /// Keep what the compositor said that was not an event.
@@ -510,5 +532,55 @@ impl SheetOut {
         self.restart = false;
         self.version += 1;
         surface.sheet(&self.source, self.version, 0, "A1", &[])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(version: u64, vouched: bool) -> Event {
+        Event {
+            version,
+            target: "send".into(),
+            action: ACTION_CLICK.into(),
+            value: String::new(),
+            cell: String::new(),
+            vouched,
+        }
+    }
+
+    fn decode(bytes: &[u8]) -> Event {
+        let mut decoder = Decoder::default();
+        decoder.feed(bytes);
+        Event::from_fields(&decoder.next_frame().unwrap().unwrap()).unwrap()
+    }
+
+    /// The mark survives the wire, and its absence does too: an older
+    /// haimanager sending six fields is a human's event.
+    #[test]
+    fn a_vouched_event_round_trips() {
+        assert!(decode(&event(3, true).encode()).vouched);
+        assert!(!decode(&event(3, false).encode()).vouched);
+        let six = encode(&[MSG_EVENT, "3", "send", ACTION_CLICK, "", ""]);
+        assert!(!decode(&six).vouched);
+    }
+
+    /// The version check stands for a human and never applies to an event
+    /// the haimanager vouches for.
+    #[test]
+    fn staleness_is_waived_for_a_vouched_event() {
+        let (ours, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut surface = Surface {
+            stream: ours,
+            decoder: Decoder::with_limit(MAX_TREE),
+            version: 0,
+            resend: Vec::new(),
+            nonblocking: false,
+        };
+        surface.version = 5;
+        assert!(surface.is_stale(&event(4, false)));
+        assert!(!surface.is_stale(&event(5, false)));
+        assert!(!surface.is_stale(&event(4, true)));
     }
 }

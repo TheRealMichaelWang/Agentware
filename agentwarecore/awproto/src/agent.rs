@@ -16,18 +16,35 @@
 //!   clipboard <kind> <content>
 //!   done      <app> <target> <action>
 //!   rejected  <app> <target> <reason>
-//!   changed  <app>                           haimanager -> agent, unsolicited
+//!   changed      <app>                        haimanager -> agent, unsolicited
+//!   data-changed <app> <source> <element> <range>
 //! ```
 //!
-//! `changed` is the one unsolicited message: an application in the agent's
-//! workspace re-rendered and its tree actually differed, so a view the agent
-//! read before that moment no longer describes the screen. It carries the
-//! name and nothing else, deliberately. The remedy is a fresh read, exactly
-//! as a human notices movement and then looks; sending the difference itself
-//! would reintroduce the failure the whole-tree protocol exists to avoid,
-//! where one missed patch leaves two ends disagreeing with no resync path.
-//! The [`Link`] collects these while waiting on replies, and hands them over
-//! through [`Link::take_changed`] between actions.
+//! The last two are the unsolicited messages, and they are two because an
+//! application changes in two ways that cost an agent very different things
+//! to look at.
+//!
+//! `changed` says the application's **interface** moved: its tree re-rendered
+//! and what an agent would see of it actually differs, so a view read before
+//! that moment no longer describes the screen. It carries the name and
+//! nothing else, deliberately. The remedy is a fresh read, exactly as a human
+//! notices movement and then looks; sending the difference itself would
+//! reintroduce the failure the whole-tree protocol exists to avoid, where one
+//! missed patch leaves two ends disagreeing with no resync path. The judgement
+//! is made on the agent's view rather than on the pixels, so a re-render that
+//! changed nothing an agent can see, a colour or a spreadsheet's version
+//! number, says nothing.
+//!
+//! `data-changed` says a **sheet** the application publishes moved: cells
+//! arrived on their own frames, and the rectangle they landed in is named so
+//! an agent can read exactly that much rather than the sheet. The element
+//! showing the source is named too, when one does, because `query cells` reads
+//! through an element; an empty range means the sheet was replaced whole.
+//! A sheet is the one thing in the system too large to re-read on every
+//! change, which is why its changes are a different word.
+//!
+//! The [`Link`] collects both while waiting on replies, can wait for them
+//! ([`Link::wait_notice`]), and hands them over through [`Link::take_notices`].
 //!
 //! ## Intents, not events
 //!
@@ -94,8 +111,9 @@
 //! handed the descriptor over. The agent is never asked and cannot lie.
 
 use std::io::{self, Read, Write};
-use std::os::fd::{FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::time::Duration;
 
 use crate::display::MAX_TREE;
 use crate::{Decoder, HAI_FD_ENV, encode};
@@ -115,9 +133,14 @@ pub const MSG_CLIPBOARD: &str = "clipboard";
 pub const MSG_CELLS: &str = "cells";
 pub const MSG_DONE: &str = "done";
 pub const MSG_REJECTED: &str = "rejected";
-/// An application's tree changed since it was last read. Unsolicited, and
-/// carrying only the name: the answer to it is a fresh `query view`.
+/// An application's interface changed since it was last read. Unsolicited,
+/// and carrying only the name: the answer to it is a fresh `query view`.
 pub const MSG_CHANGED: &str = "changed";
+/// A sheet an application publishes changed. Unsolicited, carrying the
+/// application, the sheet's source, the element showing it (or nothing) and
+/// the rectangle written (or nothing, for a sheet replaced whole): the answer
+/// to it is a `query cells` for that much.
+pub const MSG_DATA_CHANGED: &str = "data-changed";
 
 /// No application of that name is open in this workspace.
 pub const REASON_NO_SUCH_APP: &str = "no-such-app";
@@ -164,13 +187,43 @@ pub enum Outcome {
     Rejected(String),
 }
 
-/// An agent's end of its connection to the compositor.
+/// One unsolicited word from the haimanager: something in the agent's
+/// workspace is no longer as the agent last saw it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Notice {
+    /// The application's interface changed. Read its view again.
+    View { app: String },
+    /// A sheet the application publishes changed. Read that much of it.
+    Data {
+        app: String,
+        /// The stream the cells arrived on, as the element's `source` names it.
+        source: String,
+        /// The `spreadsheet` element showing that source, which is what
+        /// `query cells` reads through. `None` when no element does, which
+        /// is a sheet on a tab that is not the one in front.
+        element: Option<String>,
+        /// The rectangle written, as `A1:C5`. `None` when the sheet was
+        /// replaced whole and everything in it may differ.
+        range: Option<String>,
+    },
+}
+
+impl Notice {
+    /// The application the notice is about.
+    pub fn app(&self) -> &str {
+        match self {
+            Notice::View { app } | Notice::Data { app, .. } => app,
+        }
+    }
+}
+
+/// An agent's end of its connection to the haimanager.
 pub struct Link {
     stream: UnixStream,
     decoder: Decoder,
-    /// Applications the compositor said changed, in arrival order, collected
-    /// while waiting on replies and drained by [`Link::take_changed`].
-    changed: Vec<String>,
+    /// What the haimanager said changed, in arrival order, collected while
+    /// waiting on replies and drained by [`Link::take_notices`].
+    notices: Vec<Notice>,
 }
 
 impl Link {
@@ -184,67 +237,151 @@ impl Link {
         // SAFETY: the supervisor created this descriptor before forking us and
         // named it in our environment. Nothing else in this process owns it.
         let stream = unsafe { UnixStream::from_raw_fd(raw) };
-        Ok(Link { stream, decoder: Decoder::with_limit(MAX_TREE), changed: Vec::new() })
+        Ok(Link { stream, decoder: Decoder::with_limit(MAX_TREE), notices: Vec::new() })
     }
 
-    /// The applications whose trees changed since the last drain, oldest
-    /// first, each named once.
+    /// The descriptor under the link, for a caller that wants to be woken
+    /// when the haimanager says something while it is busy elsewhere.
     ///
-    /// Notices arrive whenever the compositor sends them: some while a reply
+    /// Nothing but a notice can arrive while no request is in flight, so
+    /// readability here means exactly "a notice is waiting".
+    pub fn fd(&self) -> RawFd {
+        self.stream.as_raw_fd()
+    }
+
+    /// Everything the haimanager said changed since the last drain, oldest
+    /// first, each said once.
+    ///
+    /// Notices arrive whenever the haimanager sends them: some while a reply
     /// was being awaited, already collected, and some sitting unread in the
     /// socket because nothing was being awaited at all. Both are gathered
     /// here, which is why this reads the socket without blocking first.
-    pub fn take_changed(&mut self) -> io::Result<Vec<String>> {
+    pub fn take_notices(&mut self) -> io::Result<Vec<Notice>> {
         self.stream.set_nonblocking(true)?;
-        let mut result = Ok(());
+        let result = self.pull();
+        self.stream.set_nonblocking(false)?;
+        // Drained before the error is raised, so a hangup still hands over
+        // whatever arrived ahead of it.
+        let taken = self.drain();
+        result?;
+        Ok(taken)
+    }
+
+    /// The notices collected so far, without draining them.
+    pub fn pending(&self) -> &[Notice] {
+        &self.notices
+    }
+
+    /// Wait up to `timeout` for the haimanager to say anything at all, and
+    /// say whether it did.
+    ///
+    /// "Anything" is bytes, not whole frames: a read that came back with the
+    /// first half of a notice is the haimanager talking, and a caller
+    /// measuring silence must not count it as quiet. What arrives is
+    /// collected, not returned: [`Link::pending`] shows it and
+    /// [`Link::take_notices`] hands it over. Waiting is separate from taking
+    /// because a caller deciding how long to wait wants to look at what has
+    /// come so far and keep waiting, and a drain in the middle of that would
+    /// lose the order.
+    pub fn wait_notice(&mut self, timeout: Duration) -> io::Result<bool> {
+        // A zero timeout would mean "forever" to the socket, and this caller
+        // means "not at all".
+        if timeout.is_zero() {
+            return Ok(false);
+        }
+        self.stream.set_read_timeout(Some(timeout))?;
+        let mut buf = [0u8; 8192];
+        let result = match self.stream.read(&mut buf) {
+            Ok(0) => Err(io::Error::other("the haimanager closed the connection")),
+            Ok(n) => {
+                self.decoder.feed(&buf[..n]);
+                Ok(true)
+            }
+            Err(err)
+                if matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) =>
+            {
+                Ok(false)
+            }
+            Err(err) => Err(err),
+        };
+        self.stream.set_read_timeout(None)?;
+        let arrived = result?;
+        self.collect_frames()?;
+        Ok(arrived)
+    }
+
+    /// Read whatever is in the socket now, on a socket already set not to
+    /// block, and collect the notices in it.
+    fn pull(&mut self) -> io::Result<()> {
         loop {
             let mut buf = [0u8; 8192];
             match self.stream.read(&mut buf) {
-                Ok(0) => {
-                    result = Err(io::Error::other("the compositor closed the connection"));
-                    break;
-                }
+                Ok(0) => return Err(io::Error::other("the haimanager closed the connection")),
                 Ok(n) => self.decoder.feed(&buf[..n]),
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
-                Err(err) => {
-                    result = Err(err);
-                    break;
-                }
+                Err(err) => return Err(err),
             }
         }
-        self.stream.set_nonblocking(false)?;
-        result?;
+        self.collect_frames()
+    }
 
+    /// Every complete frame the decoder holds, kept if it is a notice.
+    ///
+    /// Anything that is not a notice has no business arriving while no
+    /// request is in flight; `collect` keeps the notices and the rest is
+    /// dropped as the protocol violation it is.
+    fn collect_frames(&mut self) -> io::Result<()> {
         while let Some(fields) = self
             .decoder
             .next_frame()
             .map_err(|err| io::Error::other(err.to_string()))?
         {
             self.collect(&fields);
-            // Anything that is not a notice has no business arriving while no
-            // request is in flight; `collect` keeps the notices and the rest
-            // is dropped as the protocol violation it is.
         }
-
-        let mut names: Vec<String> = Vec::new();
-        for name in std::mem::take(&mut self.changed) {
-            if !names.contains(&name) {
-                names.push(name);
-            }
-        }
-        Ok(names)
+        Ok(())
     }
 
-    /// Keep a `changed` notice; say whether the frame was one.
-    fn collect(&mut self, fields: &[String]) -> bool {
-        if fields.first().map(String::as_str) != Some(MSG_CHANGED) {
-            return false;
+    /// Hand over what has been collected, each notice once.
+    ///
+    /// A view notice repeated says nothing new: the remedy is one fresh read
+    /// whether the application re-rendered once or seventeen times. A data
+    /// notice repeated with the same rectangle is the same; two rectangles
+    /// are two, and adding them up is the reader's business, since the
+    /// arithmetic for it is not this file's.
+    fn drain(&mut self) -> Vec<Notice> {
+        let mut taken: Vec<Notice> = Vec::new();
+        for notice in std::mem::take(&mut self.notices) {
+            if !taken.contains(&notice) {
+                taken.push(notice);
+            }
         }
-        if let Some(name) = fields.get(1)
-            && self.changed.last() != Some(name)
-        {
-            self.changed.push(name.clone());
+        taken
+    }
+
+    /// Keep a notice; say whether the frame was one.
+    fn collect(&mut self, fields: &[String]) -> bool {
+        let notice = match fields.first().map(String::as_str) {
+            Some(MSG_CHANGED) => match fields.get(1) {
+                Some(app) => Notice::View { app: app.clone() },
+                None => return true,
+            },
+            Some(MSG_DATA_CHANGED) => match (fields.get(1), fields.get(2)) {
+                (Some(app), Some(source)) => Notice::Data {
+                    app: app.clone(),
+                    source: source.clone(),
+                    element: fields.get(3).filter(|name| !name.is_empty()).cloned(),
+                    range: fields.get(4).filter(|range| !range.is_empty()).cloned(),
+                },
+                _ => return true,
+            },
+            _ => return false,
+        };
+        // Back to back repeats are folded here, so a burst of seventeen
+        // re-renders is one entry rather than seventeen; everything else is
+        // folded at the drain.
+        if self.notices.last() != Some(&notice) {
+            self.notices.push(notice);
         }
         true
     }
@@ -338,6 +475,12 @@ impl Link {
         self.await_reply()
     }
 
+    /// A link over one end of a socketpair, for tests.
+    #[cfg(test)]
+    fn over(stream: UnixStream) -> Link {
+        Link { stream, decoder: Decoder::with_limit(MAX_TREE), notices: Vec::new() }
+    }
+
     /// Block until something that is not a change notice arrives.
     fn await_reply(&mut self) -> io::Result<Vec<String>> {
         loop {
@@ -346,9 +489,9 @@ impl Link {
                 .next_frame()
                 .map_err(|err| io::Error::other(err.to_string()))?
             {
-                // A change notice may arrive while a reply is awaited; it is
+                // A notice may arrive while a reply is awaited; it is
                 // collected rather than mistaken for the answer, and handed
-                // over by `take_changed` when the caller next asks.
+                // over by `take_notices` when the caller next asks.
                 if self.collect(&reply) {
                     continue;
                 }
@@ -363,5 +506,92 @@ impl Link {
                 Err(err) => return Err(err),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn data(app: &str, source: &str, element: Option<&str>, range: Option<&str>) -> Notice {
+        Notice::Data {
+            app: app.into(),
+            source: source.into(),
+            element: element.map(str::to_owned),
+            range: range.map(str::to_owned),
+        }
+    }
+
+    /// Both words arrive on the wire and come out as what they are, with the
+    /// empty fields the haimanager sends for "no element" and "the whole
+    /// sheet" read back as absent rather than as empty names.
+    #[test]
+    fn both_notices_are_collected_and_read_back() {
+        let (ours, mut haimanager) = UnixStream::pair().unwrap();
+        let mut link = Link::over(ours);
+        haimanager.write_all(&encode(&[MSG_CHANGED, "awsheet"])).unwrap();
+        haimanager
+            .write_all(&encode(&[MSG_DATA_CHANGED, "awsheet", "book/1", "sheet", "B7"]))
+            .unwrap();
+        haimanager.write_all(&encode(&[MSG_DATA_CHANGED, "awsheet", "book/2", "", ""])).unwrap();
+
+        let notices = link.take_notices().unwrap();
+        assert_eq!(
+            notices,
+            vec![
+                Notice::View { app: "awsheet".into() },
+                data("awsheet", "book/1", Some("sheet"), Some("B7")),
+                data("awsheet", "book/2", None, None),
+            ]
+        );
+        // Taken means taken.
+        assert!(link.take_notices().unwrap().is_empty());
+    }
+
+    /// A burst of re-renders is one notice, and a reply in the middle of
+    /// them is still the reply.
+    #[test]
+    fn repeats_fold_and_a_reply_is_not_a_notice() {
+        let (ours, mut haimanager) = UnixStream::pair().unwrap();
+        let mut link = Link::over(ours);
+        for _ in 0..17 {
+            haimanager.write_all(&encode(&[MSG_CHANGED, "awtext"])).unwrap();
+        }
+        haimanager.write_all(&encode(&[MSG_DONE, "awtext", "body", "type-text"])).unwrap();
+        haimanager.write_all(&encode(&[MSG_CHANGED, "awtext"])).unwrap();
+
+        assert_eq!(link.next_outcome().unwrap(), Outcome::Done);
+        assert_eq!(link.pending(), &[Notice::View { app: "awtext".into() }]);
+        assert_eq!(link.take_notices().unwrap().len(), 1);
+    }
+
+    /// Waiting is bounded, and what arrives while waiting is collected
+    /// rather than returned, so a caller can look and keep waiting.
+    #[test]
+    fn waiting_collects_and_a_quiet_socket_times_out() {
+        let (ours, mut haimanager) = UnixStream::pair().unwrap();
+        let mut link = Link::over(ours);
+
+        let started = std::time::Instant::now();
+        assert!(!link.wait_notice(Duration::from_millis(30)).unwrap());
+        assert!(started.elapsed() >= Duration::from_millis(30));
+        assert!(link.pending().is_empty());
+
+        haimanager.write_all(&encode(&[MSG_CHANGED, "awcalc"])).unwrap();
+        assert!(link.wait_notice(Duration::from_secs(5)).unwrap());
+        assert_eq!(link.pending().len(), 1);
+
+        // Half a frame is the haimanager talking, not silence.
+        let frame = encode(&[MSG_CHANGED, "awsheet"]);
+        haimanager.write_all(&frame[..5]).unwrap();
+        assert!(link.wait_notice(Duration::from_secs(5)).unwrap());
+        assert_eq!(link.pending().len(), 1, "half a frame is not a notice yet");
+        haimanager.write_all(&frame[5..]).unwrap();
+        assert!(link.wait_notice(Duration::from_secs(5)).unwrap());
+        assert_eq!(link.pending().len(), 2);
+        // And the socket is blocking again afterwards, which the next reply
+        // depends on.
+        haimanager.write_all(&encode(&[MSG_APPS, "<apps/>"])).unwrap();
+        assert_eq!(link.await_reply().unwrap()[0], MSG_APPS);
     }
 }

@@ -61,9 +61,9 @@ use std::os::fd::{OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
-use awproto::{agent, display};
+use awproto::{agent, cells, display};
 
-use crate::client::{Client, Kind, Progress};
+use crate::client::{self, Client, Kind, Progress};
 use crate::clipboard::Clipboard;
 use crate::cursor;
 use crate::document::Document;
@@ -800,7 +800,7 @@ impl Screen {
         self.clients.iter_mut().find(|client| client.fd() == fd)
     }
 
-    /// An application's tree changed: tell the agent working in its
+    /// An application's interface changed: tell the agent working in its
     /// workspace, if one is, so it re-reads rather than acting on a view of
     /// how things used to be.
     ///
@@ -811,18 +811,38 @@ impl Screen {
     /// because the caller notifies for app clients only: chrome stays
     /// invisible to agents down to its updates.
     pub fn notify_agent_of_change(&mut self, changed_fd: RawFd) {
-        let Some(changed) = self.client(changed_fd) else { return };
+        let Some((name, agent)) = self.agent_watching(changed_fd) else { return };
+        agent.send(&[agent::MSG_CHANGED, &name]);
+    }
+
+    /// An application's sheets took cells: tell the agent which, and where.
+    ///
+    /// The other kind of change, and a different word for it because the
+    /// remedy is different. A sheet is the one thing too large to re-read
+    /// whole, so the rectangle written is named, along with the element the
+    /// agent reads it through, and the agent reads that much and no more.
+    pub fn notify_agent_of_data(&mut self, changed_fd: RawFd, changes: &[client::DataChange]) {
+        let Some((name, agent)) = self.agent_watching(changed_fd) else { return };
+        for change in changes {
+            let element = change.element.as_deref().unwrap_or("");
+            let range = change.range.map(cells::range_name).unwrap_or_default();
+            agent.send(&[agent::MSG_DATA_CHANGED, &name, &change.source, element, &range]);
+        }
+    }
+
+    /// The agent to tell about an application's change, if the change is an
+    /// application's and an agent is working in its workspace.
+    fn agent_watching(&mut self, changed_fd: RawFd) -> Option<(String, &mut Client)> {
+        let changed = self.client(changed_fd)?;
         if changed.kind != Kind::App {
-            return;
+            return None;
         }
         let (desk, name) = (changed.desk, changed.name.clone());
-        if let Some(agent) = self
+        let agent = self
             .clients
             .iter_mut()
-            .find(|client| client.kind == Kind::Agent && client.desk == desk)
-        {
-            agent.send(&[agent::MSG_CHANGED, &name]);
-        }
+            .find(|client| client.kind == Kind::Agent && client.desk == desk)?;
+        Some((name, agent))
     }
 
     fn client(&self, fd: RawFd) -> Option<&Client> {
@@ -2227,7 +2247,7 @@ impl Screen {
     ) -> Option<&'static str> {
         match self.client_mut(app) {
             Some(client) => match client.node_by_id(target) {
-                Some(index) => client.act_cell(fonts, index, action, value, cell).err(),
+                Some(index) => client.act_for_agent(fonts, index, action, value, cell).err(),
                 None => Some(agent::REASON_NO_SUCH_NODE),
             },
             None => Some(agent::REASON_NO_SUCH_APP),
@@ -3160,6 +3180,106 @@ mod tests {
     const SHEET: &str = "<window title=\"Sheet\" pad=\"none\">\
          <spreadsheet id=\"sheet\" grow=\"true\" source=\"book\" version=\"2\" \
          rows=\"1000\" columns=\"26\" cursor=\"A1\" description=\"The grid\"/></window>";
+
+    /// The two notices an agent hears, sent the way the main loop sends
+    /// them: an application's interface moving is `changed`, cells arriving
+    /// is `data-changed` naming the element and the rectangle, and a tree
+    /// that only claims a publish is neither.
+    #[test]
+    fn an_agent_hears_the_view_and_the_data_as_different_words() {
+        ui::set_scale(1.0);
+        let fonts = Fonts::load().expect("the faces are compiled in");
+        let mut screen = Screen::new(Rect::new(0, 0, 1200, 800), &fonts);
+
+        let (mut app, app_end) = UnixStream::pair().expect("a socketpair");
+        let app_fd = app_end.as_raw_fd();
+        screen
+            .attach(
+                &fonts,
+                &["app-attached".into(), "1".into(), "awsheet".into(), "0".into()],
+                OwnedFd::from(app_end),
+            )
+            .expect("the application attached");
+        let (mut agent, agent_end) = UnixStream::pair().expect("a socketpair");
+        screen
+            .attach(
+                &fonts,
+                &["agent-attached".into(), "1".into(), "0".into()],
+                OwnedFd::from(agent_end),
+            )
+            .expect("the agent attached");
+
+        // Everything the agent has been sent, however many frames arrived in
+        // one read. `frame` above keeps no decoder between calls, which is
+        // fine for one reply at a time and loses the second of two notices
+        // sent back to back.
+        agent.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let heard = |agent: &mut UnixStream| -> Vec<Vec<String>> {
+            let mut decoder = awproto::Decoder::with_limit(1024 * 1024);
+            let mut buf = [0u8; 8192];
+            loop {
+                match agent.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(read) => decoder.feed(&buf[..read]),
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        break;
+                    }
+                    Err(err) => panic!("reading the agent's end: {err}"),
+                }
+            }
+            let mut frames = Vec::new();
+            while let Some(fields) = decoder.next_frame().expect("a frame") {
+                frames.push(fields);
+            }
+            frames
+        };
+
+        // What the main loop does with what `readable` found.
+        let deliver = |screen: &mut Screen| {
+            let progress = screen.readable(app_fd, &fonts).expect("the app was read");
+            if progress.updated {
+                screen.notify_agent_of_change(app_fd);
+            }
+            if !progress.data.is_empty() {
+                screen.notify_agent_of_data(app_fd, &progress.data);
+            }
+            (progress.updated, progress.data)
+        };
+
+        // A first publish and the tree that claims it: the view changed (a
+        // grid appeared) and the sheet was replaced whole.
+        app.write_all(&encode(&["sheet", "book", "1", "0", "A1", "Region", "Q1"])).unwrap();
+        app.write_all(&encode(&["render", "1", SHEET])).unwrap();
+        let (updated, data) = deliver(&mut screen);
+        assert!(updated, "a grid appearing is a change to the view");
+        assert_eq!(data.len(), 1, "{data:?}");
+        assert_eq!(
+            heard(&mut agent),
+            vec![
+                vec!["changed", "awsheet"],
+                vec!["data-changed", "awsheet", "book", "sheet", ""],
+            ]
+        );
+
+        // A cell typed into, published, and the tree re-rendered to claim
+        // the version: the data moved, the view did not, and the agent is
+        // told exactly that and nothing more.
+        app.write_all(&encode(&["sheet", "book", "2", "1", "B7", "4711"])).unwrap();
+        app.write_all(&encode(&["render", "2", &SHEET.replace("version=\"2\"", "version=\"3\"")]))
+            .unwrap();
+        let (updated, data) = deliver(&mut screen);
+        assert!(!updated, "a version ticking over is not a change an agent can see");
+        assert_eq!(
+            heard(&mut agent),
+            vec![vec!["data-changed", "awsheet", "book", "sheet", "B7"]],
+            "{data:?}"
+        );
+    }
 
     /// The whole of `query cells`: an agent asks for a rectangle and is
     /// answered out of the sheet the compositor holds, without the
