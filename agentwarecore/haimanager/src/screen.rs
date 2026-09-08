@@ -56,12 +56,12 @@
 //! chat input and the transcript all stay live, or the freeze would be a trap
 //! rather than a safety measure.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::os::fd::{OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
-use awproto::agent;
+use awproto::{agent, display};
 
 use crate::client::{Client, Kind, Progress};
 use crate::clipboard::Clipboard;
@@ -72,6 +72,7 @@ use crate::images::Images;
 use crate::sheet;
 use crate::startmenu::{AGENTWARE_ICON, AGENTWARE_SVG, StartMenu, StartOutcome};
 use crate::text::{Edit, Editing, MultiPress};
+use crate::trail::Trail;
 use crate::input::{Button, Event, Key};
 use crate::paint::font::{Family, Fonts, Style};
 use crate::paint::{Canvas, Rect};
@@ -160,55 +161,6 @@ fn resize_band() -> i32 { ui::sc(7) }
 /// Smaller than this and a window is all chrome.
 fn min_window() -> (i32, i32) { (ui::sc(320), ui::sc(200)) }
 
-/// How long the fake cursor takes to cross the whole workspace.
-///
-/// Long enough for a human to follow, which is the entire point of it. An agent
-/// that acted instantly would be indistinguishable from one that had never
-/// shown its work, and the visible embodiment VISION.md promises would be a
-/// claim rather than something on screen.
-///
-/// It is the cost of the *longest* flight rather than of every flight. A fixed
-/// duration means a cursor already sitting on its target spends six hundred
-/// milliseconds travelling nowhere, which an agent filling three fields of a
-/// form pays three times over for movement nobody can see. What a human
-/// follows is the movement, so what should be constant is the speed.
-const FLIGHT: Duration = Duration::from_millis(600);
-
-/// The shortest a flight can be, however close the target.
-///
-/// Not zero, because the flight is also the moment that says a new action has
-/// begun: the cursor settling before a control sinks is how two acts on one
-/// control read as two rather than as a flicker.
-const FLIGHT_MIN: Duration = Duration::from_millis(120);
-
-/// How much of the usual pacing an action gets when more are already waiting
-/// behind it.
-///
-/// The ceremony is for a human following a deliberate act, and a run of six
-/// is not six of those, it is one sequence. Watching a sequence performed at
-/// full ceremony is watching a progress bar: the information is "six things
-/// happened, in this order", and that reads perfectly well at a third of the
-/// pace, while the full pace reads as the machine being slow.
-///
-/// This is the whole reason the harness pipelines its actions. An agent that
-/// waited for each outcome before sending the next left the queue empty by
-/// construction, so there was never anything here to notice.
-const HURRIED: f32 = 0.35;
-
-/// How long the cursor should take to cover `distance` pixels of a workspace
-/// `span` pixels wide, with `waiting` actions already queued behind it.
-fn flight_time(from: (i32, i32), to: (i32, i32), span: i32, waiting: bool) -> Duration {
-    let distance = (((to.0 - from.0) as f32).powi(2) + ((to.1 - from.1) as f32).powi(2)).sqrt();
-    // Proportional to the width of the room it is crossing, so the pacing is
-    // the same at every resolution and interface scale without a constant
-    // saying so.
-    let share = (distance / span.max(1) as f32).clamp(0.0, 1.0);
-    let pace = if waiting { HURRIED } else { 1.0 };
-    // The floor is hurried too, or a run of actions on one control costs the
-    // same as a run spread across the screen.
-    FLIGHT.mul_f32(share).max(FLIGHT_MIN).mul_f32(pace)
-}
-
 /// How long the conversation pane takes to fold away or return.
 const PANE_FOLD: Duration = Duration::from_millis(200);
 
@@ -218,45 +170,15 @@ const PANE_FOLD: Duration = Duration::from_millis(200);
 /// and only blinks while the field is waiting.
 const BLINK: Duration = Duration::from_millis(530);
 
-/// Time between characters when an agent enters text.
-///
-/// An agent that set a field's value in one step would produce something no
-/// human could have produced, and the application would receive one event where
-/// a person types seventeen. Typing it out is both the honest synthesis and the
-/// only way a human watching can read what is being entered.
-const KEYSTROKE: Duration = Duration::from_millis(45);
+// There is no constant here for the time between an agent's keystrokes, and
+// the reason is worth writing down where one used to be. Typing is still one
+// event per character, which is the guarantee: an application receives the
+// seventeen events a person typing would have produced and never a value that
+// appeared in one step. What has gone is the *pause* between them. They are
+// synthesized together, when the intent arrives, because an agent waiting out
+// seventeen pauses before it is told anything is an agent whose model cannot
+// think about the next step until the animation of the last one has finished.
 
-/// How far an accepted intent has got.
-enum Stage {
-    /// The cursor is on its way to the target.
-    Travelling,
-    /// Characters are going in one at a time.
-    Typing { done: usize, next: Instant },
-}
-
-/// An intent that has been accepted and is being performed.
-///
-/// It exists as state rather than as a blocking call because the compositor must
-/// keep answering the human while it runs. The stop button and the navigation
-/// bar stay live through the whole of it.
-struct Flight {
-    agent: RawFd,
-    app: RawFd,
-    app_name: String,
-    desk: u32,
-    target: String,
-    /// The cell of a spreadsheet, when the target is one. Empty otherwise.
-    cell: String,
-    action: String,
-    value: String,
-    from: (i32, i32),
-    to: (i32, i32),
-    started: Instant,
-    /// How long this particular flight takes, which depends on how far it
-    /// goes. See [`flight_time`].
-    duration: Duration,
-    stage: Stage,
-}
 
 /// Where the keyboard is pointed.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -382,13 +304,9 @@ pub struct Screen {
     /// The start menu, while it is open.
     start: Option<StartMenu>,
 
-    /// The intent being performed, if any.
-    flight: Option<Flight>,
-    /// Agents waiting to be told what a table's new window holds.
-    /// Intents that arrived while one was in flight. An agent waits for its
-    /// answer before sending the next, so this is a safety net rather than a
-    /// pipeline.
-    queued: VecDeque<(RawFd, Vec<String>)>,
+    /// The agent's cursor and the queue of places it still has to be seen.
+    /// It draws and decides nothing; see [`crate::trail`].
+    trail: Trail,
     /// Where the agent's pointer is, and whose workspace it is in. Kept after a
     /// flight lands, so the human can see what was just touched.
     agent_cursor: Option<(u32, i32, i32)>,
@@ -448,8 +366,7 @@ impl Screen {
             rename_drag: false,
             presses: MultiPress::default(),
             start: None,
-            flight: None,
-            queued: VecDeque::new(),
+            trail: Trail::new(),
             agent_cursor: None,
             overlay_dirty: false,
             drag_damage: None,
@@ -854,10 +771,7 @@ impl Screen {
 
         // An agent that has gone leaves no pointer behind, and an intent whose
         // agent or target has gone has nobody to answer and nothing to act on.
-        if self.flight.as_ref().is_some_and(|f| f.agent == fd || f.app == fd) {
-            self.flight = None;
-        }
-        self.queued.retain(|(from, _)| *from != fd);
+
         // An agent or an application that has gone leaves nobody to answer
         // and nothing to answer with.
         if self.clients.iter().all(|client| client.kind != Kind::Agent) {
@@ -933,6 +847,26 @@ impl Screen {
     }
 
     /// Whether a workspace is the one on screen.
+    /// Point the trail at the workspace on screen, and tell it the size of
+    /// the room the cursor crosses.
+    ///
+    /// Called from wherever the answer might have moved rather than from
+    /// every assignment to `current`: `Trail::follow` is a no-op when the
+    /// workspace has not changed, so calling it too often costs nothing and
+    /// missing one would leave the cursor drawing another desk's work.
+    fn watch_on_screen(&mut self) {
+        let desk = self.workspaces.get(self.current).map(|workspace| workspace.id);
+        let apps = self.regions().apps;
+        self.trail.set_stage((apps.x + 20, apps.y + 20), apps.w);
+        self.trail.follow(desk);
+    }
+
+    /// The range the human set for how long the agent's cursor may take to
+    /// show one action. Re-read whenever the settings file changes.
+    pub fn set_pace(&mut self, pace: awproto::pace::Pace) {
+        self.trail.set_pace(pace);
+    }
+
     fn desk_on_screen(&self, desk: u32) -> bool {
         self.workspaces.get(self.current).is_some_and(|workspace| workspace.id == desk)
     }
@@ -1850,13 +1784,9 @@ impl Screen {
                 false
             }
 
-            (agent::MSG_INTENT, _) => {
-                if self.flight.is_some() {
-                    self.queued.push_back((from, fields.to_vec()));
-                    return false;
-                }
-                self.begin(fonts, from, fields)
-            }
+            // Applied and answered on arrival, whatever the cursor happens
+            // to be doing. See `Flight`.
+            (agent::MSG_INTENT, _) => self.begin(fonts, from, fields),
 
             (other, _) => {
                 self.notes.push(format!("agent sent {other:?}, which is not a request"));
@@ -2125,34 +2055,75 @@ impl Screen {
             .unwrap_or_else(|| client.rect_of(index));
         let to = (rect.x + rect.w / 2, rect.y + rect.h / 2);
 
-        let desk = self.workspaces[at].id;
-        let from_point = self.agent_cursor.filter(|(d, _, _)| *d == desk).map_or(
-            (self.regions().apps.x + 20, self.regions().apps.y + 20),
-            |(_, x, y)| (x, y),
-        );
+        // Everything that can refuse this has refused it by now, so perform
+        // it, here, before anything is drawn. The agent is answered from this
+        // line rather than from the end of an animation, which is the whole
+        // point: the model is free to think about its next step while the
+        // cursor is still on its way to the last one.
+        let outcome = self.perform(fonts, app_fd, &target, &cell, &action, &value);
+        match outcome {
+            Some(reason) => {
+                self.refuse(from, &app, &target, reason);
+                return false;
+            }
+            None => {
+                self.notes
+                    .push(format!("agent performed {action} on {target} in {app}"));
+                self.confirm(from, &app, &target, &action);
+            }
+        }
 
-        self.flight = Some(Flight {
-            agent: from,
-            app: app_fd,
-            app_name: app,
-            desk,
-            target,
-            cell,
-            action,
-            value,
-            from: from_point,
-            to,
-            started: Instant::now(),
-            duration: flight_time(from_point, to, self.regions().apps.w, !self.queued.is_empty()),
-            stage: Stage::Travelling,
-        });
+        // And only now the picture of it. A flight decides nothing and is
+        // owed nothing; if one is already running this joins the back of the
+        // trail and waits its turn.
+        //
+        // Nothing is ever dropped from that queue and it is never reordered.
+        // Every action the agent performed is shown, in the order it was
+        // performed in, however far behind the machine that leaves the
+        // cursor: a human watching a workspace has to be able to trust that
+        // what they saw happen is what happened, and a queue that skips is a
+        // queue that quietly hides steps.
+        let desk = self.workspaces[at].id;
+        self.watch_on_screen();
+        self.trail.push(desk, to);
         true
+    }
+
+    /// Synthesize the events one action is worth, at once.
+    ///
+    /// Typing is still one event per character, because that is a guarantee
+    /// and not a decoration: an application sees a value growing exactly as
+    /// it does under a human's hands, and nothing an agent does arrives as a
+    /// value that appeared in one step. What has gone is the waiting between
+    /// them. The keystrokes are painted by the trail afterwards, at whatever
+    /// pace reads well, and the application has them all already.
+    fn perform(
+        &mut self,
+        fonts: &Fonts,
+        app: RawFd,
+        target: &str,
+        cell: &str,
+        action: &str,
+        value: &str,
+    ) -> Option<&'static str> {
+        if action != display::ACTION_TYPE_TEXT || value.is_empty() {
+            return self.apply(fonts, app, target, cell, action, value);
+        }
+        self.blink_epoch = Instant::now();
+        let total = value.chars().count();
+        for done in 1..=total {
+            let prefix: String = value.chars().take(done).collect();
+            if let Some(reason) = self.apply(fonts, app, target, cell, action, &prefix) {
+                return Some(reason);
+            }
+        }
+        None
     }
 
     /// True while something is mid-animation, so the loop should wake for
     /// frames rather than sleeping until the next event.
     pub fn wants_frame(&self) -> bool {
-        self.flight.is_some()
+        self.trail.busy()
             || self.panes_moving()
             // Only what is on screen: a control sinking for a fifth of a
             // second in a workspace nobody is looking at is not a reason to
@@ -2188,95 +2159,22 @@ impl Screen {
             }
         }
 
-        let Some(flight) = &self.flight else { return busy || settling || panes || blinked };
+        self.watch_on_screen();
 
-        // An agent working in another agentdesk is still working: its cursor
-        // travels, its keystrokes go in, the application answers. What it
-        // must not do is repaint the desk in front of the human once per
-        // character for something happening where nobody can see it.
-        let showing = self.desk_on_screen(flight.desk);
-
-        match flight.stage {
-            Stage::Travelling => {
-                let elapsed = flight.started.elapsed();
-                if elapsed >= flight.duration {
-                    self.land(fonts);
-                    return showing;
-                }
-
-                // Eased, because a pointer that moves at a constant speed and
-                // stops dead does not read as a pointer. Travel only moves the
-                // overlay: the scene under the flying cursor is not changing.
-                let t = elapsed.as_secs_f32() / flight.duration.as_secs_f32();
-                let eased = 1.0 - (1.0 - t).powi(3);
-                let x = flight.from.0 + ((flight.to.0 - flight.from.0) as f32 * eased) as i32;
-                let y = flight.from.1 + ((flight.to.1 - flight.from.1) as f32 * eased) as i32;
-                self.agent_cursor = Some((flight.desk, x, y));
-                self.overlay_dirty |= showing;
-                false
-            }
-
-            Stage::Typing { done, next } => {
-                if Instant::now() >= next {
-                    self.type_one(fonts, done);
-                }
-                showing
-            }
+        // The cursor, which draws what already happened and decides
+        // nothing. An agent working in an agentdesk nobody is looking at
+        // queues no stops at all, so this is silent for it.
+        let before = self.agent_cursor;
+        self.agent_cursor = self.trail.tick(Instant::now()).map(|(desk, (x, y))| (desk, x, y));
+        if self.agent_cursor != before {
+            let showing = self
+                .agent_cursor
+                .or(before)
+                .is_some_and(|(desk, _, _)| self.desk_on_screen(desk));
+            self.overlay_dirty |= showing;
+            return showing;
         }
-    }
-
-    /// The cursor has arrived. Start typing, or synthesize the event.
-    fn land(&mut self, fonts: &Fonts) -> bool {
-        let Some(flight) = &mut self.flight else { return false };
-        self.agent_cursor = Some((flight.desk, flight.to.0, flight.to.1));
-
-        // Text is entered a character at a time, from here on. Every other
-        // action happens at the moment the cursor arrives, as a click does.
-        if flight.action == "type-text" && !flight.value.is_empty() {
-            flight.stage = Stage::Typing { done: 0, next: Instant::now() };
-            return true;
-        }
-
-        let Some(flight) = self.flight.take() else { return false };
-        let outcome = self.apply(fonts, flight.app, &flight.target, &flight.cell, &flight.action, &flight.value);
-        self.settle(fonts, flight, outcome);
-        true
-    }
-
-    /// Put in one more character.
-    fn type_one(&mut self, fonts: &Fonts, done: usize) -> bool {
-        let (app, target, cell, action, total, prefix) = {
-            let Some(flight) = &self.flight else { return false };
-            (
-                flight.app,
-                flight.target.clone(),
-                flight.cell.clone(),
-                flight.action.clone(),
-                flight.value.chars().count(),
-                flight.value.chars().take(done + 1).collect::<String>(),
-            )
-        };
-
-        // Every keystroke is its own event, exactly as a human's would be, so an
-        // application sees a value growing rather than one appearing, and the
-        // caret stays solid exactly as it does under a human's typing.
-        self.blink_epoch = Instant::now();
-        let outcome = self.apply(fonts, app, &target, &cell, &action, &prefix);
-        if outcome.is_some() || done + 1 >= total {
-            let Some(flight) = self.flight.take() else { return false };
-            self.settle(fonts, flight, outcome);
-            return true;
-        }
-
-        // Typing keeps its own pace, hurried the same way a flight is when
-        // more actions are already waiting. Every character is still its own
-        // event, which is the part that is a guarantee; how fast they are
-        // painted is the part that is presentation.
-        let pace = if self.queued.is_empty() { KEYSTROKE } else { KEYSTROKE.mul_f32(HURRIED) };
-        if let Some(flight) = &mut self.flight {
-            flight.stage = Stage::Typing { done: done + 1, next: Instant::now() + pace };
-        }
-        true
+        busy || settling || panes || blinked
     }
 
     /// Apply one action, re-resolving the target first.
@@ -2300,26 +2198,6 @@ impl Screen {
                 None => Some(agent::REASON_NO_SUCH_NODE),
             },
             None => Some(agent::REASON_NO_SUCH_APP),
-        }
-    }
-
-    /// Answer the agent, and start whatever was waiting behind this.
-    fn settle(&mut self, fonts: &Fonts, flight: Flight, outcome: Option<&'static str>) {
-        match outcome {
-            None => {
-                self.notes.push(format!(
-                    "agent performed {} on {} in {}",
-                    flight.action, flight.target, flight.app_name
-                ));
-                self.confirm(flight.agent, &flight.app_name, &flight.target, &flight.action);
-            }
-            Some(reason) => {
-                self.refuse(flight.agent, &flight.app_name, &flight.target, reason)
-            }
-        }
-
-        if let Some((from, fields)) = self.queued.pop_front() {
-            self.begin(fonts, from, &fields);
         }
     }
 
@@ -3244,44 +3122,6 @@ mod tests {
             assert!(read > 0, "the connection closed with nothing said");
             decoder.feed(&buf[..read]);
         }
-    }
-
-    #[test]
-    fn a_flight_costs_what_it_covers() {
-        let span = 2000;
-        let alone = |from, to, span| flight_time(from, to, span, false);
-        // Crossing the whole workspace is the full flight; it is the cap, not
-        // the price of every move.
-        assert_eq!(alone((0, 0), (2000, 0), span), FLIGHT);
-        // Further than the workspace is wide still costs the cap: a diagonal
-        // is longer than a side, and a cursor is not slower for going corner
-        // to corner.
-        assert_eq!(alone((0, 0), (2000, 2000), span), FLIGHT);
-        // Half the width is half the time.
-        assert_eq!(alone((100, 50), (1100, 50), span), FLIGHT / 2);
-        // Twice on the same control is the floor, not six hundred
-        // milliseconds of travelling nowhere. This is the whole point.
-        assert_eq!(alone((400, 300), (400, 300), span), FLIGHT_MIN);
-        assert_eq!(alone((400, 300), (410, 300), span), FLIGHT_MIN);
-        // A workspace with no width yet cannot divide by it.
-        assert_eq!(alone((0, 0), (10, 0), 0), FLIGHT);
-    }
-
-    #[test]
-    fn a_queue_is_performed_as_a_sequence() {
-        let span = 2000;
-        // Every distance is hurried when something is waiting, the floor
-        // included: a run of actions on one control would otherwise cost what
-        // a run across the screen costs.
-        for (from, to) in [((0, 0), (2000, 0)), ((0, 0), (1000, 0)), ((400, 300), (400, 300))] {
-            let alone = flight_time(from, to, span, false);
-            let hurried = flight_time(from, to, span, true);
-            assert_eq!(hurried, alone.mul_f32(HURRIED), "{from:?} to {to:?}");
-            assert!(hurried < alone);
-        }
-        // Hurried, not skipped. An action nobody can see happen is an action
-        // the human cannot follow, which is the one thing the cursor is for.
-        assert!(flight_time((0, 0), (0, 0), span, true) >= Duration::from_millis(30));
     }
 
     const SHEET: &str = "<window title=\"Sheet\" pad=\"none\">\

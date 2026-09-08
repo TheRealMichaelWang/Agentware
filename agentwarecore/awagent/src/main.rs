@@ -40,12 +40,14 @@ use serde_json::{Value, json};
 
 use backend::{Assistant, Backend, Block, Delta, ModelMessage, Role, Stop, ToolDef, Usage};
 
-/// How many times the same call with the same arguments is answered before
-/// the harness says so in the result, and before it gives up on the turn.
+/// How many exchanges in a row may reach a state this turn has already been
+/// in before the harness says so in the tool result, and before it gives up
+/// on the turn.
 ///
-/// Not an exchange ceiling: a turn doing different things stays unbounded,
-/// however long it takes. This counts one question being asked again, which
-/// is the shape a stuck turn actually has.
+/// Not an exchange ceiling: a turn reaching somewhere new stays unbounded,
+/// however long it takes. What is counted is a turn going in circles, which
+/// is the shape a stuck one actually has. Both numbers are guesses until the
+/// task suite tunes them.
 const NUDGE: u32 = 3;
 const STUCK: u32 = 6;
 
@@ -176,6 +178,12 @@ impl Agent {
     /// is exactly as worth knowing the shape of as one that finished.
     fn finish(&mut self, reply: &str) {
         log(&self.meter.summary());
+        // The reply goes in the log too, on one line however many it takes in
+        // the pane. Everything else the agent says is already copied here so
+        // that a serial capture tells the same story the pane does, and the
+        // reply was the one thing missing, which left a headless run able to
+        // see that a turn ended but not what it concluded.
+        log(&format!("reply: {}", reply.replace('\n', " ")));
         if let Err(err) = self.desk.reply(reply) {
             log(&format!("could not deliver the reply: {err}"));
         }

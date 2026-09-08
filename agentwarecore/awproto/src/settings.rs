@@ -22,6 +22,10 @@
 //!   <agent>
 //!     <anthropic-key>sk-ant-...</anthropic-key>
 //!     <workspace-id>wrkspc_...</workspace-id>
+//!     <computer-use>
+//!       <min-delay>40</min-delay>
+//!       <max-delay>600</max-delay>
+//!     </computer-use>
 //!   </agent>
 //! </settings>
 //! ```
@@ -82,7 +86,9 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
+
+use crate::pace::Pace;
 
 /// The state volume, mounted by the supervisor when the machine has one.
 pub const STATE_DIR: &str = "/state";
@@ -126,6 +132,9 @@ pub struct Settings {
     /// the API will not accept without one. `None` for an ordinary
     /// workspace-scoped key, which already says which workspace it is.
     pub anthropic_workspace: Option<String>,
+    /// How long the agent's cursor may take to show one action, at both ends
+    /// of the range. Nothing waits on it: see [`crate::pace`].
+    pub pace: Pace,
 }
 
 impl Default for Settings {
@@ -136,6 +145,7 @@ impl Default for Settings {
             utc_offset: 0,
             anthropic_key: None,
             anthropic_workspace: None,
+            pace: Pace::default(),
         }
     }
 }
@@ -187,12 +197,14 @@ impl Settings {
     pub fn to_xml(&self) -> String {
         let wallpaper = self.wallpaper.as_deref().unwrap_or(WALLPAPER_NONE);
         format!(
-            "<settings>\n  <desktop>\n    <wallpaper>{}</wallpaper>\n    <theme>{}</theme>\n  </desktop>\n  <time>\n    <utc-offset>{}</utc-offset>\n  </time>\n  <agent>\n    <anthropic-key>{}</anthropic-key>\n    <workspace-id>{}</workspace-id>\n  </agent>\n</settings>\n",
+            "<settings>\n  <desktop>\n    <wallpaper>{}</wallpaper>\n    <theme>{}</theme>\n  </desktop>\n  <time>\n    <utc-offset>{}</utc-offset>\n  </time>\n  <agent>\n    <anthropic-key>{}</anthropic-key>\n    <workspace-id>{}</workspace-id>\n    <computer-use>\n      <min-delay>{}</min-delay>\n      <max-delay>{}</max-delay>\n    </computer-use>\n  </agent>\n</settings>\n",
             escape(wallpaper),
             escape(&self.theme),
             format_offset(self.utc_offset),
             escape(self.anthropic_key.as_deref().unwrap_or("")),
             escape(self.anthropic_workspace.as_deref().unwrap_or("")),
+            self.pace.min.as_millis(),
+            self.pace.max.as_millis(),
         )
     }
 }
@@ -338,7 +350,19 @@ fn parse(text: &str) -> Option<Settings> {
         .map(|text| text.trim())
         .filter(|text| !text.is_empty())
         .map(str::to_owned);
-    Some(Settings { wallpaper, theme, utc_offset, anthropic_key, anthropic_workspace })
+    // A file from before Computer Use existed has neither element and gets
+    // the default range. One that has been hand edited into nonsense gets it
+    // too, per element: `Pace::new` puts the ends in order and inside the
+    // bounds, so no pair of numbers here can stop the cursor being drawn.
+    let millis = |key: &str| {
+        values.get(key).and_then(|text| text.trim().parse::<u64>().ok()).map(Duration::from_millis)
+    };
+    let fallback = Pace::default();
+    let pace = Pace::new(
+        millis("settings/agent/computer-use/min-delay").unwrap_or(fallback.min),
+        millis("settings/agent/computer-use/max-delay").unwrap_or(fallback.max),
+    );
+    Some(Settings { wallpaper, theme, utc_offset, anthropic_key, anthropic_workspace, pace })
 }
 
 /// Every element's text, keyed by its path from the root, `a/b/c`. Elements
@@ -433,10 +457,28 @@ mod tests {
             utc_offset: -300,
             anthropic_key: Some("sk-ant-a&b<c>\"d\"".into()),
             anthropic_workspace: Some("wrkspc_&<>".into()),
+            pace: Pace::new(Duration::from_millis(25), Duration::from_millis(900)),
         };
         assert_eq!(parse(&settings.to_xml()), Some(settings));
         let none = Settings { wallpaper: None, utc_offset: 345, ..Settings::default() };
         assert_eq!(parse(&none.to_xml()), Some(none));
+    }
+
+    #[test]
+    fn a_file_from_before_computer_use_gets_the_default_range() {
+        // Every other setting has to survive an older file, and this one is
+        // no different: two missing elements are a preference nobody has
+        // expressed yet, not a broken file.
+        let old = "<settings><agent><anthropic-key>sk-ant-x</anthropic-key></agent></settings>";
+        assert_eq!(parse(old).unwrap().pace, Pace::default());
+
+        // And a hand edit into nonsense falls back per element rather than
+        // losing the wallpaper with it.
+        let bad = "<settings><agent><computer-use><min-delay>soon</min-delay>\
+                   <max-delay>90</max-delay></computer-use></agent></settings>";
+        let pace = parse(bad).unwrap().pace;
+        assert_eq!(pace.max, Duration::from_millis(90));
+        assert!(pace.min <= pace.max);
     }
 
     #[test]

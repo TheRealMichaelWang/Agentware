@@ -24,6 +24,8 @@ use std::path::Path;
 use std::time::SystemTime;
 
 use awkit::{Answer, FileDialog};
+mod computeruse;
+
 use awproto::display::{self, Event, Surface, escape};
 use awproto::settings::{self, Settings as Stored};
 use awproto::theme;
@@ -64,6 +66,9 @@ struct Settings {
     /// The workspace as typed but not yet saved, on the same terms as the
     /// key: committed on Enter or Save, never per keystroke.
     workspace_edit: String,
+    /// How long the agent's cursor may take, as stored and as being typed.
+    pace: awproto::pace::Pace,
+    pace_edit: computeruse::Editing,
     /// When the settings file was last read, so a change made elsewhere is
     /// picked up before the next render rather than overwritten.
     seen: Option<SystemTime>,
@@ -99,6 +104,8 @@ fn main() {
         key_edit: stored.anthropic_key.unwrap_or_default(),
         workspace: stored.anthropic_workspace.clone(),
         workspace_edit: stored.anthropic_workspace.unwrap_or_default(),
+        pace: stored.pace,
+        pace_edit: computeruse::Editing::new(stored.pace),
         seen: settings::modified(),
         open: false,
         theme_open: false,
@@ -257,6 +264,20 @@ impl Settings {
                 self.status = Some(status);
             }
 
+            // Computer Use answers for its own ids first, and `None` for
+            // everything else, so the page below never has to know what is
+            // in that section.
+            _ if self
+                .pace_edit
+                .accept(&event.target, &event.action, &event.value)
+                .is_some_and(|answer| match answer {
+                    computeruse::Answer::Typed => true,
+                    computeruse::Answer::Commit(pace) => {
+                        self.save_pace(pace);
+                        true
+                    }
+                }) => {}
+
             // The key is typed (or pasted through the compositor's caret) and
             // committed as one save, Enter or the button alike.
             ("api-key", display::ACTION_TYPE_TEXT) => self.key_edit = event.value.clone(),
@@ -345,6 +366,31 @@ impl Settings {
                 self.key_edit = key.clone().unwrap_or_default();
                 self.key = key;
                 self.seen = settings::modified();
+                status
+            }
+            Err(err) => format!("could not save the setting: {err}"),
+        };
+        log(&status);
+        self.status = Some(status);
+    }
+
+    /// Store the cursor's pace, and put the fields back to what was stored.
+    fn save_pace(&mut self, pace: awproto::pace::Pace) {
+        let mut stored = Stored::load();
+        stored.pace = pace;
+        let status = match stored.save() {
+            Ok(()) => {
+                self.pace = pace;
+                self.pace_edit.reset(pace);
+                self.seen = settings::modified();
+                let mut status = format!(
+                    "cursor pace saved: {}ms to {}ms",
+                    pace.max.as_millis(),
+                    pace.min.as_millis()
+                );
+                if !settings::persistent() {
+                    status.push_str(" (no state volume: kept until power off)");
+                }
                 status
             }
             Err(err) => format!("could not save the setting: {err}"),
@@ -618,6 +664,8 @@ impl Settings {
             r#"            <text role="caption" color="muted">Which model answers is chosen in each agentdesk's pane.</text>"#
         );
         out.push_str("          </vstack>\n        </group>\n");
+
+        self.pace_edit.render(out, self.pace);
 
         if let Some(status) = &self.status {
             let _ = writeln!(out, r#"        <text role="caption" color="muted">{}</text>"#, escape(status));

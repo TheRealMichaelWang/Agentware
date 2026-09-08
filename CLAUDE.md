@@ -506,29 +506,39 @@ travelling nowhere. `flight_time` makes it proportional to the workspace's own
 width, capped at `FLIGHT` for crossing the whole thing and floored at
 `FLIGHT_MIN` so a flight still reads as the moment an action begins.
 
-**A run of actions is pipelined, and performed as a sequence.** The harness
-gathers consecutive `act` calls and sends every intent before collecting any
-outcome (`Link::send_intent` and `Link::next_outcome`, the two halves of
-`act`). Nothing about the answers changes: each intent is still validated when
-it reaches the front of the compositor's queue, after everything before it has
-actually been performed, and a rejection is still a rejection. What changes is
-that the compositor can *see* the run. Waiting for each outcome before sending
-the next left `queued` empty by construction, so the compositor had no way to
-tell one deliberate gesture from the first of six and had to pace every one of
-them for the former. It now hurries a flight, and the keystrokes of a
-`type-text`, to `HURRIED` of their usual pace while anything is waiting behind
-them; every character is still its own event, because that is the guarantee,
-while how fast they are painted is presentation. Measured on the same real
-turn: six actions in 695ms rather than 1318ms, and the gap between them a
-107ms median rather than 240ms.
+**The animation never blocks the agent.** An intent is validated, **performed,
+and answered the moment it arrives**. The cursor's flight is a picture of work
+that has already happened, so the model is free to think about its next step
+while the last one is still being drawn.
 
-This is as far as the idea goes, and the reason is worth writing down.
-Answering an intent at admission, before performing it, cannot be done
-truthfully: whether action four is legal depends on the state after actions
-one to three, so the answer is not decidable when it would have to be given.
-A batch that walks into a dialog is exactly that case. Pipelining gets the
-compositor the knowledge it was missing without giving up the one-intent,
-one-true-answer rule that rejections-as-answers rests on.
+It was the other way round and it was wrong: the event was synthesized when
+the cursor landed, so an agent waited out the whole animation before it was
+told anything, and a `type-text` waited out one 45ms pause per character on
+top. The animation exists so a human can follow along, which is a reason to
+draw it and never a reason to make anyone wait for it.
+
+What that means in the code. `Screen::begin` runs every check, then calls
+`perform` and `confirm` before a `Flight` exists at all. `Flight` holds a desk
+and two points and nothing else: no application, no target, no action, because
+there is nothing left for it to do with them. `land`, `type_one`, `settle` and
+the `Stage` enum are gone, and so is the queue of intents waiting for one in
+flight, because nothing waits any more.
+
+Typing is still **one event per character**: `perform` synthesizes them
+together, so an application receives the seventeen events a person typing
+would have produced and never a value that appeared in one step. That was
+always the guarantee. The pause between them was decoration and it is gone.
+
+**The pictures queue, in order, and none are dropped.** `Screen::trail` holds
+one destination per action performed, and the cursor works through them in the
+order they happened however far behind the machine that leaves it. A human
+watching has to be able to trust that what they saw is what happened, so the
+queue never skips and never reorders.
+
+The harness pipelines to match (`Link::send_intent` and `Link::next_outcome`,
+the two halves of `act`): a run of consecutive `act` calls goes out together
+and the outcomes are collected after. Every answer is still the true one,
+because every one of them was decided on arrival.
 
 **The agent can find an application by what it is for.** It could not, and a
 benchmark found it the hard way: asked to put text files in a spreadsheet, the

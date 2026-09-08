@@ -190,7 +190,31 @@ longer than planned.
 This is the phase most likely to be skipped and least advisable to skip. Every
 decision after it is a comparison, and comparisons need a fixture.
 
-### 2a. A repeatable agent task suite
+### 2a. A repeatable agent task suite. Built: `tools/tasksuite.py`
+
+The assertions turned out not to need what this section originally proposed.
+Reaching `query view` from outside the guest needs a process inside it, and
+two things already leaving the machine answer most of what a task wants
+asserted:
+
+* **The files it wrote**, read back out of the state volume with `debugfs`,
+  the no-sudo trick `make configure_anthropic_key` already uses. Each run gets
+  its own copy of `state.img`, so a task that saves a spreadsheet is checked
+  against what it actually saved rather than against the agent's account of
+  it.
+* **The serial log**, carrying the telemetry, the reply, and the `turn:`
+  accounting line. That line is the end-of-turn marker a headless run needs,
+  and it is the reason this was writable without touching the guest at all.
+  Phase 0a paid for itself twice.
+
+One guest change was needed and it was one line: the reply was the only thing
+the agent said that was not copied to the log, which left a headless run able
+to see that a turn had ended but not what it concluded.
+
+`query view` assertions remain the answer for anything the files and the reply
+cannot settle, and are not built because nothing yet needs them.
+
+### The tasks
 
 A set of tasks with **programmatically checkable outcomes**, run headless. The
 existing `tools/screenshot.py` already boots the guest, injects input and

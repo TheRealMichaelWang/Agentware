@@ -26,6 +26,7 @@ mod screen;
 mod sheet;
 mod startmenu;
 mod text;
+mod trail;
 mod ui;
 
 use std::collections::VecDeque;
@@ -162,18 +163,27 @@ impl Theming {
         }
     }
 
-    /// Notice a settings change. True if the palette was swapped and the
-    /// scene needs repainting.
-    fn check(&mut self) -> bool {
+    /// Notice a settings change.
+    ///
+    /// The file is stat'd once a pass and read only when its clock moves, so
+    /// everything the compositor takes from it is taken here rather than by
+    /// each part reading the file for itself.
+    fn check(&mut self, screen: &mut Screen) -> bool {
         let seen = awproto::settings::modified();
         if seen == self.seen {
             return false;
         }
         self.seen = seen;
         let stored = awproto::settings::Settings::load();
+        // How long the agent's cursor may take. Nothing waits on it, so a
+        // change costs no repaint of its own: the next flight is simply
+        // drawn at the new pace.
+        screen.set_pace(stored.pace);
         if stored.theme == self.path {
             return false;
         }
+        // A changed theme repaints the world: every colour on screen came
+        // from the palette that was just swapped out.
         self.apply(&stored.theme);
         true
     }
@@ -221,7 +231,16 @@ fn run(
     // than to a bar with nothing under it. Every workspace after this one is
     // the human's doing.
     if let Some(inbox) = &mut handoffs {
-        inbox.request(&["create-desk"]);
+        // `agentware.backend=` names what the first workspace answers with,
+        // for a machine nobody is sitting at. Without it the desk picks by
+        // whether an API key is set, which is right for a person and useless
+        // for a measurement: the task suite needs to say which model it is
+        // testing, and "whichever one the absence of a key implies" stops
+        // being an answer the moment a key exists.
+        match boot_backend() {
+            Some(backend) => inbox.request(&["create-desk", "", &backend]),
+            None => inbox.request(&["create-desk"]),
+        }
     }
 
     let mut events = [epoll::Event {
@@ -323,9 +342,7 @@ fn run(
         let mut dirty = tick_dirty;
         let mut only_pointer = !tick_dirty;
 
-        // A changed theme repaints the world: every colour on screen came
-        // from the palette that was just swapped out.
-        if theming.check() {
+        if theming.check(screen) {
             screen.retheme();
             dirty = true;
             only_pointer = false;
@@ -832,6 +849,26 @@ fn register() -> Result<UnixStream, String> {
     }
 
     Ok(stream)
+}
+
+/// What the workspace the compositor asks for at boot should answer with, if
+/// the kernel command line says.
+///
+/// Checked against the table here rather than passed through blind, so a
+/// misspelling is one line in the log at boot instead of a suite quietly
+/// measuring the default and reporting it as something else.
+fn boot_backend() -> Option<String> {
+    let cmdline = std::fs::read_to_string("/proc/cmdline").ok()?;
+    let asked = cmdline
+        .split_whitespace()
+        .find_map(|word| word.strip_prefix("agentware.backend="))?;
+    match awproto::turn::backend_config(asked) {
+        Some(config) => Some(config.id.to_owned()),
+        None => {
+            log(&format!("agentware.backend={asked} names no configuration; ignoring it"));
+            None
+        }
+    }
 }
 
 /// The interface scale for a display this many rows tall.
