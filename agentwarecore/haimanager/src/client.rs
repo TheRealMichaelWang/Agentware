@@ -933,6 +933,27 @@ impl Client {
         self.slider_drag = None;
     }
 
+    /// Take back the press an action just showed, without disturbing anything
+    /// else it did.
+    ///
+    /// For an agent, whose action happened the instant it was asked for while
+    /// its cursor is still on its way. The flash belongs where the cursor
+    /// actually is, so it is taken from here and given to the trail, which
+    /// puts it back through [`Client::show_press`] when the cursor lands.
+    pub fn take_press(&mut self) -> Option<String> {
+        self.press.take().map(|(key, _)| key)
+    }
+
+    /// Show a control pressed, now, for as long as a human's press lasts.
+    ///
+    /// The one piece of this that the pace setting never touches. How fast
+    /// the cursor travels is a preference; how a button behaves when it is
+    /// pressed is what the control does, and an agent pressing one should
+    /// look exactly like a person pressing one.
+    pub fn show_press(&mut self, key: &str) {
+        self.press = Some((key.to_owned(), Instant::now()));
+    }
+
     /// Send the value the pointer at `x` names, if it is not the one already
     /// showing.
     ///

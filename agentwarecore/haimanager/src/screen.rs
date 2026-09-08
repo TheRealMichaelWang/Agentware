@@ -72,7 +72,7 @@ use crate::images::Images;
 use crate::sheet;
 use crate::startmenu::{AGENTWARE_ICON, AGENTWARE_SVG, StartMenu, StartOutcome};
 use crate::text::{Edit, Editing, MultiPress};
-use crate::trail::Trail;
+use crate::trail::{self, Trail};
 use crate::input::{Button, Event, Key};
 use crate::paint::font::{Family, Fonts, Style};
 use crate::paint::{Canvas, Rect};
@@ -2091,6 +2091,16 @@ impl Screen {
             }
         }
 
+        // The press the action just showed is taken back and handed to the
+        // trail, which puts it on when the cursor gets there. The event fired
+        // a moment ago; the flash is the part a human is meant to see, and a
+        // button lighting up before the cursor reaches it is what made this
+        // look wrong.
+        let press = self
+            .client_mut(app_fd)
+            .and_then(|client| client.take_press())
+            .map(|key| trail::Press { client: app_fd, key });
+
         // And only now the picture of it. A flight decides nothing and is
         // owed nothing; if one is already running this joins the back of the
         // trail and waits its turn.
@@ -2103,7 +2113,7 @@ impl Screen {
         // queue that quietly hides steps.
         let desk = self.workspaces[at].id;
         self.watch_on_screen();
-        self.trail.push(desk, to);
+        self.trail.push(desk, to, press);
         true
     }
 
@@ -2183,7 +2193,12 @@ impl Screen {
         // nothing. An agent working in an agentdesk nobody is looking at
         // queues no stops at all, so this is silent for it.
         let before = self.agent_cursor;
-        self.agent_cursor = self.trail.tick(Instant::now()).map(|(desk, (x, y))| (desk, x, y));
+        if let Some(press) = self.trail.tick(Instant::now())
+            && let Some(client) = self.client_mut(press.client)
+        {
+            client.show_press(&press.key);
+        }
+        self.agent_cursor = self.trail.cursor().map(|(desk, (x, y))| (desk, x, y));
         if self.agent_cursor != before {
             let showing = self
                 .agent_cursor

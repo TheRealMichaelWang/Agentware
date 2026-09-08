@@ -33,15 +33,26 @@
 //! [`awproto::pace::Pace::of`]; both ends of it are settings.
 
 use std::collections::VecDeque;
+use std::os::fd::RawFd;
 use std::time::{Duration, Instant};
 
 use awproto::pace::Pace;
 
 /// Somewhere the cursor should be seen, because an action happened there.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Stop {
     desk: u32,
     at: (i32, i32),
+    /// The control to show pressed when the cursor gets here, if this action
+    /// is one a human pressing would have flashed.
+    press: Option<Press>,
+}
+
+/// A control to show pressed, once the cursor has actually reached it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Press {
+    pub client: RawFd,
+    pub key: String,
 }
 
 /// The cursor on its way to one stop.
@@ -86,6 +97,8 @@ pub struct Trail {
     /// How wide the workspace is, so a flight's duration is a fraction of
     /// crossing it rather than a count of pixels.
     span: i32,
+    /// What to press when the flight in the air lands.
+    landing: Option<Press>,
 }
 
 impl Trail {
@@ -98,6 +111,7 @@ impl Trail {
             pace: Pace::default(),
             home: (0, 0),
             span: 1,
+            landing: None,
         }
     }
 
@@ -127,6 +141,7 @@ impl Trail {
         self.flight = None;
         self.pending.clear();
         self.cursor = None;
+        self.landing = None;
     }
 
     /// An action happened here. Queue the picture of it.
@@ -138,12 +153,23 @@ impl Trail {
     /// module reads comes from its caller and none of it from the clock,
     /// which is what makes the pacing testable rather than something that has
     /// to be watched to be believed.
-    pub fn push(&mut self, desk: u32, at: (i32, i32)) {
+    pub fn push(&mut self, desk: u32, at: (i32, i32), press: Option<Press>) {
         if self.showing != Some(desk) {
             return;
         }
-        self.pending.push_back(Stop { desk, at });
+        self.pending.push_back(Stop { desk, at, press });
         self.hurry();
+    }
+
+    /// Where the cursor should be drawn.
+    ///
+    /// It stays where it last stopped. An agent that has finished working has
+    /// not left the machine, and a pointer that vanishes the moment it stops
+    /// moving is a pointer nobody can find again; a human's does not do that
+    /// and neither should this one. It goes when the workspace changes, and
+    /// when the last agent does.
+    pub fn cursor(&self) -> Option<(u32, (i32, i32))> {
+        self.cursor
     }
 
     /// Shorten the flight in the air to match a queue that just grew.
@@ -172,22 +198,26 @@ impl Trail {
         self.flight.is_some() || !self.pending.is_empty()
     }
 
-    /// Advance to `now`, and answer with where the cursor should be drawn.
+    /// Advance to `now`.
     ///
-    /// `None` means there is nothing to draw: no agent has acted in this
-    /// workspace since it came on screen.
-    pub fn tick(&mut self, now: Instant) -> Option<(u32, (i32, i32))> {
+    /// Answers with the control the cursor has just reached, if it arrived on
+    /// this tick. That is when a press is shown: the event fired long ago,
+    /// and the flash is the part a human is meant to see, so it belongs where
+    /// the cursor actually is rather than where it was going.
+    pub fn tick(&mut self, now: Instant) -> Option<Press> {
         self.take_off(now);
         let flight = self.flight?;
         let (at, arrived) = flight.at(now);
         self.cursor = Some((flight.desk, at));
-        if arrived {
-            self.flight = None;
-            // Straight on to the next, if the machine got further ahead while
-            // this one was being drawn.
-            self.take_off(now);
+        if !arrived {
+            return None;
         }
-        self.cursor
+        self.flight = None;
+        let reached = self.landing.take();
+        // Straight on to the next, if the machine got further ahead while
+        // this one was being drawn.
+        self.take_off(now);
+        reached
     }
 
     /// Begin drawing the next stop, if the cursor is free and one is waiting.
@@ -196,6 +226,7 @@ impl Trail {
             return;
         }
         let Some(stop) = self.pending.pop_front() else { return };
+        self.landing = stop.press.clone();
         let from = match self.cursor {
             Some((desk, at)) if desk == stop.desk => at,
             _ => self.home,
@@ -245,12 +276,12 @@ mod tests {
         // The rule that lets an agent in a background agentdesk run at the
         // speed of the machine: its actions cost no animation at all.
         let mut trail = watching();
-        trail.push(2, (100, 100));
-        trail.push(2, (200, 200));
+        trail.push(2, (100, 100), None);
+        trail.push(2, (200, 200), None);
         assert!(!trail.busy(), "a workspace off screen queued something");
 
         // And the one on screen still does.
-        trail.push(1, (100, 100));
+        trail.push(1, (100, 100), None);
         assert!(trail.busy());
     }
 
@@ -258,7 +289,7 @@ mod tests {
     fn switching_away_throws_the_queue_away() {
         let mut trail = watching();
         for n in 1..=5 {
-            trail.push(1, (n * 100, 0));
+            trail.push(1, (n * 100, 0), None);
         }
         assert!(trail.busy());
 
@@ -270,7 +301,7 @@ mod tests {
         // missed: a person wants to see what it is doing now.
         trail.follow(Some(1));
         assert!(!trail.busy());
-        trail.push(1, (10, 10));
+        trail.push(1, (10, 10), None);
         assert!(trail.busy());
     }
 
@@ -279,7 +310,7 @@ mod tests {
         // `follow` is called whenever the screen is examined, not only when
         // it changes, so repeating it must not throw work away.
         let mut trail = watching();
-        trail.push(1, (500, 0));
+        trail.push(1, (500, 0), None);
         trail.follow(Some(1));
         assert!(trail.busy());
     }
@@ -291,7 +322,7 @@ mod tests {
         let mut trail = watching();
         let places: Vec<(i32, i32)> = (1..=50).map(|n| (n * 17 % 1000, n * 23 % 700)).collect();
         for at in &places {
-            trail.push(1, *at);
+            trail.push(1, *at, None);
         }
 
         let mut now = Instant::now();
@@ -318,13 +349,13 @@ mod tests {
         let start = Instant::now();
 
         let mut alone = watching();
-        alone.push(1, (1000, 0));
+        alone.push(1, (1000, 0), None);
         alone.tick(start);
         let unhurried = alone.flight.expect("a flight").duration;
 
         let mut behind = watching();
         for _ in 0..12 {
-            behind.push(1, (1000, 0));
+            behind.push(1, (1000, 0), None);
         }
         behind.tick(start);
         let hurried = behind.flight.expect("a flight").duration;
@@ -340,26 +371,72 @@ mod tests {
         let mut trail = watching();
 
         // Crossing the whole workspace alone is the maximum.
-        trail.push(1, (1000, 0));
+        trail.push(1, (1000, 0), None);
         trail.tick(start);
         assert_eq!(trail.flight.expect("a flight").duration, trail.pace.max);
 
         // Going nowhere is the minimum rather than nothing: a flight is also
         // how a human sees that an action happened at all.
         let mut trail = watching();
-        trail.push(1, (0, 0));
+        trail.push(1, (0, 0), None);
         trail.tick(start);
         assert_eq!(trail.flight.expect("a flight").duration, trail.pace.min);
+    }
+
+    #[test]
+    fn the_cursor_stays_where_it_stopped() {
+        // An agent that has finished working has not left the machine, and a
+        // pointer that vanishes the moment it stops moving is one nobody can
+        // find again.
+        let start = Instant::now();
+        let mut trail = watching();
+        trail.push(1, (300, 400), None);
+        trail.tick(start);
+        let landed = start + Duration::from_secs(1);
+        trail.tick(landed);
+        assert!(!trail.busy());
+
+        // Long after everything is drawn, it is still there.
+        for later in 1..20 {
+            trail.tick(landed + Duration::from_secs(later));
+            assert_eq!(trail.cursor(), Some((1, (300, 400))), "the cursor vanished");
+        }
+
+        // It goes when the workspace does, because that is another desk's.
+        trail.follow(Some(2));
+        assert_eq!(trail.cursor(), None);
+    }
+
+    #[test]
+    fn a_press_is_answered_when_the_cursor_gets_there() {
+        // The event fired the instant the intent arrived. The flash is the
+        // part a human is meant to see, so it belongs at the end of the
+        // flight: a button lighting up before the cursor reaches it is what
+        // made this look wrong.
+        let start = Instant::now();
+        let mut trail = watching();
+        let press = Press { client: 7, key: "send".into() };
+        trail.push(1, (900, 0), Some(press.clone()));
+
+        assert_eq!(trail.tick(start), None, "pressed before setting off");
+        let duration = trail.flight.expect("a flight").duration;
+        let half = start + duration / 2;
+        assert_eq!(trail.tick(half), None, "pressed in mid-air");
+        assert_eq!(trail.tick(start + duration), Some(press), "no press on arrival");
+
+        // And only once.
+        assert_eq!(trail.tick(start + duration + Duration::from_millis(1)), None);
     }
 
     #[test]
     fn the_cursor_arrives_where_it_was_sent() {
         let start = Instant::now();
         let mut trail = watching();
-        trail.push(1, (300, 400));
+        trail.push(1, (300, 400), None);
         trail.tick(start);
         let end = start + trail.flight.expect("a flight").duration;
-        assert_eq!(trail.tick(end), Some((1, (300, 400))));
+        trail.tick(end);
+        assert_eq!(trail.cursor(), Some((1, (300, 400))));
         assert!(!trail.busy());
     }
 }
