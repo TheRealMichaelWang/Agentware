@@ -51,6 +51,26 @@ use crate::{DESK_FD_ENV, Decoder, encode};
 
 pub const MSG_BACKEND: &str = "backend";
 pub const MSG_HISTORY: &str = "history";
+/// One installed application: the name `open-app` takes, the label a human
+/// sees, and what it is for. One frame each.
+///
+/// The agent had no way to learn any of this and it cost a whole turn to find
+/// out. `query apps` answers with what is *open*, which is the wrong question
+/// when nothing is open yet, so an agent asked for a spreadsheet guessed at
+/// `awspreadsheet`, was told it did not open, and guessed again until the
+/// human stopped it. Nothing it could have called would have told it that the
+/// application is called `awsheet`.
+///
+/// The description is the same sentence the start menu puts under a tile,
+/// which is what makes this worth more than a list of names: `awsheet` is a
+/// guess, and "A spreadsheet. Reads and writes CSV files, one open file per
+/// tab." is an answer.
+///
+/// It comes down the turn channel rather than off the agent wire because the
+/// agentdesk already reads the directory for its own launcher, and because it
+/// is a property of the machine at the moment the turn starts rather than
+/// something that changes while one runs.
+pub const MSG_INSTALLED: &str = "installed";
 pub const MSG_PROMPT: &str = "prompt";
 pub const MSG_TELEMETRY: &str = "telemetry";
 pub const MSG_OPEN_APP: &str = "open-app";
@@ -111,14 +131,41 @@ pub const BACKENDS: &[BackendConfig] = &[
         backend: "claude",
         model: "claude-haiku-4-5",
     },
+    // The one entry that names no model, because on this machine there is
+    // only ever one loaded: a model is tens of gigabytes and the memory holds
+    // one at a time, so which one it is belongs in settings beside the
+    // wallpaper, not in a per-conversation selector that could ask for a
+    // second. What the conversation chooses is local or hosted.
+    BackendConfig {
+        id: "local",
+        label: "Local",
+        backend: "openai",
+        model: "local",
+    },
 ];
 
-/// What a fresh agentdesk runs until told otherwise.
+/// What a fresh agentdesk runs when the machine can reach a hosted model.
 pub const DEFAULT_BACKEND: &str = "claude-opus-5";
+
+/// The model on the machine itself.
+pub const LOCAL_BACKEND: &str = "local";
 
 /// The configuration an id names, if it is one from the table.
 pub fn backend_config(id: &str) -> Option<&'static BackendConfig> {
     BACKENDS.iter().find(|config| config.id == id)
+}
+
+/// What a fresh agentdesk starts on.
+///
+/// A machine with no API key cannot run a hosted model at all, so defaulting
+/// to one there is defaulting to an error message: the first thing a person
+/// sends is answered by a sentence about the Settings app. The model on the
+/// machine is what such a machine can actually do, and it needs nothing
+/// entered before it works. Either way the selector is right there, and this
+/// only decides which entry it starts on.
+pub fn default_backend(hosted_key: bool) -> &'static BackendConfig {
+    let id = if hosted_key { DEFAULT_BACKEND } else { LOCAL_BACKEND };
+    backend_config(id).unwrap_or(&BACKENDS[0])
 }
 
 /// Who said a line of the conversation.
@@ -145,6 +192,17 @@ pub struct Message {
     pub text: String,
 }
 
+/// One application this machine has, as the agent is told about it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstalledApp {
+    /// What `open-app` takes.
+    pub name: String,
+    /// What a human sees under the icon.
+    pub label: String,
+    /// What it is for, in the application's own words.
+    pub description: String,
+}
+
 /// Everything a turn starts with, as read off the channel.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Context {
@@ -154,6 +212,9 @@ pub struct Context {
     /// The id of the configuration to run with; [`DEFAULT_BACKEND`] if the
     /// agentdesk did not say.
     pub backend: String,
+    /// The applications installed on this machine. Empty if the agentdesk did
+    /// not say, which an older one would not.
+    pub installed: Vec<InstalledApp>,
 }
 
 /// Something the agent sent up while working.
@@ -204,6 +265,7 @@ impl Turn {
     pub fn context(&mut self) -> io::Result<Context> {
         let mut history = Vec::new();
         let mut backend = DEFAULT_BACKEND.to_owned();
+        let mut installed = Vec::new();
         loop {
             let fields = self.next_frame()?;
             match fields.first().map(String::as_str) {
@@ -216,11 +278,17 @@ impl Turn {
                     role: fields.get(1).cloned().unwrap_or_default(),
                     text: fields.get(2).cloned().unwrap_or_default(),
                 }),
+                Some(MSG_INSTALLED) => installed.push(InstalledApp {
+                    name: fields.get(1).cloned().unwrap_or_default(),
+                    label: fields.get(2).cloned().unwrap_or_default(),
+                    description: fields.get(3).cloned().unwrap_or_default(),
+                }),
                 Some(MSG_PROMPT) => {
                     return Ok(Context {
                         history,
                         prompt: fields.get(1).cloned().unwrap_or_default(),
                         backend,
+                        installed,
                     });
                 }
                 // Something a future agentdesk says that this agent does not
@@ -289,11 +357,20 @@ impl Channel {
     /// agent that has not read its context yet is one that has not started
     /// doing anything, so a full buffer here would mean an agent that never
     /// started at all, which the write error reports.
-    pub fn send_context(&mut self, history: &[Message], prompt: &str, backend: &str) -> io::Result<()> {
+    pub fn send_context(
+        &mut self,
+        history: &[Message],
+        prompt: &str,
+        backend: &str,
+        installed: &[InstalledApp],
+    ) -> io::Result<()> {
         let mut bytes = Vec::new();
         bytes.extend(encode(&[MSG_BACKEND, backend]));
         for message in history {
             bytes.extend(encode(&[MSG_HISTORY, &message.role, &message.text]));
+        }
+        for app in installed {
+            bytes.extend(encode(&[MSG_INSTALLED, &app.name, &app.label, &app.description]));
         }
         bytes.extend(encode(&[MSG_PROMPT, prompt]));
         self.stream.set_nonblocking(false)?;

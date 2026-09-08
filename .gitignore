@@ -7,3 +7,4 @@ system.img
 sysroot/
 # The state volume is this machine's, like a disk. Made by `make run`.
 state.img
+__pycache__/

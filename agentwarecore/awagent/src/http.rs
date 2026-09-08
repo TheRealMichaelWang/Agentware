@@ -27,14 +27,158 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// than this while the model works; a silence this long is a dead connection.
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// One HTTPS POST. Returns the status and a reader over the decoded body.
-pub fn post(host: &str, path: &str, headers: &[(&str, &str)], body: &[u8]) -> io::Result<Response> {
-    let stream = connect(host)?;
+/// What a request travels over: TLS to an API on the internet, or plain TCP
+/// to a model server on the other side of the machine.
+///
+/// Both exist because both are real. The hosted backend talks to a public API
+/// and must be encrypted; the local backend talks to a server on the same
+/// host, over a loopback the packets never leave, where TLS would buy nothing
+/// and cost a certificate nobody can issue for `10.0.2.2`.
+enum Wire {
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+    Plain(TcpStream),
+}
 
-    let mut request = format!(
-        "POST {path} HTTP/1.1\r\nhost: {host}\r\ncontent-length: {}\r\nconnection: close\r\n",
-        body.len()
-    );
+impl Read for Wire {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Wire::Tls(stream) => stream.read(buf),
+            Wire::Plain(stream) => stream.read(buf),
+        }
+    }
+}
+
+impl Write for Wire {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Wire::Tls(stream) => stream.write(buf),
+            Wire::Plain(stream) => stream.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Wire::Tls(stream) => stream.flush(),
+            Wire::Plain(stream) => stream.flush(),
+        }
+    }
+}
+
+/// The connection to one host, and the reader buffered over it.
+type Stream = BufReader<Wire>;
+
+/// A client for one host, which keeps its connection between requests.
+///
+/// This exists because of what an agentic loop actually does: a turn is not
+/// one request, it is one request per tool-using exchange, ten of them in a
+/// busy turn, back to back and seconds apart. Connecting each time pays DNS,
+/// a TCP handshake and a TLS handshake per exchange for a connection that was
+/// alive and idle a moment earlier. The TLS configuration is built once and
+/// shared, so rustls can resume a session even when a connection genuinely
+/// has to be remade.
+pub struct Client {
+    host: String,
+    port: u16,
+    /// The TLS configuration, or `None` for a plain connection.
+    tls: Option<Arc<rustls::ClientConfig>>,
+    /// The live connection, when the last response left one usable.
+    idle: Option<Stream>,
+}
+
+impl Client {
+    /// A client that speaks HTTPS to a host on port 443.
+    pub fn https(host: &str) -> io::Result<Client> {
+        let roots = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        };
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(io::Error::other)?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        Ok(Client {
+            host: host.to_owned(),
+            port: 443,
+            tls: Some(Arc::new(config)),
+            idle: None,
+        })
+    }
+
+    /// A client that speaks plain HTTP to a host and port.
+    pub fn http(host: &str, port: u16) -> Client {
+        Client { host: host.to_owned(), port, tls: None, idle: None }
+    }
+
+    /// One HTTPS POST. Returns the status and a reader over the decoded body.
+    pub fn post(
+        &mut self,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> io::Result<Response> {
+        let host = authority(&self.host, self.port, self.tls.is_some());
+        let request = head_for(&host, path, headers, body.len());
+
+        // A kept connection the server has since timed out fails on the write
+        // or inside the response head and looks like nothing else, so one
+        // retry on a fresh connection is the whole of what recovery means
+        // here. The request is not resent over a connection that answered:
+        // only over one that never spoke at all.
+        if let Some(Ok(response)) =
+            self.idle.take().map(|stream| send(stream, request.as_bytes(), body))
+        {
+            return Ok(response);
+        }
+        send(BufReader::new(self.connect()?), request.as_bytes(), body)
+    }
+
+    /// Keep the connection under a finished response, if it can be kept.
+    ///
+    /// A response abandoned half-read cannot be: the next request would read
+    /// this one's tail and call it a status line.
+    pub fn recycle(&mut self, response: Response) {
+        self.idle = response.keep_alive.then(|| response.body.drained()).flatten();
+    }
+
+    /// The stream to the host, ready for bytes.
+    fn connect(&self) -> io::Result<Wire> {
+        let address = (self.host.as_str(), self.port)
+            .to_socket_addrs()?
+            .next()
+            .ok_or_else(|| io::Error::other(format!("{} did not resolve", self.host)))?;
+        let tcp = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT)?;
+        tcp.set_read_timeout(Some(READ_TIMEOUT))?;
+        tcp.set_write_timeout(Some(CONNECT_TIMEOUT))?;
+        // Nagle's algorithm holds a small write back waiting for company. A
+        // request is one write and then a wait for the answer, so there is
+        // never any company and the delay is pure.
+        let _ = tcp.set_nodelay(true);
+
+        let Some(config) = &self.tls else {
+            return Ok(Wire::Plain(tcp));
+        };
+        let name = rustls::pki_types::ServerName::try_from(self.host.clone())
+            .map_err(|_| io::Error::other(format!("{} is not a valid server name", self.host)))?;
+        let connection =
+            rustls::ClientConnection::new(Arc::clone(config), name).map_err(io::Error::other)?;
+        Ok(Wire::Tls(Box::new(rustls::StreamOwned::new(connection, tcp))))
+    }
+
+    /// The host and port, for an error message that says where it was trying
+    /// to go.
+    pub fn address(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+}
+
+/// The request head, up to but not including the body.
+fn head_for(host: &str, path: &str, headers: &[(&str, &str)], length: usize) -> String {
+    // No `connection` header: HTTP/1.1 keeps the connection alive unless one
+    // end says otherwise, and this end never wants to.
+    let mut request =
+        format!("POST {path} HTTP/1.1\r\nhost: {host}\r\ncontent-length: {length}\r\n");
     for (name, value) in headers {
         request.push_str(name);
         request.push_str(": ");
@@ -42,56 +186,33 @@ pub fn post(host: &str, path: &str, headers: &[(&str, &str)], body: &[u8]) -> io
         request.push_str("\r\n");
     }
     request.push_str("\r\n");
-
-    let mut stream = stream;
-    stream.write_all(request.as_bytes())?;
-    stream.write_all(body)?;
-    stream.flush()?;
-
-    let mut reader = BufReader::new(stream);
-    let (status, headers) = read_head(&mut reader)?;
-
-    let body: Body<_> = if header(&headers, "transfer-encoding")
-        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
-    {
-        Body::Chunked(ChunkedReader::new(reader))
-    } else if let Some(length) = header(&headers, "content-length").and_then(|v| v.parse().ok()) {
-        Body::Sized { reader, remaining: length }
-    } else {
-        // No framing declared: the body runs to the close of the connection,
-        // which `connection: close` asked for anyway.
-        Body::ToEnd(reader)
-    };
-
-    Ok(Response { status, body })
+    request
 }
 
-/// The TLS stream to a host, ready for bytes.
-fn connect(host: &str) -> io::Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>> {
-    let address = (host, 443u16)
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| io::Error::other(format!("{host} did not resolve to an address")))?;
-    let tcp = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT)?;
-    tcp.set_read_timeout(Some(READ_TIMEOUT))?;
-    tcp.set_write_timeout(Some(CONNECT_TIMEOUT))?;
+/// Write one request down a stream and read its head back.
+fn send(mut stream: Stream, request: &[u8], body: &[u8]) -> io::Result<Response> {
+    stream.get_mut().write_all(request)?;
+    stream.get_mut().write_all(body)?;
+    stream.get_mut().flush()?;
 
-    let roots = rustls::RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    let (status, headers) = read_head(&mut stream)?;
+    // A server may decline to keep the connection whatever the client wants.
+    let keep_alive = !header(&headers, "connection")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("close"));
+
+    let body = if header(&headers, "transfer-encoding")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
+    {
+        Body::Chunked(ChunkedReader::new(stream))
+    } else if let Some(length) = header(&headers, "content-length").and_then(|v| v.parse().ok()) {
+        Body::Sized { reader: stream, remaining: length }
+    } else {
+        // No framing declared: the body runs to the close of the connection,
+        // whatever either end said about keeping it.
+        Body::ToEnd(stream)
     };
-    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .map_err(io::Error::other)?
-    .with_root_certificates(roots)
-    .with_no_client_auth();
 
-    let name = rustls::pki_types::ServerName::try_from(host.to_owned())
-        .map_err(|_| io::Error::other(format!("{host} is not a valid server name")))?;
-    let connection =
-        rustls::ClientConnection::new(Arc::new(config), name).map_err(io::Error::other)?;
-    Ok(rustls::StreamOwned::new(connection, tcp))
+    Ok(Response { status, keep_alive, body })
 }
 
 /// The status line and headers, up to the blank line.
@@ -131,7 +252,19 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
 /// framing, so a caller can stream server-sent events line by line.
 pub struct Response {
     pub status: u16,
-    body: Body<BufReader<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>>,
+    /// Whether the server is willing to keep the connection afterwards.
+    keep_alive: bool,
+    body: Body<Stream>,
+}
+
+/// The `host` header for a client. A port that is not the scheme's default
+/// belongs in it, because a server routing by name needs to be told.
+fn authority(host: &str, port: u16, tls: bool) -> String {
+    if (tls && port == 443) || (!tls && port == 80) {
+        host.to_owned()
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 impl Response {
@@ -141,6 +274,22 @@ impl Response {
         let mut text = String::new();
         Read::read_to_string(self, &mut text)?;
         Ok(text)
+    }
+
+    /// Read whatever framing follows a payload a caller stopped reading at,
+    /// so the connection underneath can be kept.
+    ///
+    /// A server-sent event stream ends at an event the reader recognises,
+    /// with a few bytes of chunk framing still behind it; without those the
+    /// response is half-read and the connection has to be thrown away. A body
+    /// whose end *is* the connection's close is left alone: there is nothing
+    /// to read there that would not be a wait for the peer to hang up.
+    pub fn drain(&mut self) {
+        if matches!(self.body, Body::ToEnd(_)) {
+            return;
+        }
+        let mut scratch = [0u8; 256];
+        while matches!(self.body.read(&mut scratch), Ok(got) if got > 0) {}
     }
 }
 
@@ -155,6 +304,20 @@ enum Body<R: Read> {
     Chunked(ChunkedReader<R>),
     Sized { reader: R, remaining: usize },
     ToEnd(R),
+}
+
+impl<R: Read> Body<R> {
+    /// The reader under a body that has been read to its end, or `None` when
+    /// bytes of this response are still on the wire.
+    fn drained(self) -> Option<R> {
+        match self {
+            Body::Chunked(reader) => reader.done.then_some(reader.inner),
+            Body::Sized { reader, remaining } => (remaining == 0).then_some(reader),
+            // The close of the connection is the end of this body, so there
+            // is by definition nothing left to keep.
+            Body::ToEnd(_) => None,
+        }
+    }
 }
 
 impl<R: Read> Read for Body<R> {
@@ -354,6 +517,49 @@ mod tests {
         let mut reader = ChunkedReader::new(Cursor::new(&wire[..]));
         let mut text = String::new();
         assert!(reader.read_to_string(&mut text).is_err());
+    }
+
+    #[test]
+    fn a_body_read_to_its_end_gives_its_connection_back() {
+        let wire = b"4\r\nWiki\r\n0\r\n\r\n";
+        let mut body = Body::Chunked(ChunkedReader::new(Cursor::new(&wire[..])));
+        let mut text = String::new();
+        body.read_to_string(&mut text).unwrap();
+        assert_eq!(text, "Wiki");
+        assert!(body.drained().is_some());
+    }
+
+    #[test]
+    fn a_half_read_body_does_not() {
+        // Stopping at the payload, which is what an event reader does when it
+        // meets the event it was waiting for, leaves framing on the wire. The
+        // next request down that connection would read this one's tail and
+        // call it a status line, so the connection has to be thrown away
+        // unless something reads the rest first.
+        let wire = b"4\r\nWiki\r\n0\r\n\r\n";
+        let mut body = Body::Chunked(ChunkedReader::new(Cursor::new(&wire[..])));
+        body.read_exact(&mut [0u8; 4]).unwrap();
+        assert!(body.drained().is_none());
+
+        let mut body = Body::Sized { reader: Cursor::new(&b"hello"[..]), remaining: 5 };
+        body.read_exact(&mut [0u8; 2]).unwrap();
+        assert!(body.drained().is_none());
+
+        // A body whose end is the connection's close can never be kept.
+        assert!(Body::ToEnd(Cursor::new(&b""[..])).drained().is_none());
+    }
+
+    #[test]
+    fn requests_ask_to_keep_the_connection() {
+        let head = head_for("api.example", "/v1/messages", &[("x-api-key", "k")], 12);
+        assert!(head.starts_with("POST /v1/messages HTTP/1.1\r\n"));
+        assert!(head.contains("host: api.example\r\n"));
+        assert!(head.contains("content-length: 12\r\n"));
+        assert!(head.contains("x-api-key: k\r\n"));
+        // HTTP/1.1 keeps the connection unless one end says otherwise, and
+        // this end never wants to.
+        assert!(!head.to_ascii_lowercase().contains("connection:"));
+        assert!(head.ends_with("\r\n\r\n"));
     }
 
     #[test]

@@ -19,7 +19,9 @@ use std::io::Read;
 
 use serde_json::{Value, json};
 
-use crate::backend::{Assistant, Backend, BackendError, Block, Delta, ModelMessage, Role, Stop, ToolDef};
+use crate::backend::{
+    Assistant, Backend, BackendError, Block, Delta, ModelMessage, Role, Stop, ToolDef, Usage,
+};
 use crate::http::{self, SseReader};
 
 const HOST: &str = "api.anthropic.com";
@@ -48,11 +50,19 @@ pub struct Claude {
     /// which workspace. Absent rather than empty, so the header is either
     /// right or not sent: an empty one is a 400 of its own.
     workspace: Option<String>,
+    /// The connection to the API, kept between the exchanges of a turn.
+    client: http::Client,
 }
 
 impl Claude {
-    pub fn new(key: String, model: String, workspace: Option<String>) -> Claude {
-        Claude { key, model, workspace }
+    pub fn new(
+        key: String,
+        model: String,
+        workspace: Option<String>,
+    ) -> Result<Claude, BackendError> {
+        let client = http::Client::https(HOST)
+            .map_err(|err| BackendError::new(format!("could not set up TLS: {err}")))?;
+        Ok(Claude { key, model, workspace, client })
     }
 }
 
@@ -77,15 +87,27 @@ impl Backend for Claude {
 
         let mut delay = BACKOFF;
         for attempt in 1..=ATTEMPTS {
-            let outcome = match http::post(HOST, PATH, &headers, body.as_bytes()) {
+            let outcome = match self.client.post(PATH, &headers, body.as_bytes()) {
                 Ok(mut response) if response.status == 200 => {
                     // The stream is not retried: deltas already handed to the
                     // harness are already in the pane.
-                    return consume_stream(&mut response, on);
+                    let result = consume_stream(&mut response, on);
+                    if result.is_ok() {
+                        // The event stream ends before the chunk framing
+                        // does; reading the rest is what leaves this
+                        // connection ready for the next exchange.
+                        response.drain();
+                        self.client.recycle(response);
+                    }
+                    return result;
                 }
                 Ok(mut response) => {
                     let status = response.status;
                     let message = api_error(&mut response);
+                    // An error body is small and read whole, so the
+                    // connection is still good and a retry can go straight
+                    // down it.
+                    self.client.recycle(response);
                     match status {
                         401 | 403 => Err(BackendError::new(format!(
                             "the API rejected the key ({message}). Check it in Settings, on the Agent page"
@@ -137,6 +159,31 @@ fn request_body(model: &str, system: &str, messages: &[ModelMessage], tools: &[T
         })
         .collect();
 
+    let mut conversation: Vec<Value> = messages.iter().map(message_json).collect();
+
+    // A second cache breakpoint, at the end of the conversation.
+    //
+    // Within a turn every exchange is a strict prefix extension of the one
+    // before it: the assistant's answer and the tool results are appended and
+    // nothing earlier changes. Marking the end means the next exchange finds
+    // the whole of this one already prefilled, which over a ten-exchange turn
+    // is the difference between prefilling a growing conversation ten times
+    // and prefilling only what was added. Across turns it reaches back
+    // through the history the agentdesk resends, which is the same prefix
+    // again.
+    //
+    // The system block keeps a breakpoint of its own rather than relying on
+    // this one: it is the single prefix identical for every turn on the
+    // machine, and a conversation breakpoint that expires must not take it
+    // down with it.
+    if let Some(block) = conversation
+        .last_mut()
+        .and_then(|message| message["content"].as_array_mut())
+        .and_then(|blocks| blocks.last_mut())
+    {
+        block["cache_control"] = json!({"type": "ephemeral"});
+    }
+
     let mut body = json!({
         "model": model,
         "max_tokens": MAX_TOKENS,
@@ -147,7 +194,7 @@ fn request_body(model: &str, system: &str, messages: &[ModelMessage], tools: &[T
             "cache_control": {"type": "ephemeral"},
         }],
         "tools": tools,
-        "messages": messages.iter().map(message_json).collect::<Vec<Value>>(),
+        "messages": conversation,
     });
 
     // Adaptive thinking, with the summarized display that gives the pane
@@ -224,6 +271,8 @@ fn consume_stream(reader: &mut dyn Read, on: &mut dyn FnMut(Delta)) -> Result<As
     let mut events = SseReader::new(reader);
     let mut partials: Vec<Partial> = Vec::new();
     let mut stop: Option<Stop> = None;
+    let mut usage = Usage::default();
+    let count = |value: &Value| value.as_u64().unwrap_or(0) as u32;
 
     loop {
         let event = match events.next_event() {
@@ -235,6 +284,16 @@ fn consume_stream(reader: &mut dyn Read, on: &mut dyn FnMut(Delta)) -> Result<As
             .map_err(|err| BackendError::new(format!("the stream sent something unreadable: {err}")))?;
 
         match event.event.as_str() {
+            // What the prompt cost, and how much of it the API served from
+            // cache rather than prefilling. This is the number the caching
+            // work is judged by, so it is read rather than assumed.
+            "message_start" => {
+                let reported = &data["message"]["usage"];
+                usage.input = count(&reported["input_tokens"]);
+                usage.cache_read = count(&reported["cache_read_input_tokens"]);
+                usage.cache_write = count(&reported["cache_creation_input_tokens"]);
+                usage.output = count(&reported["output_tokens"]);
+            }
             "content_block_start" => {
                 let block = &data["content_block"];
                 let partial = match block["type"].as_str().unwrap_or("") {
@@ -297,6 +356,11 @@ fn consume_stream(reader: &mut dyn Read, on: &mut dyn FnMut(Delta)) -> Result<As
                 }
             }
             "message_delta" => {
+                // The final output count. What message_start carried was the
+                // count before the model had written anything.
+                if data["usage"]["output_tokens"].is_number() {
+                    usage.output = count(&data["usage"]["output_tokens"]);
+                }
                 if let Some(reason) = data["delta"]["stop_reason"].as_str() {
                     stop = Some(match reason {
                         "end_turn" => Stop::EndTurn,
@@ -312,7 +376,7 @@ fn consume_stream(reader: &mut dyn Read, on: &mut dyn FnMut(Delta)) -> Result<As
                 let message = data["error"]["message"].as_str().unwrap_or("no detail given");
                 return Err(BackendError::new(format!("the API reported an error mid-stream: {message}")));
             }
-            // message_start, ping, content_block_stop, and anything newer.
+            // ping, content_block_stop, and anything newer.
             _ => {}
         }
     }
@@ -338,7 +402,7 @@ fn consume_stream(reader: &mut dyn Read, on: &mut dyn FnMut(Delta)) -> Result<As
         })
         .collect();
 
-    Ok(Assistant { content, stop })
+    Ok(Assistant { content, stop, usage })
 }
 
 #[cfg(test)]
@@ -392,6 +456,46 @@ mod tests {
     }
 
     #[test]
+    fn the_end_of_the_conversation_is_a_cache_breakpoint() {
+        let messages = vec![
+            ModelMessage::user_text("add 12 and 34"),
+            ModelMessage {
+                role: Role::Assistant,
+                content: vec![Block::ToolUse {
+                    id: "toolu_1".into(),
+                    name: "act".into(),
+                    input: json!({}),
+                }],
+            },
+            ModelMessage {
+                role: Role::User,
+                content: vec![
+                    Block::ToolResult { id: "toolu_1".into(), content: "done".into(), is_error: false },
+                    Block::Text("and here is what changed".into()),
+                ],
+            },
+        ];
+        let body = request_body("claude-opus-5", "be helpful", &messages, &[]);
+
+        // The last block of the last message, and nothing before it: one
+        // breakpoint covers every token ahead of it, so a second inside the
+        // conversation would only spend one of the four the API allows.
+        assert_eq!(body["messages"][2]["content"][1]["cache_control"]["type"], "ephemeral");
+        assert!(body["messages"][2]["content"][0].get("cache_control").is_none());
+        assert!(body["messages"][1]["content"][0].get("cache_control").is_none());
+        assert!(body["messages"][0]["content"][0].get("cache_control").is_none());
+        // The system block keeps its own, so an expired conversation
+        // breakpoint does not take the one prefix every turn shares with it.
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn an_empty_conversation_has_nothing_to_mark() {
+        let body = request_body("claude-opus-5", "be helpful", &[], &[]);
+        assert_eq!(body["messages"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
     fn haiku_runs_without_adaptive_thinking() {
         let body = request_body("claude-haiku-4-5", "s", &[], &[]);
         assert!(body.get("thinking").is_none());
@@ -438,6 +542,38 @@ mod tests {
             Block::ToolUse { id: "toolu_9".into(), name: "act".into(), input: json!({"app": "awcalc"}) }
         );
         assert_eq!(deltas, ["think:open the calc", "text:Adding now.", "tool:act"]);
+    }
+
+    #[test]
+    fn usage_is_read_off_the_stream() {
+        // message_start carries the prompt's cost and an output count from
+        // before the model wrote anything; message_delta carries the real one.
+        let wire = concat!(
+            "event: message_start\ndata: {\"message\":{\"usage\":{\"input_tokens\":31,\
+             \"cache_read_input_tokens\":11804,\"cache_creation_input_tokens\":902,\
+             \"output_tokens\":1}}}\n\n",
+            "event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"end_turn\"},\
+             \"usage\":{\"output_tokens\":214}}\n\n",
+            "event: message_stop\ndata: {}\n\n",
+        );
+        let assistant = consume_stream(&mut wire.as_bytes(), &mut |_| {}).unwrap();
+        assert_eq!(
+            assistant.usage,
+            Usage { input: 31, output: 214, cache_read: 11804, cache_write: 902 }
+        );
+    }
+
+    #[test]
+    fn a_stream_that_reports_no_usage_reports_zero() {
+        // Not an error and not a guess: a backend that says nothing about
+        // tokens leaves the counts at zero, and the harness names the backend
+        // beside them so a zero can be read for what it is.
+        let wire = concat!(
+            "event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+            "event: message_stop\ndata: {}\n\n",
+        );
+        let assistant = consume_stream(&mut wire.as_bytes(), &mut |_| {}).unwrap();
+        assert_eq!(assistant.usage, Usage::default());
     }
 
     #[test]

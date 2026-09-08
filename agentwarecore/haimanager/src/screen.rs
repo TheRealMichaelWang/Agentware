@@ -160,13 +160,54 @@ fn resize_band() -> i32 { ui::sc(7) }
 /// Smaller than this and a window is all chrome.
 fn min_window() -> (i32, i32) { (ui::sc(320), ui::sc(200)) }
 
-/// How long the fake cursor takes to travel to what an agent named.
+/// How long the fake cursor takes to cross the whole workspace.
 ///
 /// Long enough for a human to follow, which is the entire point of it. An agent
 /// that acted instantly would be indistinguishable from one that had never
 /// shown its work, and the visible embodiment VISION.md promises would be a
 /// claim rather than something on screen.
+///
+/// It is the cost of the *longest* flight rather than of every flight. A fixed
+/// duration means a cursor already sitting on its target spends six hundred
+/// milliseconds travelling nowhere, which an agent filling three fields of a
+/// form pays three times over for movement nobody can see. What a human
+/// follows is the movement, so what should be constant is the speed.
 const FLIGHT: Duration = Duration::from_millis(600);
+
+/// The shortest a flight can be, however close the target.
+///
+/// Not zero, because the flight is also the moment that says a new action has
+/// begun: the cursor settling before a control sinks is how two acts on one
+/// control read as two rather than as a flicker.
+const FLIGHT_MIN: Duration = Duration::from_millis(120);
+
+/// How much of the usual pacing an action gets when more are already waiting
+/// behind it.
+///
+/// The ceremony is for a human following a deliberate act, and a run of six
+/// is not six of those, it is one sequence. Watching a sequence performed at
+/// full ceremony is watching a progress bar: the information is "six things
+/// happened, in this order", and that reads perfectly well at a third of the
+/// pace, while the full pace reads as the machine being slow.
+///
+/// This is the whole reason the harness pipelines its actions. An agent that
+/// waited for each outcome before sending the next left the queue empty by
+/// construction, so there was never anything here to notice.
+const HURRIED: f32 = 0.35;
+
+/// How long the cursor should take to cover `distance` pixels of a workspace
+/// `span` pixels wide, with `waiting` actions already queued behind it.
+fn flight_time(from: (i32, i32), to: (i32, i32), span: i32, waiting: bool) -> Duration {
+    let distance = (((to.0 - from.0) as f32).powi(2) + ((to.1 - from.1) as f32).powi(2)).sqrt();
+    // Proportional to the width of the room it is crossing, so the pacing is
+    // the same at every resolution and interface scale without a constant
+    // saying so.
+    let share = (distance / span.max(1) as f32).clamp(0.0, 1.0);
+    let pace = if waiting { HURRIED } else { 1.0 };
+    // The floor is hurried too, or a run of actions on one control costs the
+    // same as a run spread across the screen.
+    FLIGHT.mul_f32(share).max(FLIGHT_MIN).mul_f32(pace)
+}
 
 /// How long the conversation pane takes to fold away or return.
 const PANE_FOLD: Duration = Duration::from_millis(200);
@@ -211,6 +252,9 @@ struct Flight {
     from: (i32, i32),
     to: (i32, i32),
     started: Instant,
+    /// How long this particular flight takes, which depends on how far it
+    /// goes. See [`flight_time`].
+    duration: Duration,
     stage: Stage,
 }
 
@@ -2099,6 +2143,7 @@ impl Screen {
             from: from_point,
             to,
             started: Instant::now(),
+            duration: flight_time(from_point, to, self.regions().apps.w, !self.queued.is_empty()),
             stage: Stage::Travelling,
         });
         true
@@ -2154,7 +2199,7 @@ impl Screen {
         match flight.stage {
             Stage::Travelling => {
                 let elapsed = flight.started.elapsed();
-                if elapsed >= FLIGHT {
+                if elapsed >= flight.duration {
                     self.land(fonts);
                     return showing;
                 }
@@ -2162,7 +2207,7 @@ impl Screen {
                 // Eased, because a pointer that moves at a constant speed and
                 // stops dead does not read as a pointer. Travel only moves the
                 // overlay: the scene under the flying cursor is not changing.
-                let t = elapsed.as_secs_f32() / FLIGHT.as_secs_f32();
+                let t = elapsed.as_secs_f32() / flight.duration.as_secs_f32();
                 let eased = 1.0 - (1.0 - t).powi(3);
                 let x = flight.from.0 + ((flight.to.0 - flight.from.0) as f32 * eased) as i32;
                 let y = flight.from.1 + ((flight.to.1 - flight.from.1) as f32 * eased) as i32;
@@ -2223,8 +2268,13 @@ impl Screen {
             return true;
         }
 
+        // Typing keeps its own pace, hurried the same way a flight is when
+        // more actions are already waiting. Every character is still its own
+        // event, which is the part that is a guarantee; how fast they are
+        // painted is the part that is presentation.
+        let pace = if self.queued.is_empty() { KEYSTROKE } else { KEYSTROKE.mul_f32(HURRIED) };
         if let Some(flight) = &mut self.flight {
-            flight.stage = Stage::Typing { done: done + 1, next: Instant::now() + KEYSTROKE };
+            flight.stage = Stage::Typing { done: done + 1, next: Instant::now() + pace };
         }
         true
     }
@@ -3194,6 +3244,44 @@ mod tests {
             assert!(read > 0, "the connection closed with nothing said");
             decoder.feed(&buf[..read]);
         }
+    }
+
+    #[test]
+    fn a_flight_costs_what_it_covers() {
+        let span = 2000;
+        let alone = |from, to, span| flight_time(from, to, span, false);
+        // Crossing the whole workspace is the full flight; it is the cap, not
+        // the price of every move.
+        assert_eq!(alone((0, 0), (2000, 0), span), FLIGHT);
+        // Further than the workspace is wide still costs the cap: a diagonal
+        // is longer than a side, and a cursor is not slower for going corner
+        // to corner.
+        assert_eq!(alone((0, 0), (2000, 2000), span), FLIGHT);
+        // Half the width is half the time.
+        assert_eq!(alone((100, 50), (1100, 50), span), FLIGHT / 2);
+        // Twice on the same control is the floor, not six hundred
+        // milliseconds of travelling nowhere. This is the whole point.
+        assert_eq!(alone((400, 300), (400, 300), span), FLIGHT_MIN);
+        assert_eq!(alone((400, 300), (410, 300), span), FLIGHT_MIN);
+        // A workspace with no width yet cannot divide by it.
+        assert_eq!(alone((0, 0), (10, 0), 0), FLIGHT);
+    }
+
+    #[test]
+    fn a_queue_is_performed_as_a_sequence() {
+        let span = 2000;
+        // Every distance is hurried when something is waiting, the floor
+        // included: a run of actions on one control would otherwise cost what
+        // a run across the screen costs.
+        for (from, to) in [((0, 0), (2000, 0)), ((0, 0), (1000, 0)), ((400, 300), (400, 300))] {
+            let alone = flight_time(from, to, span, false);
+            let hurried = flight_time(from, to, span, true);
+            assert_eq!(hurried, alone.mul_f32(HURRIED), "{from:?} to {to:?}");
+            assert!(hurried < alone);
+        }
+        // Hurried, not skipped. An action nobody can see happen is an action
+        // the human cannot follow, which is the one thing the cursor is for.
+        assert!(flight_time((0, 0), (0, 0), span, true) >= Duration::from_millis(30));
     }
 
     const SHEET: &str = "<window title=\"Sheet\" pad=\"none\">\

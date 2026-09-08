@@ -217,6 +217,10 @@ pub struct Surface {
     /// Sheets the compositor could not follow and wants from the beginning.
     /// Drained by [`Surface::resend`].
     resend: Vec<String>,
+    /// Whether the caller has asked for non-blocking reads.
+    ///
+    /// Tracked because writes must not inherit it. See [`Surface::send`].
+    nonblocking: bool,
 }
 
 impl Surface {
@@ -230,7 +234,13 @@ impl Surface {
         // SAFETY: the supervisor created this descriptor before forking us and
         // named it in our environment. Nothing else in this process owns it.
         let stream = unsafe { UnixStream::from_raw_fd(raw) };
-        Ok(Self { stream, decoder: Decoder::with_limit(MAX_TREE), version: 0, resend: Vec::new() })
+        Ok(Self {
+            stream,
+            decoder: Decoder::with_limit(MAX_TREE),
+            version: 0,
+            resend: Vec::new(),
+            nonblocking: false,
+        })
     }
 
     /// The version of the most recently sent tree.
@@ -289,7 +299,7 @@ impl Surface {
         ];
         fields.extend(values.iter().map(|value| (*value).to_owned()));
         let borrowed: Vec<&str> = fields.iter().map(String::as_str).collect();
-        self.stream.write_all(&encode(&borrowed))
+        self.send(&encode(&borrowed))
     }
 
     /// Send the whole current interface. Returns the version it was stamped
@@ -297,7 +307,7 @@ impl Surface {
     pub fn render(&mut self, awml: &str) -> io::Result<u64> {
         self.version += 1;
         let version = self.version.to_string();
-        self.stream.write_all(&encode(&[MSG_RENDER, &version, awml]))?;
+        self.send(&encode(&[MSG_RENDER, &version, awml]))?;
         Ok(self.version)
     }
 
@@ -307,8 +317,34 @@ impl Surface {
     /// An agentdesk cannot: it is also listening to its agent and to a clock, so
     /// it polls this alongside the rest and pulls events with
     /// [`Surface::pump`].
-    pub fn set_nonblocking(&self, on: bool) -> io::Result<()> {
-        self.stream.set_nonblocking(on)
+    pub fn set_nonblocking(&mut self, on: bool) -> io::Result<()> {
+        self.stream.set_nonblocking(on)?;
+        self.nonblocking = on;
+        Ok(())
+    }
+
+    /// Write a frame whole, whatever the socket is set to for reading.
+    ///
+    /// A client that polls its descriptor sets it non-blocking to read, and
+    /// that setting is the socket's rather than the read's, so a write large
+    /// enough to fill the buffer came back `EAGAIN` and looked exactly like a
+    /// dead connection. It cost an agentdesk: a conversation of fifty
+    /// exchanges made a tree bigger than the socket could take in one go, the
+    /// desk logged "could not send a tree" and exited, and PID 1 tore the
+    /// whole workspace down around it, agent and applications included. The
+    /// bug needed a long session to appear, so nothing shorter had found it.
+    ///
+    /// Blocking for the write is the same trade `Turn::send_context` already
+    /// makes. The compositor reads continuously, so this waits for a buffer
+    /// to drain rather than for anybody to decide anything.
+    fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if !self.nonblocking {
+            return self.stream.write_all(bytes);
+        }
+        self.stream.set_nonblocking(false)?;
+        let result = self.stream.write_all(bytes);
+        let restored = self.stream.set_nonblocking(true);
+        result.and(restored)
     }
 
     /// Read whatever the compositor has sent without waiting for more.

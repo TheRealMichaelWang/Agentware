@@ -97,12 +97,33 @@ pub enum Stop {
     Other(String),
 }
 
-/// The completed assistant turn: everything the model said, and why it
-/// stopped saying it.
+/// What one exchange cost, as the backend reports it.
+///
+/// Every field is what the endpoint said, not what this code worked out, and
+/// a backend that reports nothing leaves it zero. That distinction matters:
+/// the instrumentation prints these, and a zero that means "not reported" and
+/// a zero that means "nothing cached" look the same in a log, so the harness
+/// says which backend produced the line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Usage {
+    /// Prompt tokens that were prefilled.
+    pub input: u32,
+    /// Tokens the model produced, thinking included.
+    pub output: u32,
+    /// Prompt tokens served from cache rather than prefilled. The number the
+    /// whole caching effort is judged by.
+    pub cache_read: u32,
+    /// Prompt tokens written into the cache by this exchange.
+    pub cache_write: u32,
+}
+
+/// The completed assistant turn: everything the model said, why it stopped
+/// saying it, and what it cost.
 #[derive(Debug)]
 pub struct Assistant {
     pub content: Vec<Block>,
     pub stop: Stop,
+    pub usage: Usage,
 }
 
 impl Assistant {

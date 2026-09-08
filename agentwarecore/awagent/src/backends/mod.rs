@@ -8,6 +8,17 @@
 //! nothing in the harness changes.
 
 pub mod claude;
+pub mod openai;
+
+/// Where the local model server listens.
+///
+/// The host across the guest's slirp NIC, which is where llama-server runs
+/// while the inference service is still being built and measured. It becomes
+/// a service in PID 1's table with a socket handed over at fork, at which
+/// point this constant goes; until then it is a development address and says
+/// so rather than pretending to be configuration.
+const LOCAL_HOST: &str = "10.0.2.2";
+const LOCAL_PORT: u16 = 8080;
 
 use awproto::settings::Settings;
 use awproto::turn;
@@ -35,12 +46,25 @@ pub fn from_config(id: &str, settings: &Settings) -> Result<Box<dyn Backend>, St
             // The workspace goes with the key, not with the model: it says
             // where an identity-linked key acts, and is `None` for an
             // ordinary one, which already says so itself.
-            Ok(Box::new(claude::Claude::new(
+            let claude = claude::Claude::new(
                 key.clone(),
                 config.model.to_owned(),
                 settings.anthropic_workspace.clone(),
-            )))
+            )
+            .map_err(|err| err.message)?;
+            Ok(Box::new(claude))
         }
+        "openai" => Ok(Box::new(openai::OpenAi::new(
+            LOCAL_HOST,
+            LOCAL_PORT,
+            config.model.to_owned(),
+            // Thinking off. It is where the tokens go, and on a local model
+            // tokens are the whole cost of an exchange; it is also what a
+            // draft model predicts worst, so it loses at both ends. Measured
+            // on this machine: acceptance 0.97 on a tool call and 0.52 on
+            // reasoning.
+            false,
+        ))),
         other => Err(format!("the {other} backend is not built yet")),
     }
 }

@@ -748,12 +748,119 @@ The same trick covers voice: QEMU can present an emulated audio device, so
 `awvoice`, the wake word routing and the compositor's side of it can all be
 built and proven before the real ALC623 is ever touched.
 
+## What has since been measured
+
+The numbers below replace guesses this document used to carry. All of them come
+from the Qwen3.8-27B dense model at Q5_K_XL, on llama.cpp with the Vulkan
+backend, on this machine, driven by `tools/modelbench.py` on the host and by a
+real turn in the guest reading `tools/screenshot.py`'s serial log. The turn
+instrumentation that reports them is in `awagent`, and the guest reached the
+model over slirp at `10.0.2.2`, which is the arrangement this document proposed
+and which works.
+
+| | measured |
+| --- | --- |
+| generation, no speculation | 11.0 tok/s |
+| generation, MTP draft at depth 4 | **33.9 tok/s** (3.05x) |
+| draft acceptance on a tool call | 0.97 to 1.00, mean accepted length at the cap |
+| draft acceptance on reasoning | 0.52 |
+| prefill, 1.4k to 5k tokens | 222 to 234 tok/s |
+| prefill, 9.5k tokens | 202 tok/s |
+| prefill, 18.5k tokens | 134 tok/s |
+| one exchange, warm slot | 3.1s prefill + 1.5s generation |
+| new tokens prefilled per exchange | ~560, almost all of it the re-read view |
+
+Four things follow, and three of them were not what this document expected.
+
+**Speculation is worth more than anything else available, and the reason is
+exactly the one predicted here.** A tool call is structured output whose ids
+are copied verbatim out of the context, and the draft head predicts it almost
+perfectly: acceptance is 0.97 to 1.00 and every drafted token is taken. Free
+reasoning is the opposite, at 0.52. So thinking loses twice on a local model,
+once on the tokens it spends and once on being the part that cannot be
+speculated. Depth 4 is the plateau; depth 8 is measurably worse, because the
+drafting itself costs more than the acceptance returns.
+
+**Prefill, not generation, is the dominant cost of an exchange**, and this
+document had it the other way round. Two thirds of an exchange is prefilling
+the ~560 new tokens, of which about 500 is the fresh view the harness attaches
+after an action. Speculation does nothing for prefill. A better model is the
+only lever on it.
+
+**The automatic re-read survives the measurement, which is worth saying because
+it looked like the obvious thing to cut.** It costs ~2.8s of prefill per
+action. Cutting it does not save that: the model then has to ask for the view
+with `read_app`, which is a whole extra exchange *plus* the same prefill, about
+9.8s against 4.6s. The decision was made for exchange count over token count
+and it holds even where tokens are what cost.
+
+**Batching is the largest free win in the system, and it is one paragraph of
+the system prompt.** Told it *may* issue several tool calls, this model issues
+one, every time. Told it *should*, and that each extra message is a wait the
+human sits through, it issues all six, correctly ordered, every time. Measured
+on the same real turn, end to end in the guest:
+
+| | one call per message | batched |
+| --- | --- | --- |
+| turn wall clock | 44.5s | **25.4s** |
+| exchanges for 6 actions | 9 | **4** |
+| median gap between actions | 5.01s | **0.24s** |
+
+The gap between actions inside a batch is the compositor alone, which is what
+this document said the pacing should be. It is only true inside a batch.
+
+## The sparse model, measured
+
+The comparison this document called for, and which the plan made the first
+experiment of Phase 3, has been run. The model is **Qwen3.6-35B-A3B** at
+UD-Q5_K_XL: 35B total, about 3B active, 40 layers of which only every fourth
+is full attention, with an MTP block in the same file. It answers the question
+by a wider margin than the arithmetic predicted.
+
+| | dense 27B + MTP draft | 35B-A3B + embedded MTP |
+| --- | --- | --- |
+| generation | 33.9 tok/s | **94.8 tok/s** |
+| prefill | 220 tok/s | **677 tok/s** |
+| draft acceptance on a tool call | 0.975 | **1.000** (225 of 225) |
+| pinned memory, 32k context | ~22 GiB | 28.1 GiB |
+| pinned memory, 128k context | did not fit | **30.5 GiB** |
+| the same real turn, end to end | 25.4s | **11.9s** |
+
+Three things follow.
+
+**Context stopped being the binding constraint.** Going from 32k to 128k costs
+2.5 GiB, because only ten of forty layers keep a growing KV at all and the rest
+hold a recurrent state that does not grow. The dense model's 32k ceiling was
+the thing this document treated as fixed and designed the slot budget around;
+it was a property of that model, not of the machine.
+
+**It follows instructions better, which is worth as much as the speed.** The
+dense model needed the system prompt to insist before it would batch its tool
+calls. This one batches on the permissive wording, which means the largest
+free win found on the dense model is one this model would have given for
+nothing.
+
+**The failure that looked like "the model is too big" was loading it twice.**
+Its MTP block lives inside the model file, so naming that file with `-md`
+loads a second complete copy: 50.6 GiB of a 61 GiB machine, taking the desktop
+with it. `--spec-type draft-mtp` with no `-md` uses the block in place for
+1.6 GiB. The memory arithmetic that matters on this machine is in CLAUDE.md's
+gotchas, because GTT is pinned system RAM and nothing about it is separate
+from anything else.
+
 ## Open questions
 
 * **Does llama.cpp build against musl with the Vulkan loader?** This is now the
   only unknown that changes the shape of the design rather than a number in it.
   If it wants glibc, either `awinference` becomes the one glibc component or it
   becomes ours sooner.
+* **Would a sparse model close the remaining gap?** This is now the first
+  question rather than one of many, because the measurements say the model
+  class is the only thing left that moves prefill. The arithmetic for a
+  30B-A3B at Q4: about an eighth of the bandwidth per generated token, and
+  about an eighth of the prefill FLOPs, which would put an exchange near a
+  second instead of near five. Nothing here tests it, because the only local
+  model on this machine is the dense one.
 * **Do slot save and restore work with the Vulkan backend and a quantized KV
   cache, and how long do they take for a slot of a few gigabytes?** The whole
   three-tier design rests on a restore being a second or two rather than six. If
@@ -763,13 +870,15 @@ built and proven before the real ALC623 is ever touched.
   document assumes the former, which is what makes the memory floor a guarantee
   rather than a hope. If allocation is lazier than assumed, the slot count can be
   more generous than the arithmetic here suggests.
-* **Is a sparse model actually better here than the dense 27B that is known to
-  work?** The arithmetic says yes by a wide margin. The one measurement that
-  exists says the dense model is already survivable. Only a comparison settles
-  it, and it should compare context degradation as well as tokens per second,
-  because that is the constraint that turned out to bind.
-* **How much thinking does a turn actually need?** One experiment, and both the
-  latency and the context budget depend on the answer.
+* **How much does turning thinking off cost in correctness?** It is off on the
+  local path now, because the measurements make it expensive twice over, and
+  the one task tried works without it. One task is not evidence: this needs
+  the task suite, which is what Phase 2 of the plan is for.
+* **Does batching break anything when an action in the middle of a batch is
+  rejected?** The later actions still run, against a screen the model did not
+  anticipate. Every outcome comes back, so the model can recover, and this is
+  no worse than a human clicking quickly. It has not been tested, and a batch
+  that walks into a dialog is exactly the case the suite should carry.
 * **Is the compositor single-output?** The difference between a laptop panel and
   real display handling is not visible from inside QEMU's invented monitor.
 * **What runs on the NPU, in practice?** The driver is bound and the device is

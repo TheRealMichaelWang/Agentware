@@ -67,6 +67,14 @@ QEMU := qemu-system-x86_64 -enable-kvm -m 4G -cpu host \
 # addresses. Static rather than DHCP, so boot does not wait on a lease.
 NET_ARGS := ip=10.0.2.15::10.0.2.2:255.255.255.0:agentware:eth0:off
 
+# /dev/kmsg is rate limited to about ten messages per five seconds without
+# this, and the eleventh line of a burst does not arrive late, it is dropped
+# and nothing says so. Every timing log in the system is a burst by nature:
+# the compositor's per-second `frames:` line, and the agent's per-exchange and
+# per-action accounting. Measuring against a log that silently loses lines is
+# how a number gets believed that was never there.
+LOG_ARGS := printk.devkmsg=on
+
 # The state volume: the one thing that outlives a boot. A small ext4 image the
 # supervisor mounts at /state, where settings.xml lives. Made once, kept across
 # `make clean`, and never shipped: it is this machine's, the way a disk is.
@@ -265,7 +273,7 @@ configure_anthropic_key: $(STATE_IMG)
 run: pack $(STATE_IMG)
 	@echo "==> Booting Agentware fullscreen: guest $(DISPLAY_W)x$(DISPLAY_H), host desktop $(if $(HOST_PX),$(HOST_PX),unknown). Ctrl+Alt+F to un-fullscreen."
 	$(QEMU) $(STATE_DRIVE) -display gtk,zoom-to-fit=on,full-screen=on,show-cursor=off -serial stdio \
-		-append "console=tty0 console=ttyS0,115200 $(NET_ARGS)"
+		-append "console=tty0 console=ttyS0,115200 $(NET_ARGS) $(LOG_ARGS)"
 
 # Headless boot that exercises the supervisor end to end and powers itself off.
 #

@@ -145,6 +145,45 @@ def qmp_tablet(path, fx, fy, click=""):
             time.sleep(0.05 if click in ("double", "triple") else 0.1)
 
 
+# What the monitor's `sendkey` calls each key that is not a letter or a digit.
+# Shifted characters are the unshifted key with `shift-` in front, which is
+# what a keyboard actually does and what the guest's keymap expects to see.
+KEY_NAMES = {
+    " ": "spc", "-": "minus", "=": "equal", "[": "bracket_left",
+    "]": "bracket_right", "\\": "backslash", ";": "semicolon",
+    "'": "apostrophe", ",": "comma", ".": "dot", "/": "slash", "`": "grave_accent",
+    "\n": "ret", "\t": "tab",
+}
+SHIFTED = {
+    "!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6", "&": "7",
+    "*": "8", "(": "9", ")": "0", "_": "minus", "+": "equal", "{": "bracket_left",
+    "}": "bracket_right", "|": "backslash", ":": "semicolon", '"': "apostrophe",
+    "<": "comma", ">": "dot", "?": "slash", "~": "grave_accent",
+}
+
+
+def keystrokes(text):
+    """The `sendkey` commands that type `text`.
+
+    A monitor has no command that takes a string, and an agent turn starts
+    with a sentence, so every capture that drives one has to spell it out.
+    Characters this cannot name are skipped rather than guessed at: a prompt
+    missing a character is a visible fault, and a wrong key is a silent one.
+    """
+    for character in text:
+        if character.isalnum() and character.isascii():
+            if character.isupper():
+                yield "sendkey shift-%s" % character.lower()
+            else:
+                yield "sendkey %s" % character
+        elif character in SHIFTED:
+            yield "sendkey shift-%s" % SHIFTED[character]
+        elif character in KEY_NAMES:
+            yield "sendkey %s" % KEY_NAMES[character]
+        else:
+            print("cannot type %r, skipping it" % character, file=sys.stderr)
+
+
 def read_ppm(path):
     """Parse a binary PPM (P6). QEMU writes nothing else."""
     with open(path, "rb") as handle:
@@ -204,7 +243,10 @@ def main():
     parser.add_argument("output")
     parser.add_argument("--seconds", type=float, default=6.0,
                         help="how long to let the guest boot before capturing")
-    parser.add_argument("--append", default="console=ttyS0,115200",
+    # printk.devkmsg=on by default: without it /dev/kmsg drops everything past
+    # about ten messages per five seconds, silently, and a capture is exactly
+    # the case where nobody is watching the log to notice.
+    parser.add_argument("--append", default="console=ttyS0,115200 printk.devkmsg=on",
                         help="kernel command line")
     parser.add_argument("--serial", default=None,
                         help="where to write the serial log")
@@ -249,7 +291,9 @@ def main():
         # place of "click" are the halves of one, which is how a drag is
         # driven (press at one place, move, let go at another), and "right"
         # is the other button, and "double" and "triple" are two and three
-        # presses close enough together to count as one gesture.
+        # presses close enough together to count as one gesture. "type WORDS"
+        # spells a sentence out as keystrokes, which is how a capture drives
+        # an agent turn: the monitor has no command that takes a string.
         for command in args.do:
             # "sleep N" waits between injected inputs, for gestures that need
             # the guest to catch up: an agent turn, an app being forked.
@@ -261,6 +305,12 @@ def main():
                 qmp_tablet(qmp_path, float(parts[1]), float(parts[2]),
                            parts[3] if len(parts) > 3 else "")
                 time.sleep(0.3)
+            elif command.startswith("type "):
+                # Everything after the one space, so leading spaces in the
+                # text survive and the sentence is typed as written.
+                for stroke in keystrokes(command[len("type "):]):
+                    monitor_command(monitor_path, stroke)
+                    time.sleep(0.03)
             else:
                 monitor_command(monitor_path, command)
         if args.do:

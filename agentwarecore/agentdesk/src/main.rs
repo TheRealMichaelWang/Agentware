@@ -79,6 +79,10 @@ struct Installed {
     name: String,
     /// What people see. `name.txt` if the package has one, else the folder.
     label: String,
+    /// What it is for. Already required to be non-empty, since a package
+    /// without one is a self-test stand-in rather than an application; kept
+    /// now because the agent is told it too, and a name alone is a guess.
+    description: String,
 }
 
 /// One line of the pane.
@@ -262,8 +266,7 @@ impl Desk {
             lines: Vec::new(),
             history: Vec::new(),
             composing: String::new(),
-            backend: turn::backend_config(turn::DEFAULT_BACKEND)
-                .unwrap_or(&turn::BACKENDS[0]),
+            backend: turn::default_backend(stored.anthropic_key.is_some()),
             backend_open: false,
             queued: Vec::new(),
             turn: None,
@@ -360,7 +363,22 @@ impl Desk {
         match self.ask(|broker| broker.start_agent(desk)) {
             Ok((pid, stream)) => match Channel::new(stream) {
                 Ok(mut channel) => {
-                    if let Err(err) = channel.send_context(&self.history, &prompt, self.backend.id) {
+                    // What is installed goes down with the prompt. The desk
+                    // already reads the directory for its own launcher, and
+                    // an agent that has to guess an application's name will
+                    // guess wrong and keep guessing.
+                    let installed: Vec<turn::InstalledApp> = self
+                        .installed
+                        .iter()
+                        .map(|app| turn::InstalledApp {
+                            name: app.name.clone(),
+                            label: app.label.clone(),
+                            description: app.description.clone(),
+                        })
+                        .collect();
+                    if let Err(err) =
+                        channel.send_context(&self.history, &prompt, self.backend.id, &installed)
+                    {
                         self.status = format!("could not brief the agent: {err}");
                         self.note(self.status.clone());
                         log(&self.status);
@@ -792,7 +810,11 @@ fn installed_apps() -> Vec<Installed> {
                 return None;
             }
             let label = read("name.txt");
-            Some(Installed { label: if label.is_empty() { name.clone() } else { label }, name })
+            Some(Installed {
+                label: if label.is_empty() { name.clone() } else { label },
+                name,
+                description,
+            })
         })
         .collect();
     apps.sort_by(|a, b| a.label.cmp(&b.label));

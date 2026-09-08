@@ -6,12 +6,13 @@
 //! ```text
 //!   query  apps                              agent -> haimanager
 //!   query  view <app>
-//!   query  rows <app> <table> <first-row>
+//!   query  cells <app> <sheet> <range>
 //!   query  clipboard
 //!   intent <app> <action> <target> [value]
 //!
 //!   apps      <awml>                         haimanager -> agent
 //!   view      <app> <awml>
+//!   cells     <app> <sheet> <rows>
 //!   clipboard <kind> <content>
 //!   done      <app> <target> <action>
 //!   rejected  <app> <target> <reason>
@@ -56,16 +57,16 @@
 //!
 //! ## Reading a collection too large to send
 //!
-//! A table holds a window rather than a sheet: its rows are the ones the
-//! application chose to describe, and ten thousand of them are neither sent
-//! nor wanted. `query rows` is how an agent reads a different part of one.
+//! A spreadsheet's cells are not in its view: a screenful of a grid is four
+//! hundred of them, and four hundred elements carrying a description and an
+//! action list each is forty kilobytes to learn twenty numbers. `query cells`
+//! is how an agent reads the part it wants, by naming a rectangle.
 //!
-//! It is a query rather than an action because it is a read, and because
-//! there is nothing to act on: a cell outside the window is not in the tree,
-//! so an intent naming it has no target to resolve. The compositor asks the
-//! application to move its window and answers with the view once it has,
-//! within a bounded wait. An application that ignores the request costs the
-//! agent one stale view whose `first-row` says plainly that nothing moved.
+//! It is a query rather than an action because it is a read, and it asks the
+//! application nothing at all: the compositor holds the sheet, published to
+//! it on its own frames, so the answer is a lookup rather than a round trip
+//! and a wait. The element in the view says how far the sheet runs and where
+//! anything has been put in it, which is what tells an agent what to ask for.
 //!
 //! ## Scrolling is not an action
 //!
@@ -289,7 +290,40 @@ impl Link {
     /// intents faster than they can be performed would be asking for actions
     /// against a screen it has not seen the result of.
     pub fn act(&mut self, app: &str, action: &str, target: &str, value: &str) -> io::Result<Outcome> {
-        let reply = self.round_trip(&[MSG_INTENT, app, action, target, value])?;
+        self.send_intent(app, action, target, value)?;
+        self.next_outcome()
+    }
+
+    /// Send an intent without waiting for its outcome.
+    ///
+    /// The two halves of [`Link::act`] exist apart so a run of actions can be
+    /// **pipelined**: sent one after another, and their outcomes collected
+    /// afterwards in the same order. This is not fire and forget and nothing
+    /// about the answers changes. Each intent is still validated when it
+    /// reaches the front of the compositor's queue, after everything sent
+    /// before it has been performed, and still answers `done` or `rejected`
+    /// truthfully. What goes away is the agent sitting idle between them.
+    ///
+    /// That idling is what made the queue always empty, which is what stopped
+    /// the compositor from ever knowing that more was coming. A compositor
+    /// that can see six actions waiting can perform them at the pace of a
+    /// sequence rather than at the pace of six separate gestures, which is
+    /// the whole point of sending them this way.
+    ///
+    /// The caller must take exactly one outcome per intent sent, in order.
+    pub fn send_intent(
+        &mut self,
+        app: &str,
+        action: &str,
+        target: &str,
+        value: &str,
+    ) -> io::Result<()> {
+        self.stream.write_all(&encode(&[MSG_INTENT, app, action, target, value]))
+    }
+
+    /// The next outcome, for the oldest intent that has not been answered.
+    pub fn next_outcome(&mut self) -> io::Result<Outcome> {
+        let reply = self.await_reply()?;
         match reply.first().map(String::as_str) {
             Some(MSG_DONE) => Ok(Outcome::Done),
             Some(MSG_REJECTED) => {
@@ -301,7 +335,11 @@ impl Link {
 
     fn round_trip(&mut self, fields: &[&str]) -> io::Result<Vec<String>> {
         self.stream.write_all(&encode(fields))?;
+        self.await_reply()
+    }
 
+    /// Block until something that is not a change notice arrives.
+    fn await_reply(&mut self) -> io::Result<Vec<String>> {
         loop {
             if let Some(reply) = self
                 .decoder

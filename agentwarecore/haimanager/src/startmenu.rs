@@ -127,8 +127,12 @@ impl StartMenu {
             prompt: Editing::new(String::new()),
             presses: MultiPress::default(),
             dragging: false,
-            backend: turn::backend_config(turn::DEFAULT_BACKEND)
-                .unwrap_or(&turn::BACKENDS[0]),
+            // Read when the menu opens rather than held, because a key
+            // entered in Settings should change what the next opening starts
+            // on without anything being told about it.
+            backend: turn::default_backend(
+                awproto::settings::Settings::load().anthropic_key.is_some(),
+            ),
             backend_open: false,
             doc: None,
             layout: Layout::empty(),

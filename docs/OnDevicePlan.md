@@ -27,6 +27,43 @@ the plan is unfalsifiable without it.
 largest unknown and most of the plan does not depend on it. So it gets a short
 spike near the front to size it, and the full port happens later.
 
+## Where this has got to
+
+**Phase 0 is done and Phase 1 came with it.** Phase 1 was pulled forward for a
+practical reason: verifying the instrumentation needs a real turn, there is no
+API key on this machine, and there is a model on the host. So the backend seam
+was built early and the instrumentation was proved against a local model rather
+than a hosted one, which is a better first proof anyway.
+
+What exists now, all of it verified by a real turn photographed and logged:
+
+* Per-exchange and per-turn accounting in `awagent`, printed to the kernel log,
+  whose parts add up to the whole within two milliseconds.
+* `printk.devkmsg=on` on every boot path, because without it the log silently
+  drops the lines the accounting is made of.
+* Connection reuse, a cache breakpoint on the conversation, and the prompt
+  fixes.
+* `flight_time`: the cursor's travel is proportional to its distance now.
+* `backends/openai.rs`, and a Local entry in `turn::BACKENDS` that a machine
+  with no API key starts on.
+* `tools/modelbench.py`, the host-side model measurement of Phase 2b.
+* `type` in `tools/screenshot.py`, without which no capture can drive a turn.
+
+The measurements are in OnDevice.md. The two that changed the plan: prefill
+rather than generation is the dominant cost of an exchange, and batching is
+worth more than any other free change, cutting a real turn from 44.5s to 25.4s
+and the gap between actions from 5.01s to 0.24s.
+
+**What this settles about the goal.** The design asks for the first action
+within a second and later actions paced by the cursor. Inside a batch that is
+now true: the gap is 0.24s and it is the compositor. Across a batch boundary it
+is not close, because a model exchange is 4.6s and nothing in the harness can
+make a 27B dense model on 256 GB/s faster than that. A p95 under a second needs
+every exchange under a second, which needs roughly ten times this prefill rate
+and three times this generation rate. That is a different model, not a better
+harness, which is why the sparse comparison is now the first item of Phase 3
+rather than one of several.
+
 ## Phase 0: Instrumentation, and the wins that need no decisions
 
 Everything here pays off immediately against Claude and remains true afterwards.
@@ -202,18 +239,24 @@ Answering the design's open questions. No new architecture, only experiments and
 their conclusions, each of which settles something OnDevice.md currently marks
 as unknown.
 
-* **Dense versus sparse.** The one informal observation is that a dense 27B runs
-  healthily and degrades past 32k. The arithmetic says a 30B-A3B class MoE should
-  be several times faster at generation, several times faster at prefill, and
-  smaller in KV. Compare on pass rate as well as speed, because a faster model
-  that fails tasks is not faster at anything.
+* **Dense versus sparse: answered.** Qwen3.6-35B-A3B at UD-Q5_K_XL is 2.8x the
+  generation, 3.1x the prefill, and takes the same real turn from 25.4s to
+  11.9s. It also holds 128k of context for 2.5 GiB more than 32k, which
+  retires the context ceiling the design was built around. The numbers and the
+  memory trap that came with them are in OnDevice.md. What is **not** answered
+  is pass rate: one task run a handful of times is not evidence, and this
+  model was seen to invent a `read_cells` call against an application with no
+  spreadsheet in it. That is what the Phase 2 suite is for, and it is now the
+  blocking item rather than the model.
 * **Where quality actually falls off with context.** The 32k figure is one
   person's impression. The suite can measure it: run the same tasks with padded
   history at 8k, 16k, 32k, 48k. **This number sets the slot size, the context
   budget and the history trimming threshold**, which the design says should all
   be the same figure.
-* **Thinking on versus off.** Expected to be the single largest token lever, and
-  it is one experiment.
+* **Thinking on versus off.** Half answered: it is the largest token lever and
+  it is now off on the local path, because it also has the worst draft
+  acceptance (0.52 against 0.97 for a tool call) and so loses twice. What is
+  not answered is what it costs in correctness, which needs the task suite.
 * **KV quantization.** q8 and q4 against pass rate. This buys slot count.
 * **Does slot save and restore work with Vulkan and quantized KV**, and how fast.
   The three-tier cache design rests on a restore being a second or two.

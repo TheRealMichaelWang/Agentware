@@ -465,6 +465,117 @@ the agent view exactly as it does on screen, so the one process that could
 echo the key to a model reads asterisks; a turn without a key answers with
 where to set one.
 
+**A turn accounts for its own wall clock, and a model can be local.** Nothing
+in the harness timed itself, so every claim about where a turn's seconds went
+was arithmetic. It now prints a line per exchange (wall clock, time to first
+token, tokens in and out, cache reads) and one per turn whose parts are
+disjoint and add up: `model + acting + reading + waiting + harness`. `acting`
+is the one that isolates the compositor, being everything between an intent
+going out and its answer coming back. Every ending goes through
+`Agent::finish`, so a turn that failed on its second exchange reports its shape
+too. `printk.devkmsg=on` is on every boot path now, because `/dev/kmsg` drops
+past ten lines per five seconds and drops them silently, which is how a
+measurement gets believed that was never taken.
+
+`backends/openai.rs` is the second `Backend`, speaking chat-completions to
+anything that does, and `turn::BACKENDS` gained a **Local** entry that a machine
+with no API key starts on. The one structural difference from the Anthropic
+wire is that tool results are messages of their own rather than blocks of a
+user message, so one `ModelMessage` expands to several. `http::Client` grew a
+plain-HTTP mode for it (a model server on the same machine, over a loopback the
+packets never leave) and now keeps its connection between exchanges, which a
+turn making ten requests was paying a fresh TLS handshake for each time.
+
+What that measured, against Qwen3.8-27B on llama.cpp with Vulkan, driven from
+the guest over slirp: **prefill is the dominant cost of an exchange, not
+generation.** Two thirds of 4.6s is prefilling ~560 new tokens at 220 tok/s,
+almost all of it the view the harness re-reads after an action. Speculative
+decoding with an MTP draft head is worth 3.05x on generation (11.0 to 33.9
+tok/s) because a tool call is ids copied out of the context and the draft
+acceptance is 0.97 to 1.00; free reasoning accepts at 0.52, so thinking loses
+twice and is off on the local path. **The largest free win was one paragraph of
+the system prompt**: told it *may* batch tool calls the model issues one every
+time, told it *should* and that each message is a wait, it issues all six,
+which took a real turn from 44.5s to 25.4s and the gap between actions from
+5.01s to 0.24s. `tools/modelbench.py` is where those numbers come from; the
+design's own numbers are in `docs/OnDevice.md`.
+
+**The agent's cursor travels at a speed, not for a duration.** `FLIGHT` was 600ms
+whatever the distance, so two actions on one control spent 1.2 seconds of
+travelling nowhere. `flight_time` makes it proportional to the workspace's own
+width, capped at `FLIGHT` for crossing the whole thing and floored at
+`FLIGHT_MIN` so a flight still reads as the moment an action begins.
+
+**A run of actions is pipelined, and performed as a sequence.** The harness
+gathers consecutive `act` calls and sends every intent before collecting any
+outcome (`Link::send_intent` and `Link::next_outcome`, the two halves of
+`act`). Nothing about the answers changes: each intent is still validated when
+it reaches the front of the compositor's queue, after everything before it has
+actually been performed, and a rejection is still a rejection. What changes is
+that the compositor can *see* the run. Waiting for each outcome before sending
+the next left `queued` empty by construction, so the compositor had no way to
+tell one deliberate gesture from the first of six and had to pace every one of
+them for the former. It now hurries a flight, and the keystrokes of a
+`type-text`, to `HURRIED` of their usual pace while anything is waiting behind
+them; every character is still its own event, because that is the guarantee,
+while how fast they are painted is presentation. Measured on the same real
+turn: six actions in 695ms rather than 1318ms, and the gap between them a
+107ms median rather than 240ms.
+
+This is as far as the idea goes, and the reason is worth writing down.
+Answering an intent at admission, before performing it, cannot be done
+truthfully: whether action four is legal depends on the state after actions
+one to three, so the answer is not decidable when it would have to be given.
+A batch that walks into a dialog is exactly that case. Pipelining gets the
+compositor the knowledge it was missing without giving up the one-intent,
+one-true-answer rule that rejections-as-answers rests on.
+
+**The agent can find an application by what it is for.** It could not, and a
+benchmark found it the hard way: asked to put text files in a spreadsheet, the
+agent opened the file explorer correctly, then wanted a spreadsheet, guessed
+`awspreadsheet`, was told it did not open, and guessed again for sixty-four
+exchanges until the human stopped it. Nothing it could have called would have
+told it the application is called `awsheet`. `list_apps` answers with what is
+*running*, which is the wrong question when nothing is; `open_app`'s schema
+carried a three-item example list that happened to omit the two newest
+applications.
+
+So `search_apps` takes what you want to do, not what you think it is called,
+and answers with the applications that match, what each one is for, and
+whether it is already open, which settles both questions in one call. It
+matches against name, label and **`description.txt`**, the sentence the start
+menu already puts under each tile: "A spreadsheet. Reads and writes CSV files,
+one open file per tab." was shipped and never shown to the one reader who
+needed it. A query matching nothing lists everything rather than answering
+with nothing, because a dead end is what sends an agent back to guessing.
+
+The list travels down the turn channel as `installed <name> <label>
+<description>`, one frame per application, because the agentdesk already reads
+that directory for its own launcher. `open_app`'s `name` is then a **closed
+enum of what is actually installed**, the same guarantee `act`'s vocabulary
+has and for the same reason: the schema is where a request stops being
+possible rather than where it starts being refused. A name outside it is
+answered at once instead of after five seconds of polling for something that
+was never going to start.
+
+**A turn stops when it stops getting anywhere.** There is still no exchange
+ceiling, deliberately, but sixty-four exchanges of alternating `open_app
+awspreadsheet` and `open_app awcalc` is not a long-running turn, it is a
+stopped one. The harness hashes what each exchange left behind (every tool
+result and the fresh views that rode back) and keeps the set of states this
+turn has reached: an exchange reaching a state never seen before is progress
+and resets the count, and `STUCK` exchanges in a row reaching only states
+already visited ends the turn with an honest reply. `NUDGE` in a row says so
+in the tool result first, because a model going in circles has usually not
+noticed.
+
+Getting the *unit* right took two wrong tries, and both are worth remembering
+because both looked correct. Counting a call by its name and arguments calls a
+directory walk a loop, since `up` is clicked from every folder. Counting
+whether that call changed anything calls it a loop too, since `up` from
+anywhere under `/apps` lands back at `/apps`, an identical state reached
+honestly. Both ask of one call a question only the whole turn can answer.
+
 **The guest has a network, for the agent alone.** QEMU adds a slirp NIC
 (`-netdev user`), the kernel configures it itself from the `ip=` boot
 argument (CONFIG_IP_PNP and CONFIG_VIRTIO_NET were already in the config),
@@ -576,11 +687,14 @@ tools/screenshot.py out.png --seconds 8 --append "console=ttyS0,115200" \
 ```
 
 The tool adds the slirp NIC and the `ip=` boot argument itself, so a capture
-has the same network `make run` has. Photographing a real agent turn needs an
-API key in the state image's `settings.xml`, which `make
+has the same network `make run` has. Photographing a real agent turn on a
+hosted model needs an API key in the state image's `settings.xml`, which `make
 configure_anthropic_key` writes with `debugfs -w` rather than making anyone
-type a secret through the monitor; without one, a message is answered with
-where to set the key, which photographs fine. The
+type a secret through the monitor; **a machine with no key starts on Local
+instead**, so a turn against a model server on the host photographs with no
+secret anywhere. `--do "type Add 12 and 34"` spells a sentence out as
+keystrokes, which is the only way to drive a turn: the monitor has no command
+that takes a string. `--do "sleep 120"` is how a capture waits for one. The
 pointer starts in the middle of the screen and every move is a delta from
 where it is now.
 
@@ -1078,6 +1192,64 @@ them is part of the application catalogue and none reaches an agent.
   timing numbers or mid-gesture captures exist.
 * **printk prints levels strictly below `console_loglevel`.** Setting it to 6
   suppresses level-6 messages.
+* **"You may" and "you should" are different instructions to a model, and the
+  difference was worth 19 seconds a turn.** The system prompt said several
+  tool calls were permitted; the model issued one, every time, on three runs
+  out of three. Rewritten to say it *should* batch and that each extra message
+  is a wait the human sits through, it issued all six, correctly ordered, on
+  three runs out of three. Nothing about the harness changed. Prompt wording
+  is a performance surface and it is worth measuring like one.
+* **A model server on the host is reachable from the guest at `10.0.2.2` with
+  no port forwarding**, because slirp maps the gateway to the host's loopback.
+  So the whole local-inference path can be built and measured inside QEMU
+  against real GPU-backed inference, with no bare metal work at all.
+* **An embedded MTP head must not be named with `-md`, or the model loads
+  twice.** The dense 27B ships its draft as a separate 2.95 GiB file, so
+  `--spec-type draft-mtp -md mtp-....gguf` is the right shape there. The
+  35B-A3B MoE carries its MTP block *inside* the same file (`blk.40.nextn.*`,
+  logged as "unused tensor ... ignoring" when speculation is off), so pointing
+  `-md` at that same file loads a second complete 25.3 GiB copy: 50.6 GiB of a
+  61 GiB machine, which OOMs the desktop and everything on it. `--spec-type
+  draft-mtp` **with no `-md`** uses the block in place and costs 1.6 GiB. The
+  crash reads as "the model is too big" and is nothing of the kind.
+* **GTT on this APU is system RAM, and it is pinned.** The iGPU has 512 MiB of
+  real VRAM and 48 GiB of GTT carved out of the same 61 GiB everything else
+  lives in, so a model "offloaded to the GPU" is competing with the desktop,
+  QEMU's 4 GiB guest and everything else. `mem_info_gtt_used` is the honest
+  number. Reading `MemAvailable` before and after a load is how to size one:
+  the mmap of the file is reclaimable and does not count, so the cost of a
+  load is the pinned copy and nothing else.
+* **`pkill -f` matches the shell running it.** `pkill -f 'llama-server.*8080'`
+  from a command line containing both strings kills the command, not just the
+  server. Use `pkill -x`, or bracket a letter (`'[p]refill.sh'`).
+* **A non-blocking socket is non-blocking for writes too, and `EAGAIN` is not
+  a dead connection.** The agentdesk polls its descriptor, so it sets the
+  surface non-blocking; that setting belongs to the socket, not to the read.
+  `Surface::render` then did `write_all` on it, and a full send buffer came
+  back `Resource temporarily unavailable`, which the desk logged as "could not
+  send a tree" before exiting. PID 1 saw the workspace process go and tore the
+  whole desk down around it, agent and open applications included.
+
+  It is worth being exact about what filled the buffer, because it was not one
+  huge tree and it was not memory. The buffer is the kernel's, a fixed
+  `wmem_default` of 208KB. The desk re-sends its **whole tree** on every
+  render, transcript included, which after fifty exchanges was about 30KB, so
+  roughly seven of them in flight fill it. The agent then emitted **thirteen
+  telemetry frames in three milliseconds** while listing what it had found,
+  the desk rendered several times over in that window, and the compositor was
+  busy enough not to drain them. Length made each tree big enough for a burst
+  to matter; the burst is what did it. Same lesson as the tab drag, in a
+  different subsystem: a paced test cannot catch a burst bug.
+
+  `Surface::send` now writes blocking and restores the flag, which is the
+  trade `Turn::send_context` already made. Verified by the run that found it:
+  49 exchanges killed the desk, 84 exchanges finished the task afterwards.
+
+  The unbounded growth underneath is still there and is a separate thing. At
+  about 110 bytes of markup per pane line, `MAX_TREE`'s one megabyte is
+  roughly nine thousand lines, and every render sends all of them. Windowing
+  the transcript is the known fix and is deliberately not built; see the note
+  about what is left being linear and small.
 * **A cost that grows with use cannot be photographed.** Every capture starts
   from a fresh boot with an empty conversation, so the quadratic line
   breaking and the paint that walked scrolled-away nodes were invisible to
