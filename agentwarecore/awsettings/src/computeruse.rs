@@ -25,23 +25,27 @@ pub const MIN_FIELD: &str = "ui-delay-min";
 pub const MAX_FIELD: &str = "ui-delay-max";
 pub const SAVE: &str = "ui-delay-save";
 
-/// What the human has typed, before it is committed.
+/// The range as it is being adjusted, before it is committed.
 ///
-/// Held as text rather than as numbers because a half-typed "6" on the way to
-/// "600" is not a preference anybody holds, and re-parsing it into the
-/// setting on every keystroke would save it sixty times on the way to one
-/// value. Committed on Enter or the button, like the key beside it.
+/// Two sliders rather than two fields. A duration is a quantity rather than a
+/// name, so the useful question is "a bit longer than that" and the useful
+/// answer is a thumb that moves; nobody knows what 340 milliseconds feels
+/// like until they have tried it. The numbers are shown beside them for the
+/// person who does want to be exact.
+///
+/// Dragging is not saving. A drag is a run of `set-value` events, one per
+/// value the thumb passes, and each save is a synced write to the state
+/// volume; committing every one of them would write the file a hundred times
+/// on the way to one preference. So the thumb moves freely and Save commits,
+/// exactly as the key beside it does.
 pub struct Editing {
-    pub min: String,
-    pub max: String,
+    pub min: Duration,
+    pub max: Duration,
 }
 
 impl Editing {
     pub fn new(pace: Pace) -> Editing {
-        Editing {
-            min: pace.min.as_millis().to_string(),
-            max: pace.max.as_millis().to_string(),
-        }
+        Editing { min: pace.min, max: pace.max }
     }
 
     /// Take an event this section owns. `None` if it is not one of ours.
@@ -51,38 +55,26 @@ impl Editing {
     /// know what else is on the page.
     pub fn accept(&mut self, target: &str, action: &str, value: &str) -> Option<Answer> {
         match (target, action) {
-            (MIN_FIELD, awproto::display::ACTION_TYPE_TEXT) => {
-                self.min = value.to_owned();
-                Some(Answer::Typed)
+            (MIN_FIELD, awproto::display::ACTION_SET_VALUE) => {
+                self.min = millis(value, self.min);
+                Some(Answer::Moved)
             }
-            (MAX_FIELD, awproto::display::ACTION_TYPE_TEXT) => {
-                self.max = value.to_owned();
-                Some(Answer::Typed)
+            (MAX_FIELD, awproto::display::ACTION_SET_VALUE) => {
+                self.max = millis(value, self.max);
+                Some(Answer::Moved)
             }
-            (MIN_FIELD | MAX_FIELD, awproto::display::ACTION_SUBMIT)
-            | (SAVE, awproto::display::ACTION_CLICK) => Some(Answer::Commit(self.parsed())),
+            (SAVE, awproto::display::ACTION_CLICK) => Some(Answer::Commit(self.parsed())),
             _ => None,
         }
     }
 
-    /// The range as typed, with anything unreadable falling back to what is
-    /// stored rather than to zero.
+    /// The range as the thumbs currently stand.
     ///
-    /// `Pace::new` puts the two ends in order and inside the bounds, so no
-    /// pair of numbers a person can type here produces a cursor that
-    /// teleports or one that takes a minute to cross the screen.
+    /// `Pace::new` puts the two ends in order and inside the bounds, so a
+    /// minimum dragged past the maximum is stored as the range a person
+    /// plainly meant rather than refused.
     fn parsed(&self) -> Pace {
-        let fallback = Pace::default();
-        let millis = |text: &str, default: Duration| {
-            text.trim()
-                .parse::<u64>()
-                .map(Duration::from_millis)
-                .unwrap_or(default)
-        };
-        Pace::new(
-            millis(&self.min, fallback.min),
-            millis(&self.max, fallback.max),
-        )
+        Pace::new(self.min, self.max)
     }
 
     /// Put the fields back to what is actually stored, after a save or a
@@ -100,30 +92,35 @@ impl Editing {
              the action has already happened by the time the cursor sets off.</text>\n",
         );
 
+        for (id, label, value, what) in [
+            (MAX_FIELD, "Slowest", self.max, "when nothing else is waiting"),
+            (MIN_FIELD, "Fastest", self.min, "when the cursor is far behind"),
+        ] {
+            let _ = writeln!(
+                out,
+                r#"            <text role="caption" color="muted">{label}: {shown}ms, {what}</text>
+            <slider id="{id}" value="{value}" min="{floor}" max="{ceiling}" step="10" description="Milliseconds one action takes to show {what}, between {floor} and {ceiling}"/>"#,
+                shown = value.as_millis(),
+                value = value.as_millis(),
+                floor = pace::FLOOR.as_millis(),
+                ceiling = pace::CEILING.as_millis(),
+            );
+        }
+
         let _ = writeln!(
             out,
             r#"            <hstack gap="sm">
-              <field id="{MAX_FIELD}" value="{max}" placeholder="600" description="Milliseconds one action takes to show when nothing else is waiting. The slowest the cursor ever moves"/>
-              <field id="{MIN_FIELD}" value="{min}" placeholder="40" description="Milliseconds one action takes to show when the cursor is far behind. The fastest it ever moves"/>
-              <button id="{SAVE}" label="Save" description="Saves both delays as typed"/>
+              <button id="{SAVE}" label="Save" emphasis="primary" description="Saves both delays where the thumbs stand"/>
             </hstack>"#,
-            max = escape(&self.max),
-            min = escape(&self.min),
-        );
-        out.push_str(
-            "            <text role=\"caption\" color=\"muted\">Slowest, then fastest, in \
-             milliseconds.</text>\n",
         );
 
-        // What is stored, said back, because the fields show what was typed
-        // and those are not the same thing until Save.
+        // What is stored, said back, because the thumbs show a draft and
+        // those are not the same thing until Save.
         let _ = writeln!(
             out,
-            r#"            <text role="caption" color="muted">Now: up to {max}ms for a single action, down towards {min}ms as the agent gets ahead of the cursor. Between {floor}ms and {ceiling}ms.</text>"#,
+            r#"            <text role="caption" color="muted">Saved: up to {max}ms for a single action, down towards {min}ms as the agent gets ahead of the cursor.</text>"#,
             max = stored.max.as_millis(),
             min = stored.min.as_millis(),
-            floor = pace::FLOOR.as_millis(),
-            ceiling = pace::CEILING.as_millis(),
         );
         out.push_str("          </vstack>\n        </group>\n");
     }
@@ -131,19 +128,21 @@ impl Editing {
 
 /// What taking an event did.
 pub enum Answer {
-    /// A keystroke. Re-render, save nothing.
-    Typed,
-    /// Enter or the button: this is the range to store.
+    /// A thumb moved. Re-render, save nothing.
+    Moved,
+    /// The button: this is the range to store.
     Commit(Pace),
 }
 
-/// The five XML entities, as everything that writes markup escapes them.
-fn escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+/// Milliseconds out of an event's value, falling back rather than to zero.
+fn millis(value: &str, fallback: Duration) -> Duration {
+    value
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|number| number.is_finite() && *number >= 0.0)
+        .map(|number| Duration::from_millis(number.round() as u64))
+        .unwrap_or(fallback)
 }
 
 #[cfg(test)]
@@ -155,42 +154,55 @@ mod tests {
     }
 
     #[test]
-    fn typing_does_not_commit() {
-        // Every save is a synced write to the state volume, and half a typed
-        // number is not a preference anybody holds.
+    fn dragging_does_not_commit() {
+        // A drag is a run of set-value events, one per value the thumb
+        // passes. Each save is a synced write to the state volume, so
+        // committing every one of them would write the file a hundred times
+        // on the way to one preference.
         let mut editing = Editing::new(Pace::default());
-        assert!(matches!(editing.accept(MAX_FIELD, "type-text", "6"), Some(Answer::Typed)));
-        assert!(matches!(editing.accept(MAX_FIELD, "type-text", "60"), Some(Answer::Typed)));
-        assert_eq!(editing.max, "60");
+        for value in ["600", "590", "580", "570"] {
+            assert!(matches!(
+                editing.accept(MAX_FIELD, "set-value", value),
+                Some(Answer::Moved)
+            ));
+        }
+        assert_eq!(editing.max, ms(570));
     }
 
     #[test]
-    fn enter_and_the_button_commit_the_same_thing() {
+    fn the_button_commits_where_the_thumbs_stand() {
         let mut editing = Editing::new(Pace::default());
-        editing.accept(MIN_FIELD, "type-text", "25");
-        editing.accept(MAX_FIELD, "type-text", "900");
-
-        let by_enter = editing.accept(MIN_FIELD, "submit", "");
-        let by_button = editing.accept(SAVE, "click", "");
-        for answer in [by_enter, by_button] {
-            match answer {
-                Some(Answer::Commit(pace)) => {
-                    assert_eq!(pace, Pace::new(ms(25), ms(900)));
-                }
-                _ => panic!("expected a commit"),
-            }
+        editing.accept(MIN_FIELD, "set-value", "25");
+        editing.accept(MAX_FIELD, "set-value", "900");
+        match editing.accept(SAVE, "click", "") {
+            Some(Answer::Commit(pace)) => assert_eq!(pace, Pace::new(ms(25), ms(900))),
+            _ => panic!("expected a commit"),
         }
     }
 
     #[test]
-    fn nonsense_falls_back_rather_than_saving_zero() {
-        // A field cleared or typed into wrongly must not become a cursor
-        // that teleports; it becomes the default it replaced.
+    fn a_value_that_is_not_a_number_leaves_the_thumb_alone() {
+        // Nothing should be able to make the cursor teleport, whatever
+        // arrives on the wire.
         let mut editing = Editing::new(Pace::default());
-        editing.accept(MIN_FIELD, "type-text", "");
-        editing.accept(MAX_FIELD, "type-text", "soon");
+        let was = editing.max;
+        editing.accept(MAX_FIELD, "set-value", "soon");
+        editing.accept(MAX_FIELD, "set-value", "-40");
+        assert_eq!(editing.max, was);
+    }
+
+    #[test]
+    fn the_ends_are_put_in_order_rather_than_refused() {
+        // A minimum dragged past the maximum is a range a person plainly
+        // meant, not a mistake to reject.
+        let mut editing = Editing::new(Pace::default());
+        editing.accept(MIN_FIELD, "set-value", "900");
+        editing.accept(MAX_FIELD, "set-value", "100");
         match editing.accept(SAVE, "click", "") {
-            Some(Answer::Commit(pace)) => assert_eq!(pace, Pace::default()),
+            Some(Answer::Commit(pace)) => {
+                assert_eq!(pace.min, ms(100));
+                assert_eq!(pace.max, ms(900));
+            }
             _ => panic!("expected a commit"),
         }
     }
@@ -202,7 +214,7 @@ mod tests {
         let mut editing = Editing::new(Pace::default());
         assert!(editing.accept("api-key", "type-text", "sk-ant-x").is_none());
         assert!(editing.accept("api-key-save", "click", "").is_none());
-        assert_eq!(editing.min, Pace::default().min.as_millis().to_string());
+        assert_eq!(editing.min, Pace::default().min);
     }
 
     #[test]
@@ -210,10 +222,13 @@ mod tests {
         // The fields show a draft; the caption has to show the machine's
         // actual answer or there is no way to tell whether Save worked.
         let mut editing = Editing::new(Pace::default());
-        editing.accept(MAX_FIELD, "type-text", "1234");
+        editing.accept(MAX_FIELD, "set-value", "1230");
         let mut out = String::new();
         editing.render(&mut out, Pace::new(ms(40), ms(600)));
-        assert!(out.contains(r#"value="1234""#), "the draft is not in the field");
+        assert!(out.contains(r#"value="1230""#), "the draft is not on the thumb");
         assert!(out.contains("up to 600ms"), "the stored value is not said back");
+        // And it is a slider, with the bounds the setting allows.
+        assert!(out.contains("<slider"), "not a slider");
+        assert!(out.contains(&format!(r#"max="{}""#, pace::CEILING.as_millis())));
     }
 }

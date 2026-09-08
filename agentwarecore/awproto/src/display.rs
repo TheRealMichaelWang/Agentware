@@ -76,6 +76,14 @@ pub const ACTION_CLICK: &str = "click";
 pub const ACTION_TYPE_TEXT: &str = "type-text";
 pub const ACTION_SUBMIT: &str = "submit";
 pub const ACTION_TOGGLE: &str = "toggle";
+/// One number chosen, on an element that holds a range. The value travels as
+/// text like every other value on this wire, and the application parses it.
+///
+/// A human dragging a slider's thumb produces a run of these, one per value
+/// the thumb passes through, exactly as typing produces one `type-text` per
+/// character: an application sees a value moving rather than one that
+/// appeared, and an agent's single `set-value` is one of the same events.
+pub const ACTION_SET_VALUE: &str = "set-value";
 pub const ACTION_SELECT: &str = "select";
 pub const ACTION_DESELECT: &str = "deselect";
 /// A dropdown asked to show or hide its options. The application owns the

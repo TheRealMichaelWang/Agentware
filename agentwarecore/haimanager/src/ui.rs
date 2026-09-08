@@ -1009,6 +1009,7 @@ fn measure(fonts: &Fonts, tree: &Tree, index: usize, width: i32) -> i32 {
         // while it is open and are nowhere while it is not.
         Tag::Option => 0,
         Tag::Checkbox => control_height(fonts, tree, index).max(checkbox_size()),
+        Tag::Slider => crate::slider::natural_height(),
         Tag::Editor => line_height(fonts, tree, index) * EDITOR_LINES + control_pad() * 2,
 
         // A row is as tall as its tallest child, each measured at the width
@@ -1370,7 +1371,7 @@ impl Placer<'_> {
             // with. Containers and text take the row: they have insides that
             // want the room, or centre themselves when painted.
             let mut slot = Rect::new(x, inner.y, width, inner.h);
-            if matches!(node.tag, Tag::Button | Tag::Field | Tag::Select | Tag::Checkbox) {
+            if matches!(node.tag, Tag::Button | Tag::Field | Tag::Select | Tag::Checkbox | Tag::Slider) {
                 // A control with a border all the way round is kept inside
                 // what is actually visible, as well as inside the row. It
                 // only ever differs in a strip of tabs, where the row is a
@@ -1837,7 +1838,7 @@ fn wanted_width(fonts: &Fonts, tree: &Tree, index: usize) -> i32 {
         }
         Tag::Divider if node.attr("dir") == Some("vertical") => DIVIDER,
         Tag::Divider => 0,
-        Tag::Image | Tag::Button | Tag::Field | Tag::Editor | Tag::Checkbox | Tag::Item | Tag::Select => {
+        Tag::Image | Tag::Button | Tag::Field | Tag::Editor | Tag::Checkbox | Tag::Slider | Tag::Item | Tag::Select => {
             natural_width(fonts, tree, index)
         }
         Tag::Option => 0,
@@ -1898,6 +1899,7 @@ fn natural_width(fonts: &Fonts, tree: &Tree, index: usize) -> i32 {
             fonts.measure(label_of(node), &style) + button_pad() * 2 + icon
         }
         Tag::Checkbox => checkbox_size() + 8 + fonts.measure(label_of(node), &style),
+        Tag::Slider => crate::slider::natural_width(),
         Tag::Item | Tag::Option | Tag::MenuItem => {
             fonts.measure(label_of(node), &style) + control_pad() * 2
         }
@@ -2481,6 +2483,12 @@ fn paint_node(
                 let caret_x = x + fonts.measure(prefix(line, column), &style);
                 inner.fill_rect(Rect::new(caret_x, top + row as i32 * step, sc(2).max(2), step), accent());
             });
+        }
+
+        Tag::Slider => {
+            let range = crate::slider::Range::of(node);
+            let value = crate::slider::value_of(node, range);
+            crate::slider::draw(canvas, rect, value, range, focused, disabled);
         }
 
         Tag::Checkbox => {

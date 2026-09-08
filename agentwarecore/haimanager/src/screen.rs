@@ -267,6 +267,9 @@ pub struct Screen {
     /// The client whose scrollbar thumb is being dragged, so pointer motion
     /// keeps reaching it even when the pointer leaves the bar.
     scroll_drag: Option<RawFd>,
+    /// The client whose slider thumb the hand is holding, so motion keeps
+    /// reaching it once the pointer wanders off the track.
+    slider_drag: Option<RawFd>,
     /// The client the pointer is dragging a text selection out of, on the
     /// same terms: a selection that stopped extending the moment the pointer
     /// left the field would be a selection nobody could finish.
@@ -355,6 +358,7 @@ impl Screen {
             notes: Vec::new(),
             drag: None,
             scroll_drag: None,
+            slider_drag: None,
             text_drag: None,
             column_drag: None,
             cell_drag: None,
@@ -985,6 +989,11 @@ impl Screen {
                     client.drag_scroll(fonts, x, y);
                     scene = true;
                 }
+                if let Some(fd) = self.slider_drag
+                    && let Some(client) = self.client_mut(fd)
+                {
+                    scene |= client.drag_slider(fonts, x);
+                }
                 if let Some(fd) = self.text_drag
                     && let Some(client) = self.client_mut(fd)
                 {
@@ -1033,6 +1042,11 @@ impl Screen {
                     && let Some(client) = self.client_mut(fd)
                 {
                     client.end_scroll_drag();
+                }
+                if let Some(fd) = self.slider_drag.take()
+                    && let Some(client) = self.client_mut(fd)
+                {
+                    client.end_slider_drag();
                 }
                 if let Some(fd) = self.text_drag.take()
                     && let Some(client) = self.client_mut(fd)
@@ -1650,19 +1664,23 @@ impl Screen {
     fn note_drags(&mut self, fd: RawFd) {
         // Asked and answered before anything is written, so the borrow on the
         // client ends before the fields it would conflict with are set.
-        let Some((scrolling, selecting, sizing, cells, tab)) = self.client(fd).map(|client| {
+        let Some((scrolling, selecting, sizing, cells, tab, sliding)) = self.client(fd).map(|client| {
             (
                 client.scroll_dragging(),
                 client.selecting(),
                 client.sizing_column(),
                 client.selecting_cells(),
                 client.moving_tab(),
+                client.slider_dragging(),
             )
         }) else {
             return;
         };
         if scrolling {
             self.scroll_drag = Some(fd);
+        }
+        if sliding {
+            self.slider_drag = Some(fd);
         }
         if selecting {
             self.text_drag = Some(fd);

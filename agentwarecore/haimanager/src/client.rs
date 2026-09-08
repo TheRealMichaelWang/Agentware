@@ -52,6 +52,7 @@ use crate::clipboard::Clipboard;
 use crate::document::Document;
 use crate::editmenu;
 use crate::sheet::{self, Sheets};
+use crate::slider;
 use crate::text::{self, Edit, Editing, MultiPress};
 use crate::images::Images;
 use crate::input::{Button, Event, Key};
@@ -185,6 +186,12 @@ pub struct Client {
     /// the thumb it was grabbed, so the thumb tracks the hand rather than
     /// jumping to centre itself under it.
     scroll_drag: Option<(String, i32)>,
+    /// A slider whose thumb the hand is holding, by the node's identity.
+    ///
+    /// Ephemeral like every other drag: the value belongs to the application
+    /// and reaches it as `set-value` events, and this is only the knowledge
+    /// that the next motion is still part of this gesture.
+    slider_drag: Option<String>,
     /// Whether the bar being dragged is the one across. A table has two, and
     /// they share a node, so the axis is what tells them apart.
     scroll_across: bool,
@@ -272,6 +279,7 @@ impl Client {
             caret_on: false,
             scroll_shown: None,
             scroll_drag: None,
+            slider_drag: None,
             scroll_across: false,
             press: None,
         })
@@ -903,6 +911,48 @@ impl Client {
         self.scroll_drag = None;
     }
 
+    /// Whether the hand is holding a slider's thumb.
+    pub fn slider_dragging(&self) -> bool {
+        self.slider_drag.is_some()
+    }
+
+    /// Follow the hand along a slider being dragged.
+    ///
+    /// The value the pointer names is sent as `set-value`, the same event an
+    /// agent's intent produces, through the same `act`. A run of them is what
+    /// a drag is, exactly as a run of `type-text` is what typing is: the
+    /// application sees a value moving rather than one that appeared.
+    pub fn drag_slider(&mut self, fonts: &Fonts, x: i32) -> bool {
+        let Some(key) = self.slider_drag.clone() else { return false };
+        let Some(doc) = &self.doc else { return false };
+        let Some(index) = doc.index_of(&key) else { return false };
+        self.set_slider(fonts, index, x)
+    }
+
+    pub fn end_slider_drag(&mut self) {
+        self.slider_drag = None;
+    }
+
+    /// Send the value the pointer at `x` names, if it is not the one already
+    /// showing.
+    ///
+    /// Nothing is sent for a motion that does not change the value, so
+    /// dragging along a coarse range costs one event per step rather than one
+    /// per pixel.
+    fn set_slider(&mut self, fonts: &Fonts, index: usize, x: i32) -> bool {
+        let Some(doc) = &self.doc else { return false };
+        let node = doc.tree.node(index);
+        let range = slider::Range::of(node);
+        let showing = slider::value_of(node, range);
+        let rect = self.layout.rect_of(index);
+        let wanted = slider::value_at(rect, range, x);
+        if wanted == showing {
+            return false;
+        }
+        let _ = self.act(fonts, index, display::ACTION_SET_VALUE, &slider::format(wanted, range));
+        true
+    }
+
     pub fn draw(&self, canvas: &mut Canvas, fonts: &Fonts, images: &Images) {
         let Some(doc) = &self.doc else { return };
         ui::paint(
@@ -1508,6 +1558,17 @@ impl Client {
         // Whether it becomes one is decided by whether the pointer moves,
         // exactly as it is for a run of cells or a run of text. The cross is
         // not part of it: a press there is a close, not a grip.
+        // A press on a slider is where the value goes, and where a drag
+        // along it starts. Handled before the general path because the value
+        // comes from *where* the press landed, which nothing else needs.
+        if tag == Tag::Slider {
+            let key = doc.key(index).to_owned();
+            self.focus = Some(key.clone());
+            self.slider_drag = Some(key);
+            self.set_slider(fonts, index, x);
+            return true;
+        }
+
         let carried = if tag == Tag::Tab
             && node.flag("movable")
             && !(node.flag("closable") && x >= rect.x + rect.w - ui::tab_close_w())
@@ -1629,6 +1690,11 @@ impl Client {
             "click" => self.emit(&id, display::ACTION_CLICK, ""),
 
             "toggle" => self.emit(&id, display::ACTION_TOGGLE, ""),
+
+            // A number on a range. The compositor does not hold it: the
+            // application does, exactly as it holds a field's text, and the
+            // thumb moves when the tree comes back carrying the new value.
+            display::ACTION_SET_VALUE => self.emit(&id, display::ACTION_SET_VALUE, value),
 
             // The unconditional forms. They become the event a human would have
             // produced, which is a toggle, and only when the state has to move.

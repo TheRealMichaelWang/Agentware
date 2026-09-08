@@ -271,7 +271,7 @@ impl Settings {
                 .pace_edit
                 .accept(&event.target, &event.action, &event.value)
                 .is_some_and(|answer| match answer {
-                    computeruse::Answer::Typed => true,
+                    computeruse::Answer::Moved => true,
                     computeruse::Answer::Commit(pace) => {
                         self.save_pace(pace);
                         true

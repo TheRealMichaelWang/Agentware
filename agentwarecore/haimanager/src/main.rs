@@ -24,6 +24,7 @@ mod input;
 mod paint;
 mod screen;
 mod sheet;
+mod slider;
 mod startmenu;
 mod text;
 mod trail;

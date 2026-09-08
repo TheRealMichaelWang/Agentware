@@ -41,6 +41,8 @@ pub enum Tag {
     Field,
     Editor,
     Checkbox,
+    /// One number chosen along a track. See [`crate::slider`].
+    Slider,
     List,
     Item,
     /// A dropdown: one chosen value, the options shown only while `open`.
@@ -81,6 +83,7 @@ impl Tag {
             "field" => Tag::Field,
             "editor" => Tag::Editor,
             "checkbox" => Tag::Checkbox,
+            "slider" => Tag::Slider,
             "list" => Tag::List,
             "item" => Tag::Item,
             "select" => Tag::Select,
@@ -110,6 +113,7 @@ impl Tag {
             Tag::Field => "field",
             Tag::Editor => "editor",
             Tag::Checkbox => "checkbox",
+            Tag::Slider => "slider",
             Tag::List => "list",
             Tag::Item => "item",
             Tag::Select => "select",
@@ -136,6 +140,7 @@ impl Tag {
                 | Tag::Field
                 | Tag::Editor
                 | Tag::Checkbox
+                | Tag::Slider
                 | Tag::Item
                 | Tag::Select
                 | Tag::Option
@@ -171,6 +176,10 @@ impl Tag {
             Tag::Field => &["focus", "type-text", "clear", "submit"],
             Tag::Editor => &["focus", "type-text", "clear"],
             Tag::Checkbox => &["focus", "check", "uncheck", "toggle"],
+            // One verb, and it is already in the vocabulary. An agent says
+            // what the number should be; where a thumb sits is the
+            // compositor's arithmetic and never something to express.
+            Tag::Slider => &["focus", "set-value"],
             Tag::Item => &["focus", "click", "select", "deselect"],
             // A dropdown offers both verbs whatever its state, the way a
             // checkbox offers check and uncheck: the intent says what should

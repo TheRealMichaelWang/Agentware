@@ -148,9 +148,28 @@ A `password` field reports `value` as a masked placeholder in the agent's view, 
 | `radio` | `label` | `checked`, `disabled` | `focus` `select` |
 | `select` | `label`, `placeholder` | `value`, `disabled`, `open` | `focus` `open` `close` |
 | `option` | `label`, `value` | `selected`, `disabled` | `select` |
+| `slider` | `label`, `min`, `max`, `step` | `value`, `disabled` | `focus` `set-value` |
 
 A `select` is a dropdown. Its `open` is the application's, like every other piece of state in its tree: the compositor asks with `open` and `close` events (a human pressing the box, or an agent's intent; both are unconditional, so one that is already that way sends nothing) and the application answers by re-rendering with `open="true"` and its `option` children, which then float below the box over whatever follows, painted after everything else in the window and hit-tested first. Pressing an option always reports `select` on it, even the one already chosen, because choosing is also what closes the list. A press anywhere else while it is open closes it and does nothing more. Closed, the options are nowhere: no rectangle, no actions, and `folded` from the compositor's point of view, so an agent's view lists them but offers no action until the list is open. Options carry ids, since an agent chooses one by naming it.
-| `slider` | `label`, `min`, `max`, `step` | `value`, `disabled` | `focus` `set-value` |
+
+A `slider` is one number chosen along a track, and it is the only control whose
+value is a quantity rather than a name. `min` and `max` bound it and `step` is
+the granularity, so a slider of milliseconds can be made to move in tens and
+never report 437; all three fall back rather than refuse if a document gets
+them wrong, and a backwards range is put in order. The value is the
+application's, exactly as a field's text is: the compositor works out what the
+hand is asking for and sends it, and the thumb agrees with the next tree. An
+application that will not accept a value renders the old one back and the
+thumb returns, which is what a refused range should look like and needs no
+mechanism of its own.
+
+A human drag becomes a run of `set-value` events, one per value the thumb
+passes through, on the same principle as one event per keystroke: an
+application sees a value moving rather than one that appeared. **An agent
+sends exactly one**, naming the number it wants, and never anything about
+where a thumb should sit. That is the whole reason `set-value` takes a number
+rather than a position, and it is why an agent never has to know this control
+is a track with a knob on it.
 
 `check` and `uncheck` exist alongside `toggle` deliberately. An agent that wants a box checked should say `check`, not `toggle`, so the outcome does not depend on a state it may have read a moment ago.
 
@@ -468,4 +487,9 @@ list  item  dialog  table  column  row  cell
 
 Everything else is additive. Nothing in the reduced set forecloses the rest, and no element should be built before an application actually needs it.
 
-`slider` and `tabs` are the ones most likely to be wanted next. `slider` needs drag tracking, for which the column edges and the scrollbars are now the pattern. `select` is built; its overlay is the same machinery a dialog's is. `table` is built, along with the two things it needed that nothing else did: a second scrolling axis, and a window over content too large to send.
+`slider` and `tabs` are both built. `slider` did need the drag tracking this
+paragraph predicted, and it did follow the scrollbars: a key in the client's
+ephemeral state, motion routed to whoever took hold, and a release that clears
+it. Its arithmetic is in `haimanager/src/slider.rs` rather than spread across
+layout and paint, so where the thumb sits for a value and what value a press
+means are one pair of inverse functions with a test asserting they are. `select` is built; its overlay is the same machinery a dialog's is. `table` is built, along with the two things it needed that nothing else did: a second scrolling axis, and a window over content too large to send.
