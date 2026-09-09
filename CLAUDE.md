@@ -645,6 +645,21 @@ possible rather than where it starts being refused. A name outside it is
 answered at once instead of after five seconds of polling for something that
 was never going to start.
 
+**A window is addressed by handle, never by name.** Every window gets an
+instance handle when it attaches (`Client::handle`, `awfiles#2`: the name and
+a per-name counter that runs for the life of the machine and never comes
+round again), `list_apps` gives every window's handle, `open_app` answers
+with the handle of the window it opened (told apart from any already open by
+comparing the listing before and after), and `read_app`, `read_cells` and
+`act` take the handle. A bare name is refused even when one window carries
+it, so a model cannot learn a habit that breaks the day a second window
+opens. The bug that forced this: the MoE's one failed `traverse` run had
+opened two explorers, `Screen::app_in` took the first window with that name,
+and `raise` moves the raised window to the back of the list, so every action
+landed on the other explorer and every view showed the one it had not just
+acted on (versions `v33, v32, v34, v33` alternating in the log) until the
+loop detector, correctly, stopped it.
+
 **Consequences: the agent waits for the answer, not for a clock.** An
 intent is answered `done` the moment the haimanager performs it, which is
 before the application has heard of it; the application's reply comes back
@@ -919,10 +934,47 @@ than generation is the dominant cost of an exchange; and the largest free win
 was one paragraph of the system prompt telling the model it *should* batch
 tool calls rather than that it *may*.
 
-**Not yet measured, and the blocking item:** pass rates. The suite exists and
-runs, but no full table has been produced for any configuration, so nothing
-here separates "faster" from "better". Claude is the control group every other
-number needs and it wants a key in `state.img`.
+**The pass-rate table, Phase 2c, produced 8 September 2026.** Six tasks,
+three runs each, per configuration; median seconds and exchanges per task.
+Every run is kept under `/tmp/tasksuite-*` with its serial log and disk.
+
+| task | Claude Opus 5 | Qwen3.6-35B-A3B MoE | Qwen3.8-27B dense |
+| --- | --- | --- | --- |
+| calculator | 3/3, 16.6s, 4 | 3/3, 9.2s, 3 | 3/3, 26.4s, 5 |
+| open-and-edit | 3/3, 28.8s, 10 | 3/3, 28.9s, 13 | 3/3, 55.1s, 10 |
+| new-sheet | 3/3, 20.5s, 6 | 3/3, 18.9s, 7 | 3/3, 39.5s, 8 |
+| write-text | 3/3, 17.5s, 6 | 3/3, 18.8s, 9 | 3/3, 33.9s, 8 |
+| find-app | 3/3, 24.5s, 5 | 3/3, 17.2s, 10 | 3/3, 29.2s, 4 |
+| traverse | 3/3, 421s, 59 | 3/3, 229s, 57 | 0/3, 237s, 30 |
+| **overall** | **18/18** | **18/18** | **15/18** |
+
+What it settles. **The MoE matches Claude on every task and is faster on
+five of six**, at a quarter of the output tokens (6k against 28k on
+`traverse`); it spends more exchanges on the short tasks because it batches
+less. **The dense 27B fails `traverse` for one reason only**: every run died
+at 29 to 31 exchanges with `request (33060 tokens) exceeds the available
+context size (32768)`. Not a quality failure; there is no history trimming
+and the turn outgrew the slot, which answers the Phase 3 question of where
+that model falls off at 32k: it does not fall off, it hits a wall, and
+trimming at the turn boundary (Phase 4) is what it needs.
+
+The MoE numbers are from the rerun under instance handles; its first table
+had `traverse` at 2/3, and the failure was the two-explorers bug the handles
+exist for. Its `traverse` was then measured again under the prompt that
+says to save (3/3). The Claude and dense tables predate the handles and the
+prompt change; every one of their passes still passes the corrected checks,
+verified against the kept runs.
+
+**The assertions were wrong before this table and were fixed first.**
+`find-app` accepted any reply containing "12", which the prompt itself
+contains; `calculator` accepted mental arithmetic; `open-and-edit` accepted
+`500` anywhere in the file; `traverse` looked for three guessed filenames
+and required a save the prompt never asked for. They now check the
+calculator's own `12 + 34 = 46` log line, the actual cell with the rest of
+the sheet intact, and every file the run created under `/home`. The check
+that each kept run passes exactly its own task and no other
+(`check_asserts.py`, run against 13 kept runs) is what caught the CRLF line
+endings and the intermediate `display 12` state along the way.
 
 ## Working conventions
 

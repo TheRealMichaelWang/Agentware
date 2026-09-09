@@ -694,11 +694,12 @@ fn unescape(text: &str) -> String {
 ///
 /// `actions` is added, computed from the element and its state rather than
 /// copied from the document.
-pub fn agent_view(tree: &Tree, sheets: &Sheets, app: &str, desk: u32) -> String {
+pub fn agent_view(tree: &Tree, sheets: &Sheets, app: &str, instance: &str, desk: u32) -> String {
     // The app name and the workspace come from the supervisor's handoff, not
     // from the document, so an application cannot misreport which workspace it
-    // is in or borrow another one's name.
-    let mut out = format!("<view app=\"{app}\" desk=\"{desk}\">\n");
+    // is in or borrow another one's name. The instance handle is the
+    // haimanager's, and is what the agent names this window by.
+    let mut out = format!("<view instance=\"{instance}\" app=\"{app}\" desk=\"{desk}\">\n");
     emit(tree, sheets, Tree::ROOT, 1, &mut out);
     out.push_str("</view>");
     out
@@ -833,7 +834,7 @@ mod tests {
                </window>"#,
         )
         .unwrap();
-        let view = agent_view(&tree, &Sheets::default(), "awsettings", 1);
+        let view = agent_view(&tree, &Sheets::default(), "awsettings", "awsettings#1", 1);
         assert!(!view.contains("sk-ant-secret"), "the secret leaked: {view}");
         assert!(view.contains("value=\"*************\""), "no mask: {view}");
         assert!(view.contains("value=\"plain\""), "a plain field kept its value: {view}");
@@ -861,7 +862,7 @@ mod tests {
                </window>"#,
         )
         .unwrap();
-        let view = agent_view(&closed, &Sheets::default(), "awsheet", 1);
+        let view = agent_view(&closed, &Sheets::default(), "awsheet", "awsheet#1", 1);
 
         // A menu offers both verbs whatever its state, like a dropdown.
         let menu = view.lines().find(|line| line.contains("id=\"edit\"")).unwrap();
@@ -893,7 +894,7 @@ mod tests {
         // for without reading a screenful to find out.
         let mut sheets = Sheets::default();
         sheets.apply("book", 0, 1, (0, 0), &["x".into(), "y".into()]);
-        let used = agent_view(&closed, &sheets, "awsheet", 1);
+        let used = agent_view(&closed, &sheets, "awsheet", "awsheet#1", 1);
         let grid = used.lines().find(|line| line.contains("id=\"sheet\"")).unwrap();
         assert!(grid.contains("used=\"A1:B1\""), "{grid}");
 
@@ -906,7 +907,7 @@ mod tests {
                </window>"#,
         )
         .unwrap();
-        let view = agent_view(&open, &Sheets::default(), "awsheet", 1);
+        let view = agent_view(&open, &Sheets::default(), "awsheet", "awsheet#1", 1);
         let item = view.lines().find(|line| line.contains("id=\"menu-clear\"")).unwrap();
         assert!(item.contains("actions=\"focus click\""), "an open item offered nothing: {item}");
     }

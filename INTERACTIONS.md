@@ -63,8 +63,10 @@ An agent has exactly two channels, and neither one is the Supervisor.
 
 **Agent → haimanager: queries.**
 
-* *What applications are open?* Answered as AWML.
-* *What is the state of application X?* Answered as AWML in a reduced schema: element IDs, semantic roles, labels, and declared state, with pure layout containers omitted. The model does not need to know that two buttons are in a row; it needs to know both exist, what they do, and whether they are enabled.
+* *What windows are open?* Answered as AWML: one `<app>` per window, each with an **instance handle** (`awfiles#2`: the application's name and a counter the haimanager assigns when the window attaches, unique for the life of the machine), the application's name, and the window's title.
+* *What is the state of window X?* Answered as AWML in a reduced schema: element IDs, semantic roles, labels, and declared state, with pure layout containers omitted. The model does not need to know that two buttons are in a row; it needs to know both exist, what they do, and whether they are enabled.
+
+Every query and every intent names a window by its handle, never by the application's name, and a bare name is refused even when only one window carries it. A name is not an identity: two windows of one application are two processes with two trees, and an agent that could only say "awfiles" was answered by whichever window the haimanager found first, which raising the target moved to the back, so every action landed on the other window and every view showed the one it had not just acted on. The handle is what makes "the window I opened" a thing an agent can say, and `open_app` hands it back for exactly that reason.
 
 Both answers are **scoped to the agent's own agentdesk**. An agent cannot see or address an app in another workspace, and this is not enforced by checking a workspace id the agent supplies. The haimanager knows which workspace a connection belongs to because the Supervisor told it so when it handed the descriptor over. The agent is never asked and cannot lie.
 

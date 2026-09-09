@@ -108,6 +108,15 @@ pub struct Client {
     /// The workspace this connection belongs to, as the supervisor stated it.
     pub desk: u32,
     pub name: String,
+    /// What an agent addresses this window by: the name and a counter,
+    /// `awfiles#2`, unique for the life of the machine.
+    ///
+    /// The name is not an identity. Two windows of one application are two
+    /// processes with two trees, and an agent that could only say "awfiles"
+    /// was answered by whichever came first, which changed every time one
+    /// was raised. The handle is the haimanager's, assigned at attach, and
+    /// never reused.
+    pub handle: String,
     /// The last thing that happened, for the status strip.
     pub note: String,
 
@@ -273,12 +282,19 @@ impl Client {
     /// to name a process to PID 1 when a window was closed; the cross asks the
     /// application now, so there is nothing to name, and a compositor that
     /// cannot identify a process is a compositor that cannot end one.
-    pub fn adopt(kind: Kind, desk: u32, name: String, stream: UnixStream) -> io::Result<Self> {
+    pub fn adopt(
+        kind: Kind,
+        desk: u32,
+        name: String,
+        handle: String,
+        stream: UnixStream,
+    ) -> io::Result<Self> {
         stream.set_nonblocking(true)?;
         Ok(Client {
             kind,
             desk,
             name,
+            handle,
             note: "connected, nothing rendered yet".into(),
             stream,
             decoder: Decoder::with_limit(MAX_TREE),
@@ -338,7 +354,9 @@ impl Client {
     pub fn agent_view(&self) -> Option<String> {
         self.doc
             .as_ref()
-            .map(|doc| awml::agent_view(&doc.tree, &self.sheets, &self.name, self.desk))
+            .map(|doc| {
+                awml::agent_view(&doc.tree, &self.sheets, &self.name, &self.handle, self.desk)
+            })
     }
 
     /// A number standing for what an agent would see of this client, so two
@@ -351,7 +369,8 @@ impl Client {
     fn view_digest(&self) -> Option<u64> {
         use std::hash::{Hash, Hasher};
         let doc = self.doc.as_ref()?;
-        let view = awml::agent_view(&doc.tree, &Sheets::default(), &self.name, self.desk);
+        let view =
+            awml::agent_view(&doc.tree, &Sheets::default(), &self.name, &self.handle, self.desk);
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         view.hash(&mut hasher);
         Some(hasher.finish())
@@ -2647,7 +2666,8 @@ mod tests {
         let fonts = Fonts::load().expect("the faces are compiled in");
         let (ours, peer) = UnixStream::pair().expect("a socketpair");
         let mut client =
-            Client::adopt(Kind::App, 1, "test".to_owned(), ours).expect("adopted");
+            Client::adopt(Kind::App, 1, "test".to_owned(), "test#1".to_owned(), ours)
+                .expect("adopted");
         client.apply(&fonts, source, 1, &mut Vec::new());
         client.set_frame(&fonts, Frame::Whole(frame));
         (fonts, client, peer)

@@ -26,6 +26,7 @@ is a rate, not a boolean.
 """
 
 import argparse
+import csv
 import json
 import os
 import re
@@ -101,6 +102,47 @@ class Outcome:
         low = self.reply.lower()
         return all(word.lower() in low for word in words)
 
+    def logged(self, pattern: str) -> bool:
+        """Whether the serial log carries a line matching this.
+
+        The applications write what they did to the kernel log, and that is
+        the one witness a reply cannot forge: `awcalc: display 46` means the
+        calculator showed 46, whatever the model then said about it.
+
+        Matched a line at a time, and a serial console ends its lines in
+        CRLF, so a pattern anchored with `$` must allow the carriage return:
+        write `display 46\\s*$`.
+        """
+        return re.search(pattern, self.log, re.MULTILINE) is not None
+
+    def cell(self, path: str, ref: str) -> str:
+        """One cell of a saved CSV by its `D4` name, or "" if it is not there.
+
+        Quoted cells are read as a spreadsheet writes them; a sheet with no
+        quoting in it reads the same either way.
+        """
+        column = ord(ref[0].upper()) - ord("A")
+        row = int(ref[1:]) - 1
+        lines = self.file(path).splitlines()
+        if row >= len(lines):
+            return ""
+        cells = next(csv.reader([lines[row]]))
+        return cells[column].strip() if column < len(cells) else ""
+
+    def listing(self, directory: str) -> list:
+        """The names in a directory of the state volume, plain files only."""
+        got = subprocess.run(
+            ["debugfs", "-R", "ls -p %s" % directory, self.state],
+            capture_output=True, text=True,
+        )
+        names = []
+        for line in got.stdout.splitlines():
+            # /inode/mode/uid/gid/name/size/ ; a regular file's mode starts 100.
+            parts = line.split("/")
+            if len(parts) >= 6 and parts[2].startswith("100"):
+                names.append(parts[5])
+        return names
+
 
 class Task:
     def __init__(self, name, prompt, check, why, seconds=180):
@@ -120,27 +162,56 @@ def csv_names(outcome, path):
             for cell in line.split(",")}
 
 
+# What /home holds before any run, so a task that has to create a file is
+# judged on the files it created and not on one that was already there.
+PRISTINE_HOME = None
+
+
+def new_files(outcome):
+    """Every file under /home (one level of folders deep) this run created.
+
+    Whatever it is called. The spreadsheet writes CSV under any name, and a
+    run that saved a correct sheet as `text_files.txt` was scored a failure
+    for its extension, which is not the thing being measured.
+    """
+    found = []
+    for directory in ("/home", "/home/notes"):
+        for name in outcome.listing(directory):
+            path = directory + "/" + name
+            if path not in PRISTINE_HOME:
+                found.append(path)
+    return found
+
+
 TASKS = [
     Task(
         name="calculator",
         prompt="Add 12 and 34 on the calculator.",
-        why="the reply says 46",
-        check=lambda got: got.said("46"),
+        # The calculator's own log is the witness. A reply saying 46 proves
+        # the model can add; the calculator logging the sum it computed
+        # proves the machine did it, which is the thing being measured.
+        why="the calculator computed 12 + 34 = 46 and the reply says so",
+        check=lambda got: got.logged(r"awcalc: (12 \+ 34|34 \+ 12) = 46\s*$")
+        and got.said("46"),
         seconds=120,
     ),
     Task(
         name="open-and-edit",
         prompt="Open quarter.csv in the spreadsheet and put 500 into cell D4, then save it.",
-        why="quarter.csv contains 500",
-        check=lambda got: "500" in got.file("/home/quarter.csv"),
+        # The cell, not the file: "500 somewhere in it" would pass a sheet
+        # overwritten with nothing but 500, and the rest of the file still
+        # being there is what says it was edited rather than replaced.
+        why="quarter.csv has 500 in D4 and the rest of the sheet intact",
+        check=lambda got: got.cell("/home/quarter.csv", "D4") == "500"
+        and got.cell("/home/quarter.csv", "A11") == "Overseas",
         seconds=240,
     ),
     Task(
         name="new-sheet",
         prompt="Make a new spreadsheet with the word Hello in cell A1 and save it as "
                "greeting.csv in the home folder.",
-        why="greeting.csv exists and holds Hello",
-        check=lambda got: "hello" in got.file("/home/greeting.csv").lower(),
+        why="greeting.csv exists with Hello in A1",
+        check=lambda got: got.cell("/home/greeting.csv", "A1").lower() == "hello",
         seconds=240,
     ),
     Task(
@@ -158,8 +229,13 @@ TASKS = [
         # for and what the machine could not answer at all before it existed.
         prompt="What is 144 divided by 12? Work it out on this machine rather than in "
                "your head.",
-        why="the reply says 12, having found the app itself",
-        check=lambda got: got.said("12"),
+        # The prompt itself contains "12", so the reply saying it proves
+        # nothing; the calculator logging the division proves the agent
+        # found the application and used it, which is the whole task. The
+        # operator is matched loosely because it is a ÷ and a serial console
+        # is not to be trusted with one.
+        why="the calculator computed 144 / 12 = 12, the agent having found it itself",
+        check=lambda got: got.logged(r"awcalc: 144 \S+ 12 = 12\s*$") and got.said("12"),
         seconds=120,
     ),
     Task(
@@ -167,13 +243,18 @@ TASKS = [
         # The long-horizon one. Two applications, a directory walk that has to
         # descend and come back, and a result carried between them. This is
         # the task that found three real defects the first time it was run.
-        prompt="Create a spreadsheet listing all the text files on this machine. "
-               "Traverse the filesystem manually with the file explorer; there is no "
-               "search.",
-        why="a saved CSV names all three text files under /home",
+        # "Save it" is said, because the check reads a file and a sheet that
+        # was filled in correctly and never saved is a run that did what it
+        # was asked. Where to save it is said too, so the check knows where
+        # to look; what to call it is not, so every file the run created is
+        # read.
+        prompt="Create a spreadsheet listing all the text files on this machine, and "
+               "save it in the home folder. Traverse the filesystem manually with the "
+               "file explorer; there is no search.",
+        why="a file the run saved under /home names all three text files there",
         check=lambda got: any(
             {"welcome.txt", "ideas.txt", "shopping.txt"} <= csv_names(got, path)
-            for path in ("/home/sheet.csv", "/home/textfiles.csv", "/home/files.csv")
+            for path in new_files(got)
         ),
         seconds=600,
     ),
@@ -277,6 +358,14 @@ def main():
     if shutil.which("debugfs") is None:
         print("debugfs is not installed; file assertions need e2fsprogs", file=sys.stderr)
         return 1
+
+    # What the disk holds before any task runs, read once from the machine's
+    # own image rather than assumed: a run is judged on the files it made.
+    global PRISTINE_HOME
+    pristine = Outcome("", STATE_IMG)
+    PRISTINE_HOME = {directory + "/" + name
+                     for directory in ("/home", "/home/notes")
+                     for name in pristine.listing(directory)}
 
     tasks = [task for task in TASKS if not args.only or task.name in args.only]
     results = []

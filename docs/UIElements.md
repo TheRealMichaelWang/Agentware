@@ -427,7 +427,7 @@ The same interface, as the app writes it and as the agent receives it.
 **What the agent receives:**
 
 ```xml
-<view app="Messages" desk="3">
+<view instance="messages#1" app="messages" desk="3">
   <text>Compose</text>
   <field id="to" value="" description="Recipient address for the message"
          actions="focus type-text clear submit"/>
@@ -449,7 +449,7 @@ Four things happened:
 
 ## Intents
 
-An agent acts by naming a node and an action. It never produces an event.
+An agent acts by naming a window, a node and an action. It never produces an event. The window is named by the **instance handle** the view's header carries (`instance="messages#1"`), which `list_apps` and `open_app` give it; the application's name alone names nothing, because two windows of one application are two handles.
 
 ```xml
 <intent action="type-text" target="to" value="alice@example.com"/>

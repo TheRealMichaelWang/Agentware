@@ -237,6 +237,11 @@ struct Workspace {
 
 pub struct Screen {
     clients: Vec<Client>,
+    /// How many windows each application has ever opened, for handing the
+    /// next one its handle. Counts up for the life of the machine and is
+    /// never walked back, so a handle names one window and no other, even
+    /// after that window has gone.
+    handles: HashMap<String, u32>,
     workspaces: Vec<Workspace>,
     current: usize,
     focus: Surface,
@@ -344,6 +349,7 @@ impl Screen {
         images.icons.prepare(AGENTWARE_ICON, &[start_icon()]);
         Screen {
             clients: Vec::new(),
+            handles: HashMap::new(),
             workspaces: Vec::new(),
             current: 0,
             focus: Surface::Desk,
@@ -699,7 +705,18 @@ impl Screen {
             self.images.icons.prepare(&name, &[title_icon(), dock_icon()]);
         }
 
-        let client = Client::adopt(kind, desk, name, UnixStream::from(fd))
+        // The handle an agent addresses this window by: the name and a
+        // number that never comes round again. Chrome and agents are never
+        // addressed, so theirs is just the name.
+        let handle = if kind == Kind::App {
+            let count = self.handles.entry(name.clone()).or_insert(0);
+            *count += 1;
+            format!("{name}#{count}")
+        } else {
+            name.clone()
+        };
+
+        let client = Client::adopt(kind, desk, name, handle, UnixStream::from(fd))
             .map_err(|err| format!("could not adopt the descriptor: {err}"))?;
         let label = client.label();
         let fd = client.fd();
@@ -830,14 +847,15 @@ impl Screen {
         }
     }
 
-    /// The agent to tell about an application's change, if the change is an
-    /// application's and an agent is working in its workspace.
+    /// The agent to tell about a window's change, and the handle to tell it
+    /// by, if the change is an application's and an agent is working in its
+    /// workspace.
     fn agent_watching(&mut self, changed_fd: RawFd) -> Option<(String, &mut Client)> {
         let changed = self.client(changed_fd)?;
         if changed.kind != Kind::App {
             return None;
         }
-        let (desk, name) = (changed.desk, changed.name.clone());
+        let (desk, name) = (changed.desk, changed.handle.clone());
         let agent = self
             .clients
             .iter_mut()
@@ -1868,8 +1886,11 @@ impl Screen {
         let mut out = format!("<apps desk=\"{}\">\n", workspace.id);
         for window in &workspace.windows {
             let Some(client) = self.client(window.fd) else { continue };
+            // The handle first, because it is what every other message
+            // takes; the name says which application the window is.
             out.push_str(&format!(
-                "  <app name=\"{}\" title=\"{}\"/>\n",
+                "  <app instance=\"{}\" name=\"{}\" title=\"{}\"/>\n",
+                client.handle,
                 client.name,
                 client.title()
             ));
@@ -1892,21 +1913,27 @@ impl Screen {
         }
     }
 
-    fn app_in(&self, at: usize, name: &str) -> Option<RawFd> {
+    /// The window an agent's handle names, in one workspace.
+    ///
+    /// By handle and only by handle. A bare name is not looked up even when
+    /// one window carries it: the answer would be right today and wrong the
+    /// moment a second window opened, and an agent that learned it could
+    /// say "awfiles" would go on saying it.
+    fn app_in(&self, at: usize, handle: &str) -> Option<RawFd> {
         let workspace = self.workspaces.get(at)?;
         workspace
             .windows
             .iter()
-            .find(|window| self.client(window.fd).is_some_and(|c| c.name == name))
+            .find(|window| self.client(window.fd).is_some_and(|c| c.handle == handle))
             .map(|window| window.fd)
     }
 
-    /// Why an application the agent named is not one it may have.
+    /// Why a window the agent named is not one it may have.
     ///
     /// The distinction is worth making. Something open in another workspace, or
     /// the workspace's own chrome, is not missing: it exists and is forbidden,
     /// and telling an agent it does not exist would send it looking for it.
-    fn why_not(&self, at: usize, name: &str) -> &'static str {
+    fn why_not(&self, at: usize, handle: &str) -> &'static str {
         let elsewhere = self
             .workspaces
             .iter()
@@ -1916,10 +1943,10 @@ impl Screen {
                     && workspace
                         .windows
                         .iter()
-                        .any(|w| self.client(w.fd).is_some_and(|c| c.name == name))
+                        .any(|w| self.client(w.fd).is_some_and(|c| c.handle == handle))
             });
 
-        if elsewhere || name == "workspace" {
+        if elsewhere || handle == "workspace" {
             agent::REASON_NOT_ADDRESSABLE
         } else {
             agent::REASON_NO_SUCH_APP
@@ -3181,6 +3208,76 @@ mod tests {
          <spreadsheet id=\"sheet\" grow=\"true\" source=\"book\" version=\"2\" \
          rows=\"1000\" columns=\"26\" cursor=\"A1\" description=\"The grid\"/></window>";
 
+    /// Two windows of one application are two handles, each answering for
+    /// itself whatever order they were raised in, and the bare name answers
+    /// for neither.
+    ///
+    /// This is the failure a directory walk found: with two explorers open
+    /// and only a name to address them by, every action landed on whichever
+    /// the haimanager found first, and raising the target moved it to the
+    /// back, so the two alternated until the loop detector gave up.
+    #[test]
+    fn two_windows_of_one_application_are_two_handles() {
+        ui::set_scale(1.0);
+        let fonts = Fonts::load().expect("the faces are compiled in");
+        let mut screen = Screen::new(Rect::new(0, 0, 1200, 800), &fonts);
+
+        let mut opened = Vec::new();
+        for title in ["First", "Second"] {
+            let (mut app, app_end) = UnixStream::pair().expect("a socketpair");
+            let app_fd = app_end.as_raw_fd();
+            screen
+                .attach(
+                    &fonts,
+                    &["app-attached".into(), "1".into(), "awfiles".into(), "0".into()],
+                    OwnedFd::from(app_end),
+                )
+                .expect("the application attached");
+            let markup = format!(
+                "<window title=\"{title}\" pad=\"none\"><button id=\"go\" label=\"{title}\" \
+                 description=\"Which window this is\"/></window>"
+            );
+            app.write_all(&encode(&["render", "1", &markup])).unwrap();
+            screen.readable(app_fd, &fonts);
+            opened.push(app);
+        }
+        let (mut agent, agent_end) = UnixStream::pair().expect("a socketpair");
+        let agent_fd = agent_end.as_raw_fd();
+        screen
+            .attach(
+                &fonts,
+                &["agent-attached".into(), "1".into(), "0".into()],
+                OwnedFd::from(agent_end),
+            )
+            .expect("the agent attached");
+        let ask = |screen: &mut Screen, agent: &mut UnixStream, fields: &[&str]| {
+            agent.write_all(&encode(fields)).unwrap();
+            let progress = screen.readable(agent_fd, &fonts).expect("the agent was read");
+            screen.requests(&fonts, agent_fd, progress.requests);
+            frame(agent)
+        };
+
+        // Listed by handle, name and title.
+        let apps = ask(&mut screen, &mut agent, &["query", "apps"]);
+        assert!(apps[1].contains("instance=\"awfiles#1\" name=\"awfiles\" title=\"First\""), "{}", apps[1]);
+        assert!(apps[1].contains("instance=\"awfiles#2\" name=\"awfiles\" title=\"Second\""), "{}", apps[1]);
+
+        // Each handle answers for its own window, and acting on one, which
+        // raises it, does not change which window the other handle names.
+        let done = ask(&mut screen, &mut agent, &["intent", "awfiles#1", "click", "go", ""]);
+        assert_eq!(done[0], agent::MSG_DONE, "{done:?}");
+        let second = ask(&mut screen, &mut agent, &["query", "view", "awfiles#2"]);
+        assert!(second[2].contains("label=\"Second\""), "{}", second[2]);
+        let first = ask(&mut screen, &mut agent, &["query", "view", "awfiles#1"]);
+        assert!(first[2].contains("label=\"First\""), "{}", first[2]);
+
+        // The bare name names nothing.
+        let refused = ask(&mut screen, &mut agent, &["query", "view", "awfiles"]);
+        assert!(refused[2].contains(agent::REASON_NO_SUCH_APP), "{}", refused[2]);
+        let refused = ask(&mut screen, &mut agent, &["intent", "awfiles", "click", "go", ""]);
+        assert_eq!(refused[0], agent::MSG_REJECTED, "{refused:?}");
+    }
+
     /// The two notices an agent hears, sent the way the main loop sends
     /// them: an application's interface moving is `changed`, cells arriving
     /// is `data-changed` naming the element and the rectangle, and a tree
@@ -3261,8 +3358,8 @@ mod tests {
         assert_eq!(
             heard(&mut agent),
             vec![
-                vec!["changed", "awsheet"],
-                vec!["data-changed", "awsheet", "book", "sheet", ""],
+                vec!["changed", "awsheet#1"],
+                vec!["data-changed", "awsheet#1", "book", "sheet", ""],
             ]
         );
 
@@ -3276,7 +3373,7 @@ mod tests {
         assert!(!updated, "a version ticking over is not a change an agent can see");
         assert_eq!(
             heard(&mut agent),
-            vec![vec!["data-changed", "awsheet", "book", "sheet", "B7"]],
+            vec![vec!["data-changed", "awsheet#1", "book", "sheet", "B7"]],
             "{data:?}"
         );
     }
@@ -3327,14 +3424,14 @@ mod tests {
 
         // The agent asks for a rectangle nowhere near the top of the sheet.
         agent
-            .write_all(&encode(&["query", "cells", "awsheet", "sheet", "A500:B500"]))
+            .write_all(&encode(&["query", "cells", "awsheet#1", "sheet", "A500:B500"]))
             .unwrap();
         let progress = screen.readable(agent_fd, &fonts).expect("the agent was read");
         screen.requests(&fonts, agent_fd, progress.requests);
 
         let reply = frame(&mut agent);
         assert_eq!(reply[0], agent::MSG_CELLS, "not a block of cells: {reply:?}");
-        assert_eq!(reply[1], "awsheet");
+        assert_eq!(reply[1], "awsheet#1");
         assert_eq!(reply[3], "A500:B500");
         assert_eq!(reply[4], "far down\t\n", "the wrong cells came back: {:?}", reply[4]);
 
@@ -3348,7 +3445,7 @@ mod tests {
 
         // The view carries the shape and where the sheet is used, so an agent
         // knows what to ask for; it carries no cells at all.
-        agent.write_all(&encode(&["query", "view", "awsheet"])).unwrap();
+        agent.write_all(&encode(&["query", "view", "awsheet#1"])).unwrap();
         let progress = screen.readable(agent_fd, &fonts).expect("the agent was read");
         screen.requests(&fonts, agent_fd, progress.requests);
         let reply = frame(&mut agent);

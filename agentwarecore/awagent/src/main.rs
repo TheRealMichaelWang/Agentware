@@ -144,6 +144,10 @@ by name is how you reach a command a human would right-click for; there is no \
 right-click in your vocabulary and you do not need one.
 
 Working style:
+- Every open window has an instance handle like awfiles#1: the application's name and a \
+number. list_apps gives the handle of every open window and open_app gives the handle of \
+the one it opened. read_app, read_cells and act take the handle, never the bare name: two \
+windows of one application are two handles, and the name alone is refused.
 - Read before acting: list_apps, then read_app, then act.
 - When the work needs an application that is not open, call search_apps first and say what \
 you want to do, not what you think it is called. It answers with what this machine has, \
@@ -692,8 +696,9 @@ fn tool_definitions(installed: &[turn::InstalledApp]) -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "list_apps",
-            description: "List the applications open in this workspace, as markup naming \
-                          each app. Call this first, and again after open_app.",
+            description: "List the windows open in this workspace, as markup giving each \
+                          one's instance handle (like awfiles#1), application name and \
+                          title. Call this first.",
             schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
         },
         ToolDef {
@@ -709,9 +714,9 @@ fn tool_definitions(installed: &[turn::InstalledApp]) -> Vec<ToolDef> {
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "app": {"type": "string", "description": "The application's name as list_apps gave it"}
+                    "instance": {"type": "string", "description": "The window's instance handle, like awfiles#1, as list_apps or open_app gave it"}
                 },
-                "required": ["app"],
+                "required": ["instance"],
                 "additionalProperties": false
             }),
         },
@@ -746,14 +751,14 @@ fn tool_definitions(installed: &[turn::InstalledApp]) -> Vec<ToolDef> {
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "app": {"type": "string", "description": "The application's name"},
+                    "instance": {"type": "string", "description": "The window's instance handle, like awsheet#1"},
                     "id": {"type": "string", "description": "The spreadsheet's id, as the view gives it"},
                     "range": {
                         "type": "string",
                         "description": "A rectangle like A1:D20, or one cell like B7"
                     }
                 },
-                "required": ["app", "id", "range"],
+                "required": ["instance", "id", "range"],
                 "additionalProperties": false
             }),
         },
@@ -766,7 +771,7 @@ fn tool_definitions(installed: &[turn::InstalledApp]) -> Vec<ToolDef> {
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "app": {"type": "string", "description": "The application's name"},
+                    "instance": {"type": "string", "description": "The window's instance handle, like awcalc#1"},
                     "action": {
                         "type": "string",
                         "enum": ["focus", "click", "type-text", "clear", "submit", "check",
@@ -777,15 +782,17 @@ fn tool_definitions(installed: &[turn::InstalledApp]) -> Vec<ToolDef> {
                     "target": {"type": "string", "description": "The control's id"},
                     "value": {"type": "string", "description": "The text for type-text, the number for set-value, or the other corner's cell id for select-range, or the position for move"}
                 },
-                "required": ["app", "action", "target"],
+                "required": ["instance", "action", "target"],
                 "additionalProperties": false
             }),
         },
         ToolDef {
             name: "open_app",
             description: "Ask the workspace to open one of this machine's installed \
-                          applications, then wait for it to appear. The result lists what \
-                          is open afterwards.",
+                          applications, then wait for it to appear. The result gives the \
+                          new window's instance handle, which is what read_app and act \
+                          take, and lists everything open afterwards. Opening an \
+                          application that is already open opens a second window.",
             schema: json!({
                 "type": "object",
                 "properties": {"name": opens},
@@ -875,10 +882,21 @@ fn search_apps(installed: &[turn::InstalledApp], query: &str, open: &str) -> Str
     } else {
         format!("Nothing matched {query:?}. Everything this machine has:\n")
     };
+    let windows = instances_in(open);
     for (_, app) in ranked {
-        // The compositor's answer names the open applications; a name it
-        // contains is one that is running.
-        let running = if open.contains(&app.name) { "already open" } else { "not open" };
+        // The haimanager's answer lists the open windows by handle; the
+        // handles are what the model needs next, so they are said here
+        // rather than a bare "already open" that leaves it a call short.
+        let handles: Vec<&str> = windows
+            .iter()
+            .filter(|(_, name)| *name == app.name)
+            .map(|(instance, _)| instance.as_str())
+            .collect();
+        let running = if handles.is_empty() {
+            "not open".to_owned()
+        } else {
+            format!("already open as {}", handles.join(", "))
+        };
         out.push_str(&format!(
             "\n{} ({}), {}\n  {}\n",
             app.name, app.label, running, app.description
@@ -886,6 +904,24 @@ fn search_apps(installed: &[turn::InstalledApp], query: &str, open: &str) -> Str
     }
     out.push_str("\nOpen one with open_app, naming it exactly as above.");
     out
+}
+
+/// The open windows in a `list_apps` answer, as (instance handle, name).
+///
+/// Read off the markup the haimanager writes, one `<app .../>` per line
+/// carrying `instance` and `name` attributes. The harness needs the pairs
+/// to tell the model which handle a search found and which window an
+/// `open_app` produced; the model reads the markup itself.
+fn instances_in(markup: &str) -> Vec<(String, String)> {
+    let attribute = |line: &str, name: &str| -> Option<String> {
+        let key = format!(" {name}=\"");
+        Some(line.split_once(&key)?.1.split_once('"')?.0.to_owned())
+    };
+    markup
+        .lines()
+        .filter(|line| line.trim_start().starts_with("<app "))
+        .filter_map(|line| Some((attribute(line, "instance")?, attribute(line, "name")?)))
+        .collect()
 }
 
 /// Perform a batch of actions: in order, each the moment the last was
@@ -914,13 +950,13 @@ fn batched_acts(
     let mut stopped: Option<String> = None;
     for (id, input) in &run {
         let (Some(app), Some(action), Some(target)) = (
-            field(input, "app"),
+            field(input, "instance"),
             field(input, "action"),
             field(input, "target"),
         ) else {
             results.push(Block::ToolResult {
                 id: id.clone(),
-                content: "act needs an app, an action and a target".to_owned(),
+                content: "act needs an instance handle, an action and a target".to_owned(),
                 is_error: true,
             });
             continue;
@@ -1000,8 +1036,8 @@ fn run_tool(agent: &mut Agent, name: &str, input: &Value) -> (String, bool) {
             (search_apps(&agent.installed, &query, &open), false)
         }
         "read_app" => {
-            let Some(app) = field("app") else {
-                return ("read_app needs an app name".to_owned(), true);
+            let Some(app) = field("instance") else {
+                return ("read_app needs an instance handle, like awfiles#1".to_owned(), true);
             };
             agent.say(turn::KIND_ACTION, &format!("reading {app}"));
             let asked = Instant::now();
@@ -1017,9 +1053,9 @@ fn run_tool(agent: &mut Agent, name: &str, input: &Value) -> (String, bool) {
         }
         "read_cells" => {
             let (Some(app), Some(id), Some(range)) =
-                (field("app"), field("id"), field("range"))
+                (field("instance"), field("id"), field("range"))
             else {
-                return ("read_cells needs an app, an id and a range".to_owned(), true);
+                return ("read_cells needs an instance handle, an id and a range".to_owned(), true);
             };
             agent.say(turn::KIND_ACTION, &format!("reading {range} of {id} in {app}"));
             let asked = Instant::now();
@@ -1059,35 +1095,48 @@ fn run_tool(agent: &mut Agent, name: &str, input: &Value) -> (String, bool) {
                 );
             }
             agent.say(turn::KIND_ACTION, &format!("opening {name}"));
+            // What is open before asking, so the window this call opened is
+            // told apart from one already there. A name is not an identity:
+            // asking for an application that is open opens a second window,
+            // and the model has to be handed that window's handle and not
+            // the first one's.
+            let before = match agent.link.apps() {
+                Ok(markup) => instances_in(&markup),
+                Err(err) => connection_lost(&err),
+            };
             if let Err(err) = agent.desk.open_app(&name) {
                 return (format!("could not ask the workspace to open {name:?}: {err}"), true);
             }
             let waited = Instant::now();
-            // Look before sleeping. An application the model asked for that
-            // is already open answers on the first look, and used to cost a
-            // poll interval for nothing.
             loop {
-                match agent.link.apps() {
-                    Ok(markup) if markup.contains(&name) => {
-                        agent.meter.waiting += waited.elapsed();
-                        agent.say(turn::KIND_RESULT, &format!("{name} is open"));
-                        log(&format!("open {name}: {}ms", waited.elapsed().as_millis()));
-                        return (format!("{name} is open. Open applications:\n{markup}"), false);
-                    }
-                    Ok(markup) if waited.elapsed() >= OPENING => {
-                        agent.meter.waiting += waited.elapsed();
-                        agent.say(turn::KIND_ERROR, &format!("{name} did not open"));
-                        return (
-                            format!(
-                                "{name} did not appear within {}s. Open applications:\n{markup}",
-                                OPENING.as_secs()
-                            ),
-                            true,
-                        );
-                    }
-                    Ok(_) => std::thread::sleep(OPENING_POLL),
+                let markup = match agent.link.apps() {
+                    Ok(markup) => markup,
                     Err(err) => connection_lost(&err),
+                };
+                let opened = instances_in(&markup)
+                    .into_iter()
+                    .find(|(instance, app)| app == &name && !before.contains(&(instance.clone(), app.clone())));
+                if let Some((instance, _)) = opened {
+                    agent.meter.waiting += waited.elapsed();
+                    agent.say(turn::KIND_RESULT, &format!("{name} is open as {instance}"));
+                    log(&format!("open {name}: {instance} in {}ms", waited.elapsed().as_millis()));
+                    return (
+                        format!("{name} is open as {instance}. Open windows:\n{markup}"),
+                        false,
+                    );
                 }
+                if waited.elapsed() >= OPENING {
+                    agent.meter.waiting += waited.elapsed();
+                    agent.say(turn::KIND_ERROR, &format!("{name} did not open"));
+                    return (
+                        format!(
+                            "{name} did not appear within {}s. Open windows:\n{markup}",
+                            OPENING.as_secs()
+                        ),
+                        true,
+                    );
+                }
+                std::thread::sleep(OPENING_POLL);
             }
         }
         other => (format!("there is no tool named {other:?}"), true),
@@ -1190,11 +1239,27 @@ mod tests {
     fn searching_says_what_is_already_open() {
         // Both questions answered at once: an app that is already open needs
         // no open_app, and finding that out used to be a second call.
-        let open = "<apps><app name=\"awfiles\"/></apps>";
+        let open = "<apps desk=\"1\">\n  <app instance=\"awfiles#1\" name=\"awfiles\" title=\"Files\"/>\n  \
+                    <app instance=\"awfiles#3\" name=\"awfiles\" title=\"Files\"/>\n</apps>";
         let found = search_apps(&machine(), "files", open);
-        assert!(found.contains("awfiles (Files), already open"), "{found}");
+        // Both windows, by handle: the handle is what the model needs next.
+        assert!(found.contains("awfiles (Files), already open as awfiles#1, awfiles#3"), "{found}");
         let found = search_apps(&machine(), "spreadsheet", open);
         assert!(found.contains("awsheet (Sheet), not open"), "{found}");
+    }
+
+    #[test]
+    fn open_windows_are_read_by_handle() {
+        let markup = "<apps desk=\"1\">\n  <app instance=\"awcalc#1\" name=\"awcalc\" title=\"Calculator\"/>\n  \
+                      <app instance=\"awfiles#2\" name=\"awfiles\" title=\"Files\"/>\n</apps>";
+        assert_eq!(
+            instances_in(markup),
+            vec![
+                ("awcalc#1".to_owned(), "awcalc".to_owned()),
+                ("awfiles#2".to_owned(), "awfiles".to_owned()),
+            ]
+        );
+        assert!(instances_in("<apps/>").is_empty());
     }
 
     #[test]

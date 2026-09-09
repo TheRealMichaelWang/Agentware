@@ -5,24 +5,41 @@
 //!
 //! ```text
 //!   query  apps                              agent -> haimanager
-//!   query  view <app>
-//!   query  cells <app> <sheet> <range>
+//!   query  view <instance>
+//!   query  cells <instance> <sheet> <range>
 //!   query  clipboard
-//!   intent <app> <action> <target> [value]
+//!   intent <instance> <action> <target> [value]
 //!
 //!   apps      <awml>                         haimanager -> agent
-//!   view      <app> <awml>
-//!   cells     <app> <sheet> <rows>
+//!   view      <instance> <awml>
+//!   cells     <instance> <sheet> <rows>
 //!   clipboard <kind> <content>
-//!   done      <app> <target> <action>
-//!   rejected  <app> <target> <reason>
-//!   changed      <app>                        haimanager -> agent, unsolicited
-//!   data-changed <app> <source> <element> <range>
+//!   done      <instance> <target> <action>
+//!   rejected  <instance> <target> <reason>
+//!   changed      <instance>                   haimanager -> agent, unsolicited
+//!   data-changed <instance> <source> <element> <range>
 //! ```
 //!
-//! The last two are the unsolicited messages, and they are two because an
-//! application changes in two ways that cost an agent very different things
-//! to look at.
+//! ## An application is addressed by instance, never by name
+//!
+//! `<instance>` is a handle the haimanager gives a window when it attaches,
+//! `awfiles#2`: the application's name and a counter, unique for the life of
+//! the machine. `query apps` lists every open window with its handle, and
+//! every other message names one. A name alone is refused, even when only
+//! one window carries it.
+//!
+//! It has to be the handle because a name is not an identity. Two windows of
+//! one application are two processes with two trees, and an agent addressing
+//! "awfiles" was answered by whichever the haimanager found first, which
+//! raising the target moved to the back, so every action landed on the other
+//! window and every view showed the one it had not just acted on. A directory
+//! walk that had been going well ended with the agent clicking `up` in two
+//! explorers alternately until the loop detector stopped it. The handle is
+//! what makes "the window I opened" a thing an agent can say.
+//!
+//! The last two messages are the unsolicited ones, and they are two because
+//! an application changes in two ways that cost an agent very different
+//! things to look at.
 //!
 //! `changed` says the application's **interface** moved: its tree re-rendered
 //! and what an agent would see of it actually differs, so a view read before
@@ -191,11 +208,11 @@ pub enum Outcome {
 /// workspace is no longer as the agent last saw it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Notice {
-    /// The application's interface changed. Read its view again.
-    View { app: String },
-    /// A sheet the application publishes changed. Read that much of it.
+    /// The window's interface changed. Read its view again.
+    View { instance: String },
+    /// A sheet the window publishes changed. Read that much of it.
     Data {
-        app: String,
+        instance: String,
         /// The stream the cells arrived on, as the element's `source` names it.
         source: String,
         /// The `spreadsheet` element showing that source, which is what
@@ -209,10 +226,10 @@ pub enum Notice {
 }
 
 impl Notice {
-    /// The application the notice is about.
-    pub fn app(&self) -> &str {
+    /// The window the notice is about, by its handle.
+    pub fn instance(&self) -> &str {
         match self {
-            Notice::View { app } | Notice::Data { app, .. } => app,
+            Notice::View { instance } | Notice::Data { instance, .. } => instance,
         }
     }
 }
@@ -363,12 +380,12 @@ impl Link {
     fn collect(&mut self, fields: &[String]) -> bool {
         let notice = match fields.first().map(String::as_str) {
             Some(MSG_CHANGED) => match fields.get(1) {
-                Some(app) => Notice::View { app: app.clone() },
+                Some(instance) => Notice::View { instance: instance.clone() },
                 None => return true,
             },
             Some(MSG_DATA_CHANGED) => match (fields.get(1), fields.get(2)) {
-                (Some(app), Some(source)) => Notice::Data {
-                    app: app.clone(),
+                (Some(instance), Some(source)) => Notice::Data {
+                    instance: instance.clone(),
                     source: source.clone(),
                     element: fields.get(3).filter(|name| !name.is_empty()).cloned(),
                     range: fields.get(4).filter(|range| !range.is_empty()).cloned(),
@@ -513,9 +530,9 @@ impl Link {
 mod tests {
     use super::*;
 
-    fn data(app: &str, source: &str, element: Option<&str>, range: Option<&str>) -> Notice {
+    fn data(instance: &str, source: &str, element: Option<&str>, range: Option<&str>) -> Notice {
         Notice::Data {
-            app: app.into(),
+            instance: instance.into(),
             source: source.into(),
             element: element.map(str::to_owned),
             range: range.map(str::to_owned),
@@ -529,19 +546,21 @@ mod tests {
     fn both_notices_are_collected_and_read_back() {
         let (ours, mut haimanager) = UnixStream::pair().unwrap();
         let mut link = Link::over(ours);
-        haimanager.write_all(&encode(&[MSG_CHANGED, "awsheet"])).unwrap();
+        haimanager.write_all(&encode(&[MSG_CHANGED, "awsheet#1"])).unwrap();
         haimanager
-            .write_all(&encode(&[MSG_DATA_CHANGED, "awsheet", "book/1", "sheet", "B7"]))
+            .write_all(&encode(&[MSG_DATA_CHANGED, "awsheet#1", "book/1", "sheet", "B7"]))
             .unwrap();
-        haimanager.write_all(&encode(&[MSG_DATA_CHANGED, "awsheet", "book/2", "", ""])).unwrap();
+        haimanager
+            .write_all(&encode(&[MSG_DATA_CHANGED, "awsheet#1", "book/2", "", ""]))
+            .unwrap();
 
         let notices = link.take_notices().unwrap();
         assert_eq!(
             notices,
             vec![
-                Notice::View { app: "awsheet".into() },
-                data("awsheet", "book/1", Some("sheet"), Some("B7")),
-                data("awsheet", "book/2", None, None),
+                Notice::View { instance: "awsheet#1".into() },
+                data("awsheet#1", "book/1", Some("sheet"), Some("B7")),
+                data("awsheet#1", "book/2", None, None),
             ]
         );
         // Taken means taken.
@@ -555,13 +574,13 @@ mod tests {
         let (ours, mut haimanager) = UnixStream::pair().unwrap();
         let mut link = Link::over(ours);
         for _ in 0..17 {
-            haimanager.write_all(&encode(&[MSG_CHANGED, "awtext"])).unwrap();
+            haimanager.write_all(&encode(&[MSG_CHANGED, "awtext#1"])).unwrap();
         }
-        haimanager.write_all(&encode(&[MSG_DONE, "awtext", "body", "type-text"])).unwrap();
-        haimanager.write_all(&encode(&[MSG_CHANGED, "awtext"])).unwrap();
+        haimanager.write_all(&encode(&[MSG_DONE, "awtext#1", "body", "type-text"])).unwrap();
+        haimanager.write_all(&encode(&[MSG_CHANGED, "awtext#1"])).unwrap();
 
         assert_eq!(link.next_outcome().unwrap(), Outcome::Done);
-        assert_eq!(link.pending(), &[Notice::View { app: "awtext".into() }]);
+        assert_eq!(link.pending(), &[Notice::View { instance: "awtext#1".into() }]);
         assert_eq!(link.take_notices().unwrap().len(), 1);
     }
 
@@ -577,12 +596,12 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(30));
         assert!(link.pending().is_empty());
 
-        haimanager.write_all(&encode(&[MSG_CHANGED, "awcalc"])).unwrap();
+        haimanager.write_all(&encode(&[MSG_CHANGED, "awcalc#1"])).unwrap();
         assert!(link.wait_notice(Duration::from_secs(5)).unwrap());
         assert_eq!(link.pending().len(), 1);
 
         // Half a frame is the haimanager talking, not silence.
-        let frame = encode(&[MSG_CHANGED, "awsheet"]);
+        let frame = encode(&[MSG_CHANGED, "awsheet#1"]);
         haimanager.write_all(&frame[..5]).unwrap();
         assert!(link.wait_notice(Duration::from_secs(5)).unwrap());
         assert_eq!(link.pending().len(), 1, "half a frame is not a notice yet");

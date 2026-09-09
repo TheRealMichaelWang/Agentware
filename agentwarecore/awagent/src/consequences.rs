@@ -112,9 +112,9 @@ pub fn await_notices(agent: &mut Agent, expected: &HashSet<String>) -> Vec<Notic
 /// One notice as a few words for the log.
 fn describe_briefly(notice: &Notice) -> String {
     match notice {
-        Notice::View { app } => format!("{app} view"),
-        Notice::Data { app, source, element, range } => format!(
-            "{app} {source} {} {}",
+        Notice::View { instance } => format!("{instance} view"),
+        Notice::Data { instance, source, element, range } => format!(
+            "{instance} {source} {} {}",
             element.as_deref().unwrap_or("(no element)"),
             range.as_deref().unwrap_or("(whole)")
         ),
@@ -125,7 +125,9 @@ fn describe_briefly(notice: &Notice) -> String {
 fn unanswered(agent: &Agent, expected: &HashSet<String>) -> Vec<String> {
     let mut missing: Vec<String> = expected
         .iter()
-        .filter(|app| !agent.link.pending().iter().any(|notice| notice.app() == app.as_str()))
+        .filter(|instance| {
+            !agent.link.pending().iter().any(|notice| notice.instance() == instance.as_str())
+        })
         .cloned()
         .collect();
     missing.sort();
@@ -145,29 +147,29 @@ pub fn describe(agent: &mut Agent, notices: &[Notice]) -> Option<String> {
         "The workspace changed while you worked. The present state, re-read for you:\n",
     );
 
-    // One view per application, however many times it re-rendered. Kept
-    // by name as well as written out, because a sheet replaced whole is
+    // One view per window, however many times it re-rendered. Kept by
+    // handle as well as written out, because a sheet replaced whole is
     // sized by the `used` its element carries in the view.
     let mut views: Vec<(String, String)> = Vec::new();
     for notice in notices {
-        let Notice::View { app } = notice else { continue };
-        if views.iter().any(|(seen, _)| seen == app) {
+        let Notice::View { instance } = notice else { continue };
+        if views.iter().any(|(seen, _)| seen == instance) {
             continue;
         }
-        agent.say(turn::KIND_ACTION, &format!("re-reading {app} (it changed)"));
+        agent.say(turn::KIND_ACTION, &format!("re-reading {instance} (it changed)"));
         let asked = Instant::now();
-        let answer = agent.link.view(app);
+        let answer = agent.link.view(instance);
         agent.meter.reading += asked.elapsed();
         match answer {
             Ok(markup) if !markup.is_empty() => {
                 text.push('\n');
                 text.push_str(&markup);
                 text.push('\n');
-                views.push((app.clone(), markup));
+                views.push((instance.clone(), markup));
             }
             Ok(_) => {}
             Err(err) => {
-                log(&format!("could not re-read {app}: {err}"));
+                log(&format!("could not re-read {instance}: {err}"));
                 return Some(text);
             }
         }
@@ -200,7 +202,7 @@ fn used_in(view: &str, element: &str) -> Option<Option<cells::Range>> {
 
 /// One sheet's changes over an exchange, added up.
 struct SheetChange {
-    app: String,
+    instance: String,
     source: String,
     element: Option<String>,
     /// The rectangle written, or `None` once any notice said the sheet was
@@ -219,10 +221,10 @@ impl SheetChange {
     /// cell is worth attaching. `views` is what was read; a sheet whose view
     /// was not is named and left for `read_cells`.
     fn describe(&self, agent: &mut Agent, views: &[(String, String)]) -> String {
-        let SheetChange { app, source, element, range } = self;
+        let SheetChange { instance, source, element, range } = self;
         let shown = match element {
-            Some(id) => format!("sheet {id} in {app}"),
-            None => format!("a sheet in {app} that is not on a visible tab"),
+            Some(id) => format!("sheet {id} in {instance}"),
+            None => format!("a sheet in {instance} that is not on a visible tab"),
         };
         let Some(id) = element else {
             return match range {
@@ -238,7 +240,7 @@ impl SheetChange {
             None => {
                 let used = views
                     .iter()
-                    .find(|(name, _)| name == app)
+                    .find(|(seen, _)| seen == instance)
                     .and_then(|(_, view)| used_in(view, id));
                 match used {
                     Some(Some(used)) => (used, "was replaced whole".to_owned()),
@@ -258,14 +260,17 @@ impl SheetChange {
                  Read the part you need with read_cells."
             );
         }
-        agent.say(turn::KIND_ACTION, &format!("re-reading {app} {id} {named} (it changed)"));
+        agent.say(
+            turn::KIND_ACTION,
+            &format!("re-reading {instance} {id} {named} (it changed)"),
+        );
         let asked = Instant::now();
-        let answer = agent.link.cells(app, id, &named);
+        let answer = agent.link.cells(instance, id, &named);
         agent.meter.reading += asked.elapsed();
         match answer {
             Ok(rows) => format!("{shown} {how}. Cells {named} now hold:\n{rows}"),
             Err(err) => {
-                log(&format!("could not re-read {app} {id} {named}: {err}"));
+                log(&format!("could not re-read {instance} {id} {named}: {err}"));
                 format!("{shown} {how}.")
             }
         }
@@ -276,11 +281,14 @@ impl SheetChange {
 fn sheets_changed(notices: &[Notice]) -> Vec<SheetChange> {
     let mut sheets: Vec<SheetChange> = Vec::new();
     for notice in notices {
-        let Notice::Data { app, source, element, range } = notice else { continue };
+        let Notice::Data { instance, source, element, range } = notice else { continue };
         // A range the haimanager wrote is one this can read; anything else
         // is a wire fault, and the honest reading of it is "somewhere".
         let range = range.as_deref().and_then(cells::parse_range);
-        match sheets.iter_mut().find(|sheet| sheet.app == *app && sheet.source == *source) {
+        match sheets
+            .iter_mut()
+            .find(|sheet| sheet.instance == *instance && sheet.source == *source)
+        {
             Some(sheet) => {
                 sheet.range = match (sheet.range, range) {
                     (Some(sum), Some(run)) => Some(cells::union(sum, run)),
@@ -293,7 +301,7 @@ fn sheets_changed(notices: &[Notice]) -> Vec<SheetChange> {
                 }
             }
             None => sheets.push(SheetChange {
-                app: app.clone(),
+                instance: instance.clone(),
                 source: source.clone(),
                 element: element.clone(),
                 range,
@@ -307,9 +315,9 @@ fn sheets_changed(notices: &[Notice]) -> Vec<SheetChange> {
 mod tests {
     use super::*;
 
-    fn data(app: &str, source: &str, element: Option<&str>, range: Option<&str>) -> Notice {
+    fn data(instance: &str, source: &str, element: Option<&str>, range: Option<&str>) -> Notice {
         Notice::Data {
-            app: app.into(),
+            instance: instance.into(),
             source: source.into(),
             element: element.map(str::to_owned),
             range: range.map(str::to_owned),
@@ -323,7 +331,7 @@ mod tests {
         let notices = [
             data("awsheet", "book/1", Some("sheet"), Some("B7")),
             data("awsheet", "book/1", Some("sheet"), Some("C7:D7")),
-            Notice::View { app: "awsheet".into() },
+            Notice::View { instance: "awsheet".into() },
             data("awsheet", "book/1", Some("sheet"), Some("A8")),
             data("awsheet", "book/2", None, None),
             data("awsheet", "book/2", Some("sheet"), Some("A1")),
