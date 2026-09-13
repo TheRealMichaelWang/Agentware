@@ -73,6 +73,101 @@ const APP_DIR: &str = "/apps";
 /// enough that an idle workspace costs nothing anyone can measure.
 const TICK: Duration = Duration::from_secs(1);
 
+/// The most earlier conversation a turn begins with, in tokens. The one cut
+/// the design makes into context, and it is made here because the desk owns
+/// the conversation (see docs/OnDevice.md, "bound history at the turn
+/// boundary").
+///
+/// The number rests on the padded-history measurements of 12 September
+/// 2026 with the 35B MoE (docs/OnDevicePlan.md, Phase 3), which drew two
+/// curves and they disagree. With ordinary conversation as the history
+/// (questions answered in words), 38k tokens cost nothing on the short
+/// tasks: 15 of 15 passed, exactly as with no history at all. With three
+/// hundred copies of the agent's own action report as the history, the
+/// worst history there could be, the suite fell from 17/18 at 2.5k to
+/// 15/18 at 11k, 12/18 at 20k and 9/18 at 38k, always the same way: a new
+/// request answered in one exchange with a report of work not done, the
+/// shape of the replies in front of it. A real conversation is neither
+/// curve, and the realistic one, padded from genuine transcripts, is not
+/// measured yet. Until it is, this is the design's figure, the one the
+/// ordinary-conversation curve supports. With the history carrying each
+/// turn's tool calls (see `with_calls`), 64k of it scored 12/18 on 13
+/// September 2026 with no fabricated report in any miss, so the budget is
+/// 64k: the memory bound, since a long turn grew 58k tokens over its
+/// history and the slot is 128k. What must not happen is setting this from
+/// the pathological curve: a budget that forgets what the human said an
+/// hour ago, every day, to guard against a failure only a synthetic
+/// history has produced.
+const HISTORY_BUDGET: usize = 65_536;
+
+/// Characters per token for estimating the budget, set low on purpose: the
+/// calibrated figure for this model is about 3.2, and 3 makes the estimate
+/// err towards counting more tokens than there are, so the cut is never
+/// later than it should be.
+const CHARS_PER_TOKEN: usize = 3;
+
+/// The most calls a turn's history entry keeps. A traverse is sixty to a
+/// hundred; what the next turn needs to see is that the work was done with
+/// tools, not every step of it, so the first and last of a long turn stay.
+const CALLS_KEPT: usize = 40;
+
+/// An agent's reply as it goes into the history: the reply, then the tool
+/// calls that earned it, one JSON object per line after
+/// `turn::HISTORY_CALLS`. The agent turns these back into tool-use blocks
+/// when it builds the next turn's conversation (`awagent/src/history.rs`).
+///
+/// History used to hold the reply alone, and that was a flaw measured on
+/// 12 September 2026: a conversation of forty turns, each a request and an
+/// instant report, shows a model no tool call anywhere, however many
+/// hundreds were made, and under such a history it answered new requests
+/// with a report and no tool call, 0 of 15 short tasks at 8k tokens. Listing
+/// the actions as text above the reply made it write that text itself. The
+/// calls go in as calls. The results stay out, since they are the tokens.
+fn with_calls(calls: &[String], reply: &str) -> String {
+    if calls.is_empty() {
+        return reply.to_owned();
+    }
+    let mut text = format!("{reply}\n{}\n", turn::HISTORY_CALLS);
+    if calls.len() <= CALLS_KEPT {
+        for call in calls {
+            let _ = writeln!(text, "{call}");
+        }
+    } else {
+        let head = CALLS_KEPT / 2;
+        for call in &calls[..head] {
+            let _ = writeln!(text, "{call}");
+        }
+        for call in &calls[calls.len() - (CALLS_KEPT - head)..] {
+            let _ = writeln!(text, "{call}");
+        }
+    }
+    text
+}
+
+/// Where the history a turn is given starts: the index of the oldest
+/// message that fits the budget, counting back from the newest, moved
+/// forward to the next human message so what the agent reads begins with
+/// a request rather than an answer to one it cannot see. Whole messages,
+/// oldest dropped first, nothing summarised: a summary is a model call the
+/// desk would have to make, and the design leaves that for the day it is
+/// needed.
+fn kept_from(history: &[Message]) -> usize {
+    let mut spent = 0;
+    let mut start = history.len();
+    while start > 0 {
+        let cost = history[start - 1].text.len() / CHARS_PER_TOKEN + 1;
+        if spent + cost > HISTORY_BUDGET {
+            break;
+        }
+        spent += cost;
+        start -= 1;
+    }
+    while start < history.len() && history[start].role != turn::ROLE_HUMAN {
+        start += 1;
+    }
+    start
+}
+
 /// An installed application, by package.
 struct Installed {
     /// The folder name, which is what the broker is asked for.
@@ -104,6 +199,10 @@ struct Running {
     /// Whether the agent has replied yet. One that hangs up without replying
     /// ended some other way, and the human is told so.
     replied: bool,
+    /// Every tool call the agent reported this turn (`turn::KIND_CALL`), in
+    /// order, so the reply that ends the turn carries them into the
+    /// history. See `with_calls`.
+    calls: Vec<String>,
     started: Instant,
     /// What the turn runs as, for the working line under the transcript. Held
     /// here rather than read from the selector, which may already say what
@@ -119,6 +218,9 @@ struct Desk {
     /// What goes to the agent as context: what was said, by whom. A subset of
     /// `lines`, because telemetry and system notes are for the human.
     history: Vec<Message>,
+    /// How many of the oldest messages no longer reach the agent, so the
+    /// pane says so once when the number grows and not on every turn.
+    forgotten: usize,
     /// The message being composed.
     composing: String,
     /// Which of the backend configurations this desk's turns run with. Chosen
@@ -265,6 +367,7 @@ impl Desk {
             broker: None,
             lines: Vec::new(),
             history: Vec::new(),
+            forgotten: 0,
             composing: String::new(),
             backend: turn::default_backend(stored.anthropic_key.is_some()),
             backend_open: false,
@@ -359,6 +462,18 @@ impl Desk {
             self.history.push(Message { role: turn::ROLE_HUMAN.into(), text });
         }
 
+        // The one cut into context: what the agent begins with is bounded
+        // here, at the turn boundary, where the prompt is assembled fresh
+        // anyway. The pane is told once, when the cut first moves.
+        let start = kept_from(&self.history);
+        if start > self.forgotten {
+            self.note(format!(
+                "The conversation is longer than the agent is given: its first {start} \
+                 message(s) no longer reach it."
+            ));
+            self.forgotten = start;
+        }
+
         let desk = self.id;
         match self.ask(|broker| broker.start_agent(desk)) {
             Ok((pid, stream)) => match Channel::new(stream) {
@@ -376,8 +491,12 @@ impl Desk {
                             description: app.description.clone(),
                         })
                         .collect();
-                    if let Err(err) =
-                        channel.send_context(&self.history, &prompt, self.backend.id, &installed)
+                    if let Err(err) = channel.send_context(
+                        &self.history[start..],
+                        &prompt,
+                        self.backend.id,
+                        &installed,
+                    )
                     {
                         self.status = format!("could not brief the agent: {err}");
                         self.note(self.status.clone());
@@ -388,6 +507,7 @@ impl Desk {
                         pid,
                         channel,
                         replied: false,
+                        calls: Vec::new(),
                         started: Instant::now(),
                         label: self.backend.label,
                     });
@@ -441,12 +561,26 @@ impl Desk {
         let mut dirty = !reports.is_empty();
         for report in reports {
             match report {
+                // A call is kept for the history and never shown: the pane
+                // has the action lines for that.
+                Report::Telemetry { kind, text } if kind == turn::KIND_CALL => {
+                    if let Some(running) = &mut self.turn {
+                        running.calls.push(text);
+                    }
+                }
                 Report::Telemetry { kind, text } => self.lines.push(Line::Telemetry(kind, text)),
                 Report::Reply(text) => {
-                    if let Some(running) = &mut self.turn {
-                        running.replied = true;
-                    }
-                    self.history.push(Message { role: turn::ROLE_AGENT.into(), text: text.clone() });
+                    let calls = match &mut self.turn {
+                        Some(running) => {
+                            running.replied = true;
+                            std::mem::take(&mut running.calls)
+                        }
+                        None => Vec::new(),
+                    };
+                    self.history.push(Message {
+                        role: turn::ROLE_AGENT.into(),
+                        text: with_calls(&calls, &text),
+                    });
                     self.lines.push(Line::Agent(text));
                 }
                 // The agent may open applications, but only through the
@@ -900,5 +1034,46 @@ fn log(message: &str) {
         let _ = kmsg.write_all(line.as_bytes());
     } else {
         eprintln!("agentdesk: {message}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn said(role: &str, chars: usize) -> Message {
+        Message { role: role.into(), text: "x".repeat(chars) }
+    }
+
+    #[test]
+    fn a_short_conversation_is_kept_whole() {
+        let history: Vec<Message> = (0..10)
+            .map(|i| said(if i % 2 == 0 { turn::ROLE_HUMAN } else { turn::ROLE_AGENT }, 300))
+            .collect();
+        assert_eq!(kept_from(&history), 0);
+        assert_eq!(kept_from(&[]), 0);
+    }
+
+    #[test]
+    fn the_oldest_go_first_and_what_is_kept_starts_with_the_human() {
+        // Each pair is 2 * (3000 / 3 + 1) = 2002 tokens by the estimate, so
+        // the budget holds about sixteen pairs of the forty.
+        let history: Vec<Message> = (0..80)
+            .map(|i| said(if i % 2 == 0 { turn::ROLE_HUMAN } else { turn::ROLE_AGENT }, 3000))
+            .collect();
+        let start = kept_from(&history);
+        assert!(start > 0 && start < history.len(), "{start}");
+        assert_eq!(history[start].role, turn::ROLE_HUMAN);
+        let kept: usize = history[start..].iter().map(|m| m.text.len() / CHARS_PER_TOKEN + 1).sum();
+        assert!(kept <= HISTORY_BUDGET);
+        // One more pair would not have fitted.
+        let one_more = kept + 2 * (3000 / CHARS_PER_TOKEN + 1);
+        assert!(one_more > HISTORY_BUDGET);
+    }
+
+    #[test]
+    fn a_single_message_over_budget_leaves_nothing_but_never_panics() {
+        let history = vec![said(turn::ROLE_HUMAN, HISTORY_BUDGET * CHARS_PER_TOKEN * 2)];
+        assert_eq!(kept_from(&history), 1);
     }
 }

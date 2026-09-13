@@ -32,9 +32,27 @@ pub fn open() {
             }
         }
         Err(err) => {
-            eprintln!("supervisor: could not open /dev/kmsg: {err}");
+            stderr(&format!("could not open /dev/kmsg: {err}"));
         }
     }
+}
+
+/// Write to stderr and never mind whether it worked.
+///
+/// `eprintln!` panics when the write fails, and for PID 1 stderr is
+/// `/dev/console`, which is whatever the last `console=` on the kernel
+/// command line named. On the Framework Desktop that was a serial port the
+/// machine does not have: the first log line panicked, the panic hook tried
+/// to say so through the same stderr, and a panic inside a panic is an
+/// abort. The kernel then reported "Attempted to kill init" three hundred
+/// microseconds after starting it, with no supervisor line anywhere,
+/// because there was nowhere for one to go. A log that cannot be written is
+/// a log lost, never a reason to stop.
+fn stderr(line: &str) {
+    let mut out = std::io::stderr().lock();
+    let _ = out.write_all(b"supervisor: ");
+    let _ = out.write_all(line.as_bytes());
+    let _ = out.write_all(b"\n");
 }
 
 /// Write one log record. Each `write` to `/dev/kmsg` is exactly one record, so
@@ -55,7 +73,7 @@ pub fn emit(level: u8, args: fmt::Arguments<'_>) {
         *slot = None;
     }
 
-    eprintln!("supervisor: {line}");
+    stderr(&line);
 }
 
 macro_rules! kinfo {

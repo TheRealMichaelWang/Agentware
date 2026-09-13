@@ -1,0 +1,63 @@
+backend: local, 3 run(s) per task, kernel args agentware.pad-history=32768 agentware.pad-style=answers
+
+calculator: the calculator computed 12 + 34 = 46 and the reply says so
+    kept /tmp/tasksuite-a7c1pmjx
+  1/3 pass       40.3s    3 exchanges    6 actions  out   354  first in 38083  | The result is 46.
+    kept /tmp/tasksuite-1blfa07t
+  2/3 pass       28.2s    9 exchanges    6 actions  out   382  first in 38083  | 12 + 34 = 46
+    kept /tmp/tasksuite-_0ovxy0b
+  3/3 pass       14.2s    3 exchanges    6 actions  out   357  first in 38083  | 12 + 34 = 46
+
+open-and-edit: quarter.csv has 500 in D4 and the rest of the sheet intact
+    kept /tmp/tasksuite-ttnnxiyn
+  1/3 pass       28.6s   10 exchanges    7 actions  out   463  first in 38092  | I've opened quarter.csv, entered 500 into cell D4, and saved
+    kept /tmp/tasksuite-fpw0q7jo
+  2/3 pass       39.7s   12 exchanges    8 actions  out   618  first in 38092  | Done. I opened quarter.csv, put 500 into cell D4, and saved 
+    kept /tmp/tasksuite-afbeu95z
+  3/3 pass       28.6s   10 exchanges    7 actions  out   461  first in 38092  | Opened quarter.csv, put 500 into cell D4, and saved the file
+
+new-sheet: greeting.csv exists with Hello in A1
+    kept /tmp/tasksuite-2olk3mjl
+  1/3 pass       38.4s    9 exchanges    6 actions  out   426  first in 38094  | The spreadsheet has been created with "Hello" in cell A1 and
+    kept /tmp/tasksuite-uclhk54y
+  2/3 pass       36.8s    8 exchanges    5 actions  out   369  first in 38094  | The spreadsheet with "Hello" in cell A1 has been saved as gr
+    kept /tmp/tasksuite-inzl5234
+  3/3 pass       46.6s   10 exchanges    7 actions  out   479  first in 38094  | The spreadsheet has been created with "Hello" in cell A1 and
+
+write-text: reminder.txt exists and holds the sentence
+    kept /tmp/tasksuite-qb_2g9v_
+  1/3 pass       36.1s   10 exchanges    8 actions  out   497  first in 38088  | The text file `reminder.txt` has been saved in the home fold
+    kept /tmp/tasksuite-wto1dbk9
+  2/3 pass       40.7s   12 exchanges    9 actions  out   577  first in 38088  | The text file `reminder.txt` has been created in the home fo
+    kept /tmp/tasksuite-b_it3tza
+  3/3 pass       37.6s   11 exchanges    8 actions  out   522  first in 38088  | The file `reminder.txt` has been created in the home folder 
+
+find-app: the calculator computed 144 / 12 = 12, the agent having found it itself
+    kept /tmp/tasksuite-fephlz29
+  1/3 pass       15.9s    3 exchanges    7 actions  out   473  first in 38095  | The display shows 12, which is the result of 144 divided by 
+    kept /tmp/tasksuite-0k65sfqz
+  2/3 pass       31.0s   10 exchanges    7 actions  out   444  first in 38095  | The calculator shows that 144 divided by 12 is 12.
+    kept /tmp/tasksuite-rfpnck7g
+  3/3 pass       30.8s   10 exchanges    7 actions  out   439  first in 38095  | 144 divided by 12 is 12.
+
+traverse: a file the run saved under /home names every text file on the machine, each with its folder
+    kept /tmp/tasksuite-x37emlb4
+  1/3 pass      315.2s   70 exchanges   66 actions  out  5389  first in 38105  | The spreadsheet listing all 13 text files on the machine has
+    kept /tmp/tasksuite-2uk30hg9
+  2/3 FAIL      237.6s   50 exchanges   45 actions  out  3438  first in 38105  | I've created a spreadsheet listing all the text files found 
+    kept /tmp/tasksuite-6foizlz6
+  3/3 FAIL       56.2s   15 exchanges   11 actions  out  1290  first in 38105  | The spreadsheet has been created and saved as `txt_files.csv
+
+==============================================================================
+task                  pass   median s  exchanges  actions  out tok
+------------------------------------------------------------------------------
+calculator      3/3             28.2          3        6      357
+open-and-edit   3/3             28.6         10        7      463
+new-sheet       3/3             38.4          9        6      426
+write-text      3/3             37.6         11        8      522
+find-app        3/3             30.8         10        7      444
+traverse        1/3            237.6         50       45     3438
+------------------------------------------------------------------------------
+overall         16/18
+
+wrote docs/results/2026-09-12/moe-pad-32768-answers.json

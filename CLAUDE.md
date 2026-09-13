@@ -61,6 +61,16 @@ state.img               the state volume: ext4 on /dev/vdb, mounted at /state,
                         holds settings.xml; made on first `make run`, gitignored
 initramfs.cpio.gz       the boot stage: the supervisor and /dev/console,
                         nothing else; written by tools/mkinitramfs.py
+initramfs-usb.cpio.gz   the same plus the GPU's firmware, for real hardware;
+                        made by `make usb`, gitignored
+kernel/                 the two kernel defconfigs: agentware.config for QEMU,
+                        agentware-usb.config for the Framework (amdgpu, EFI
+                        framebuffer console, NVMe, UAS, built-in cmdline)
+linux-firmware/         submodule: the official firmware tree, pinned to a
+                        release, sparse-checked-out to amdgpu/
+tools/usbstick.sh       lay a USB stick (or a loop device) out to boot from
+tools/usbboot.py        boot a stick image under OVMF with no serial port
+                        and photograph it
 system.img              the OS: an ext4 volume (/dev/vda) the supervisor
                         mounts and binds into the root, demand-paged; rebuilt
                         whole by `make pack`
@@ -724,6 +734,34 @@ calls it a loop too, since `up` from anywhere under `/apps` lands back at
 `/apps`, an identical state reached honestly. Both ask of one call a question
 only the whole turn can answer.
 
+**It boots real hardware.** The Phase 1.5 spike (`docs/OnDevicePlan.md`)
+booted the Framework Desktop from a USB stick on 13 September 2026 to the
+supervisor's boot report, with its volumes mounted off the stick. The
+kernel for that is a worktree of the submodule, `kernel-usb-src/`, with
+what a real screen and a real disk need before a GPU driver (`SYSFB`,
+`FB_EFI`, `FRAMEBUFFER_CONSOLE`, `BLK_DEV_NVME`, `USB_UAS`) and a built-in
+command line the EFI stub boots with no loader; `tools/usbstick.sh` lays
+the stick out through udisks without root; the supervisor takes
+`agentware.volume-wait=<ms>` for a disk that takes seconds to enumerate and
+`agentware.report-only` to stop after the report so a console with no
+scrollback can be read. Secure Boot has to be off: the kernel is unsigned.
+The one failure on the way is a gotcha below (`eprintln!` and a console
+that is not there).
+
+Phase 5 then put the GPU on the stick. The bare-metal kernel's
+configuration is checked in as `kernel/agentware-usb.config` (`make
+kernel-usb` builds it, `make kernelconfig-usb` saves it back) with amdgpu,
+its display core and fbdev emulation built in, and the Strix Halo's
+firmware rides in a second initramfs, `initramfs-usb.cpio.gz`, because
+the driver asks for it while probing, before any disk exists. The files
+come from the `linux-firmware` submodule, the official tree pinned to a
+release, and the list is this machine's, read off the GPU's IP discovery
+table in sysfs and mapped through the driver's `MODULE_FIRMWARE` lines
+(the plan's guessed list had every version wrong). `make usb` builds all
+of it; `tools/usbboot.py` boots the stick's layout under OVMF the way the
+Framework boots the stick, USB disk and no serial port, and photographs
+the screen, which is how every change to the stick is tried first.
+
 **The guest has a network, for the agent alone.** QEMU adds a slirp NIC
 (`-netdev user`), the kernel configures it itself from the `ip=` boot
 argument (CONFIG_IP_PNP and CONFIG_VIRTIO_NET were already in the config),
@@ -740,6 +778,8 @@ display with nothing on it.
 make selftest    # headless supervisor self-test, exits 0 on success
 make run         # boot in a QEMU window
 make pack        # build the boot stage and system image without booting
+make usb         # pack, plus the bare-metal kernel and the firmware initramfs
+                 # for tools/usbstick.sh
 ```
 
 The guest display is a custom 2560x1440 monitor QEMU invents, opened fullscreen
@@ -868,9 +908,17 @@ the host's loopback.
 
 ```
 llama-server -m ~/llm/models/Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf \
-  -ngl 99 -c 131072 -fa on --jinja --spec-type draft-mtp \
+  -ngl 99 -c 131072 -fa on --jinja --spec-type draft-mtp,ngram-mod \
   --host 127.0.0.1 --port 8080
 ```
+
+`draft-mtp,ngram-mod` is the draft head plus n-gram lookup in the context,
+measured on 12 September against every mode the server offers without a
+second model (`docs/results/2026-09-12/decode-*.json`, greedy, tok/s of
+generation on tool calls): none 57, draft head 94 flat, n-gram lookup alone
+59 on a turn's first exchange and up to 116 once there is a call to copy
+from, the two together 78 on the first exchange and 120 to 139 after it. A
+turn is one first exchange and several later ones.
 
 **No `-md`.** That model's MTP draft head is inside the same file, so naming
 it as the draft model loads a second complete 25.3 GiB copy and OOMs the
@@ -923,7 +971,83 @@ implied by whether an API key was set, which stops being an answer the moment
 a key exists for testing the hosted model.
 
 `--keep` leaves each run's state image and serial log behind, which is how a
-failing task gets diagnosed.
+failing task gets diagnosed, and how a whole campaign gets scored again
+when a check changes: `tools/recheck.py --update <suite log>` finds every
+kept run named in a log, applies the checks as they are now, prints what
+changed, and rewrites `passed` in the JSON beside the log, so a table is
+always drawn under one rule. `--all` scores every run against every task,
+which is the cross-check that a check is checking something.
+
+Two more flags put a machine into a configuration for a whole campaign
+without anyone clicking through the Settings app. `--setting
+agent/local-thinking=on` writes an element into each run's own copy of
+`settings.xml` before it boots (any path the settings module reads).
+`--pad 32768` begins every turn with that much earlier conversation: the
+suite sizes a hand-written conversation (`tools/padding.py`, the text in
+`tools/fixtures/conversation-*.txt`, about 15k tokens of a person actually
+using this machine, varied requests and the agent's replies in the register
+of the real ones) against the model server's own tokenizer, writes it into
+the run's state image, and names it on the kernel command line; the agent
+reads the file it is pointed at and knows nothing else about it
+(`awagent/src/padding.rs`, a dozen lines). Past 15k the fixture starts over,
+and the suite prints and records how many times. The exchange line's `in N`
+is the size that was actually sent, recorded as `first_input`. The first
+version of this generated the padding inside the agent, three hundred
+copies of one action report: see the gotcha about synthetic history for
+what that measured instead. `--append` still adds arbitrary kernel
+arguments.
+
+The checks are stricter than they were. `traverse` asks for every text file
+on the machine, and the check used to accept the three under `/home`, so
+a run that listed 3 of the machine's 13 and stopped scored the same as a
+full traversal; it now requires every text file in the two images, each on
+a row with its folder, and the list is read out of the images rather than
+written down. Under that rule the 12 September thinking-off baseline lost
+one of its three `traverse` passes, a sheet naming the three home files and
+nothing else. The 8 September table was scored under the old rule and its
+raw runs are gone, so its `traverse` row cannot be re-scored and stands
+with this note.
+
+### `tools/slotbench.py`: what the cache design rests on
+
+Host side, starts its own servers. For each KV precision it reads what a
+load pins off `MemAvailable`, prefills a conversation into slot 0, repeats
+it, continues it, saves the slot, erases it, restores it, and sends the
+three shapes of next request again, reading the server's own `cache_n` on
+every answer so a hit and a miss are the server's word and not the clock's.
+
+```
+tools/slotbench.py                                  # 20k tokens, every variant
+tools/slotbench.py --tokens 114000 --only f16 --variant default
+```
+
+**What it answered (Phase 3), 8 September 2026, Qwen3.6-35B-A3B on Vulkan:**
+
+* **llama.cpp reserves the KV up front.** 128k pins 2.4 GiB more than 32k
+  before a token is sent (29.9 against 27.5 GiB at f16), so the memory
+  floor in `docs/OnDevice.md` is a guarantee and not a hope.
+* **Save and restore work, at f16 and q8, and they are fast.** 114k tokens:
+  save 0.54s, restore 0.31s, 2.25 GiB on disk (q8: 0.30s, 0.17s, 1.22 GiB),
+  against **242s** to prefill the same conversation from nothing. A
+  thousandfold, which is the saved tier's whole premise.
+* **A restored conversation is reused by any request that continues it**,
+  which every agent exchange does: 20k tokens restored in 0.05s and the
+  continuation prefilled 13 tokens. The one shape a restore cannot resume
+  is an **exact repeat** of the saved prompt: this model is hybrid (its
+  linear-attention layers carry a recurrent state that cannot be rewound),
+  the server re-evaluates at least the last token of a repeated prompt, and
+  that needs a checkpoint from before the end, which the save file does not
+  carry (`server-context.cpp`, "forcing full prompt re-processing due to
+  lack of cache data"). Exact repeats never occur in the loop. Two benches
+  measured only that shape before the third measured the real one, which
+  is worth remembering: a benchmark of a cache has to send the request the
+  system actually sends.
+* **q8 KV is not worth it for this model.** Hybrid attention keeps the KV
+  small (2.25 GiB for 114k tokens), so quantizing saves 1.2 GiB per full
+  slot and costs 25% of prefill speed (304s against 242s for 114k). The
+  suite under q8 scored 17/18, the miss being the model answering
+  `find-app` from its head with zero actions, which is not a precision
+  effect. Stay at f16.
 
 ### What has been measured
 
@@ -936,7 +1060,12 @@ tool calls rather than that it *may*.
 
 **The pass-rate table, Phase 2c, produced 8 September 2026.** Six tasks,
 three runs each, per configuration; median seconds and exchanges per task.
-Every run is kept under `/tmp/tasksuite-*` with its serial log and disk.
+The raw runs (serial logs, disk images, per-run JSON) were kept under
+`/tmp`, which is a tmpfs, and the machine rebooted on 11 September before
+they were copied out; **these tables and the slotbench numbers above are
+the whole surviving record.** Anything measured from now on goes in
+`docs/results/<date>/` from the start, and the suite is run with
+`--json docs/results/<date>/<label>.json`.
 
 | task | Claude Opus 5 | Qwen3.6-35B-A3B MoE | Qwen3.8-27B dense |
 | --- | --- | --- | --- |
@@ -1436,6 +1565,14 @@ them is part of the application catalogue and none reaches an agent.
 * **virtio-gpu does not scan out what you wrote.** The host keeps its own copy
   and only transfers on an explicit dirty call. Without it the screen stays as
   it was while every ioctl reports success.
+* **amdgpu refuses that same dirty call, every time, from anyone in
+  userspace.** Its `amdgpu_dirtyfb` returns `ENOSYS` when the caller has a
+  file, so the "harmless on real hardware" the compositor assumed was one
+  "could not present" log line per frame into a kernel log with the rate
+  limit off. The card scans out of the buffer the CPU wrote, so the frame
+  was on screen all along; `Display::dirty` learns from the first refusal
+  and stops asking. A driver-specific assumption in a DRM client is worth
+  reading the other driver's source for before the first boot, not after.
 * **`rustix::process::waitpid(None, ..)` is `waitpid(0)`**, meaning any child in
   the caller's *process group*. The reaper must use `wait()`, which is
   `waitpid(-1)`. Services call `setsid` and orphans keep their original group,
@@ -1633,3 +1770,47 @@ them is part of the application catalogue and none reaches an agent.
   can see. The stale check is by version, so such a click is thrown away; the
   cost is one lost click a minute at worst and the alternative is acting on a
   tree the human did not see. Do not "fix" it by skipping the check.
+* **`debugfs rm` then `debugfs write` hands the old file's blocks to the new
+  one.** `rm` unlinks without freeing, `write` allocates from the same
+  bitmap, and the `e2fsck` afterwards resolves the double claim by cutting
+  the new file to the old one's length. `tools/setkey.py` did exactly this
+  and it never showed, because a key replaces a key of the same size. The
+  task suite's `--setting` added one element, the file came back truncated
+  mid-word, the guest could not parse it and rewrote the defaults over it,
+  key and all, and a run labelled "thinking on" measured thinking off. The
+  fsck now runs between the unlink and the write. Check the image after
+  writing to it, and check the setting inside the guest, not only the
+  command line that asked for it.
+* **`debugfs ls -p` prints a directory's mode with a leading zero and a
+  file's without.** `040755` against `100644`. A filter for modes starting
+  `40` therefore matched no folder at all, the list of the machine's text
+  files that the `traverse` check is built from held 3 entries instead of
+  13, and a check meant to be strict re-scored five campaigns and changed
+  one verdict, which looked like confirmation. It was caught by reading
+  one "passing" sheet and finding three rows in it. When a stricter check
+  changes almost nothing, read one of the runs it passed.
+* **`eprintln!` panics when stderr cannot be written, and PID 1's stderr is
+  whatever the last `console=` named.** On the Framework Desktop the
+  built-in command line ended `console=ttyS0`, a serial port the machine
+  does not have. The supervisor's first log line, before `/dev/kmsg`
+  exists, went through `eprintln!`, which panicked; the panic hook said so
+  through the same `eprintln!`; a panic inside a panic is `abort()`, whose
+  `hlt` the kernel reported as a general protection fault in init and
+  "Attempted to kill init! exitcode=0xb", 300 microseconds after starting
+  it, with no supervisor line anywhere because there was nowhere for one to
+  go. QEMU has a serial port, so it never showed. `klog::stderr` writes and
+  ignores the result now, and the console order puts `tty0` last. To test
+  a boot that has no serial port, boot the stick's layout as a loop image
+  under OVMF with `-serial none` and photograph the screen through the
+  monitor's `screendump`; that reproduced the fault byte for byte.
+* **Synthetic history teaches the model what a reply looks like.** Padding
+  the conversation with three hundred earlier turns that each end in the
+  agent's report of finished work made the model answer a new request
+  with such a report and no tool call, from about 10k tokens on. The same
+  length of history with no action reports in it cost nothing on the short
+  tasks up to 38k. A measurement of "quality against context length" that
+  pads with the agent's own kind of output is measuring the padding's
+  content as much as its length, and the honest experiment runs both
+  styles. What that implies about the remedy (a sentence in the system
+  prompt against a shorter history) is in the measuring section, with the
+  numbers.

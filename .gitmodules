@@ -1,3 +1,6 @@
 [submodule "kernel-build"]
 	path = kernel-build
 	url = https://github.com/torvalds/linux.git
+[submodule "linux-firmware"]
+	path = linux-firmware
+	url = https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git

@@ -3,8 +3,14 @@
 # so none of it belongs in the repository.
 target/
 initramfs.cpio.gz
+initramfs-usb.cpio.gz
 system.img
 sysroot/
+# The bare-metal kernel: a worktree of the submodule built with its own
+# config (EFI framebuffer console, NVMe, a built-in command line for a USB
+# stick), kept out of the QEMU kernel's tree. See docs/OnDevicePlan.md 1.5.
+kernel-usb-src/
+kernel-usb/
 # The state volume is this machine's, like a disk. Made by `make run`.
 state.img
 __pycache__/

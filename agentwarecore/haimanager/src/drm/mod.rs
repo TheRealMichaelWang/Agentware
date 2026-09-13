@@ -68,6 +68,13 @@ pub struct Display {
     /// The CRTC configuration found at startup, restored on the way out so a
     /// clean exit hands the console back rather than leaving a dead screen.
     saved: uapi::Crtc,
+    /// Whether this driver takes dirty calls at all. virtio-gpu needs them;
+    /// amdgpu answers every one from userspace with `ENOSYS` (its
+    /// `amdgpu_dirtyfb` serves only the kernel's own fbdev client), and a
+    /// scanout engine reading the buffer the CPU wrote needs no telling.
+    /// Learned from the first refusal, so a real card costs one log line
+    /// rather than one per frame.
+    dirty_supported: bool,
 }
 
 impl Display {
@@ -95,9 +102,30 @@ impl Display {
 
         let front = allocate(fd, mode.hdisplay as u32, mode.vdisplay as u32)?;
 
-        let mut display = Self { card, crtc_id, connector_id, mode, front, saved };
+        let mut display =
+            Self { card, crtc_id, connector_id, mode, front, saved, dirty_supported: true };
         display.present()?;
         Ok(display)
+    }
+
+    /// Run one dirty call, and stop making them if the driver has none.
+    ///
+    /// `ENOSYS` is the kernel's answer when a framebuffer has no dirty
+    /// handler for userspace, which on amdgpu is every framebuffer. That is
+    /// not a failed present: the card scans out of the mapping directly, so
+    /// the frame is already on screen. Any other error is reported as before.
+    fn dirty(&mut self, call: impl FnOnce(BorrowedFd<'_>, u32) -> io::Result<()>) -> io::Result<()> {
+        if !self.dirty_supported {
+            return Ok(());
+        }
+        match call(self.card.as_fd(), self.front.fb_id) {
+            Err(err) if err.raw_os_error() == Some(libc::ENOSYS) => {
+                self.dirty_supported = false;
+                crate::log("the driver takes no dirty calls; presenting by scanout alone");
+                Ok(())
+            }
+            other => other,
+        }
     }
 
     pub fn mode_name(&self) -> String {
@@ -158,10 +186,12 @@ impl Display {
 
     /// Push what has been drawn to the screen.
     ///
-    /// Required on virtual hardware, harmless on real hardware. See
-    /// [`uapi::FbDirty`] for why writing the mapping is not by itself enough.
+    /// Required on virtual hardware; refused by real hardware, which is
+    /// already showing it. See [`uapi::FbDirty`] for why writing the mapping
+    /// is not by itself enough on the former, and [`Display::dirty`] for the
+    /// latter.
     pub fn flush(&mut self) -> io::Result<()> {
-        uapi::dirty_fb(self.card.as_fd(), self.front.fb_id)
+        self.dirty(uapi::dirty_fb)
     }
 
     /// Copy a small canvas into the framebuffer at a position, without marking
@@ -223,7 +253,7 @@ impl Display {
         if clips.is_empty() {
             return Ok(());
         }
-        uapi::dirty_fb_rects(self.card.as_fd(), self.front.fb_id, &clips)
+        self.dirty(|fd, fb_id| uapi::dirty_fb_rects(fd, fb_id, &clips))
     }
 
     /// Point the CRTC at our framebuffer.

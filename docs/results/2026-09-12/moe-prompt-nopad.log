@@ -1,0 +1,63 @@
+backend: local, 3 run(s) per task
+
+calculator: the calculator computed 12 + 34 = 46 and the reply says so
+    kept /tmp/tasksuite-3blwggfm
+  1/3 pass       17.6s    9 exchanges    6 actions  out   382  first in 2627  | 12 + 34 = 46
+    kept /tmp/tasksuite-y6ryustd
+  2/3 pass       15.3s    9 exchanges    6 actions  out   387  first in 2627  | The sum of 12 and 34 is 46.
+    kept /tmp/tasksuite-ngyau3rq
+  3/3 pass       15.1s    9 exchanges    6 actions  out   383  first in 2627  | 12 + 34 = 46.
+
+open-and-edit: quarter.csv has 500 in D4 and the rest of the sheet intact
+    kept /tmp/tasksuite-8my1zi9n
+  1/3 pass       27.3s   11 exchanges    8 actions  out   613  first in 2636  | Done. I opened quarter.csv, put 500 into cell D4, and saved 
+    kept /tmp/tasksuite-u_by28gf
+  2/3 pass       21.3s   10 exchanges    7 actions  out   636  first in 2636  | I've successfully opened quarter.csv, put 500 into cell D4, 
+    kept /tmp/tasksuite-zs2xheym
+  3/3 pass       23.5s   11 exchanges    7 actions  out   754  first in 2636  | Done. I opened quarter.csv, set cell D4 to 500, and saved th
+
+new-sheet: greeting.csv exists with Hello in A1
+    kept /tmp/tasksuite-oat3g0f1
+  1/3 pass       22.5s    9 exchanges    6 actions  out   578  first in 2638  | The spreadsheet has been created and saved successfully. The
+    kept /tmp/tasksuite-2lc3vm7f
+  2/3 pass       21.3s    8 exchanges    6 actions  out   551  first in 2638  | The spreadsheet has been created and saved successfully. The
+    kept /tmp/tasksuite-daq5tadb
+  3/3 pass       21.2s    9 exchanges    6 actions  out   497  first in 2638  | Done. The spreadsheet with "Hello" in cell A1 has been saved
+
+write-text: reminder.txt exists and holds the sentence
+    kept /tmp/tasksuite-9b1z1tmd
+  1/3 pass       22.2s   10 exchanges    6 actions  out   733  first in 2632  | The file has been created successfully. The tab now shows "r
+    kept /tmp/tasksuite-7kpfp454
+  2/3 pass       18.0s    9 exchanges    6 actions  out   621  first in 2632  | Done. I've created a new text file called `reminder.txt` in 
+    kept /tmp/tasksuite-xyrfqvgf
+  3/3 pass       19.1s   10 exchanges    7 actions  out   476  first in 2632  | The file `reminder.txt` has been created in the home folder 
+
+find-app: the calculator computed 144 / 12 = 12, the agent having found it itself
+    kept /tmp/tasksuite-y7bpoyru
+  1/3 pass       18.7s   10 exchanges    7 actions  out   556  first in 2639  | 144 divided by 12 = 12.
+    kept /tmp/tasksuite-ypazjav9
+  2/3 pass       12.0s    5 exchanges    7 actions  out   494  first in 2639  | The calculator shows the result is **12**.  144 ÷ 12 = 12
+    kept /tmp/tasksuite-modoqae8
+  3/3 pass       18.7s   10 exchanges    7 actions  out   563  first in 2639  | The calculator shows **12** as the result.  144 ÷ 12 = **12*
+
+traverse: a file the run saved under /home names every text file on the machine, each with its folder
+    kept /tmp/tasksuite-npxvp058
+  1/3 pass      230.2s   58 exchanges   64 actions  out  5216  first in 2649  | The spreadsheet has been created and saved as `/home/text_fi
+    kept /tmp/tasksuite-6m1wutp3
+  2/3 pass      229.8s   59 exchanges   67 actions  out  4919  first in 2649  | The spreadsheet has been saved to `/home/text_files.csv`.   
+    kept /tmp/tasksuite-3zwjca8s
+  3/3 pass      277.8s   75 exchanges   78 actions  out  6170  first in 2649  | I've successfully created a spreadsheet listing all text fil
+
+==============================================================================
+task                  pass   median s  exchanges  actions  out tok
+------------------------------------------------------------------------------
+calculator      3/3             15.3          9        6      383
+open-and-edit   3/3             23.5         11        7      636
+new-sheet       3/3             21.3          9        6      551
+write-text      3/3             19.1         10        6      621
+find-app        3/3             18.7         10        7      556
+traverse        3/3            230.2         59       67     5216
+------------------------------------------------------------------------------
+overall         18/18
+
+wrote docs/results/2026-09-12/moe-prompt-nopad.json

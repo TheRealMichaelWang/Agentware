@@ -1,0 +1,63 @@
+backend: local, 3 run(s) per task, settings agent/local-thinking=on
+
+calculator: the calculator computed 12 + 34 = 46 and the reply says so
+    kept /tmp/tasksuite-jpd3nmze
+  1/3 pass       22.0s   10 exchanges    7 actions  out   647  first in 2545  | The result of 12 + 34 is **46**.
+    kept /tmp/tasksuite-mp4kgnzl
+  2/3 pass       11.5s    4 exchanges    7 actions  out   510  first in 2545  | I have added 12 and 34, and the result is 46. The calculator
+    kept /tmp/tasksuite-o7nvgg0y
+  3/3 pass        9.2s    4 exchanges    6 actions  out   387  first in 2545  | The result of 12 + 34 is 46.
+
+open-and-edit: quarter.csv has 500 in D4 and the rest of the sheet intact
+    kept /tmp/tasksuite-t6t7x2lj
+  1/3 pass       21.4s   10 exchanges    7 actions  out   665  first in 2554  | Done. I've opened quarter.csv, entered 500 into cell D4, and
+    kept /tmp/tasksuite-_z1z4u21
+  2/3 pass       26.4s   10 exchanges    8 actions  out   607  first in 2554  | Done. I've opened quarter.csv, put 500 into cell D4 (which w
+    kept /tmp/tasksuite-u4juhd1k
+  3/3 pass       22.6s   12 exchanges    8 actions  out   557  first in 2554  | I've opened quarter.csv, entered 500 into cell D4, and saved
+
+new-sheet: greeting.csv exists with Hello in A1
+    kept /tmp/tasksuite-vt3qv8ts
+  1/3 pass       18.7s    8 exchanges    6 actions  out   564  first in 2556  | Done! I've created a new spreadsheet with "Hello" in cell A1
+    kept /tmp/tasksuite-_d6xhp6t
+  2/3 pass       19.1s    7 exchanges    5 actions  out   472  first in 2556  | The spreadsheet has been created and saved successfully. Cel
+    kept /tmp/tasksuite-67b_t0z2
+  3/3 pass       18.2s    7 exchanges    5 actions  out   400  first in 2556  | Done. The spreadsheet now contains "Hello" in cell A1 and ha
+
+write-text: reminder.txt exists and holds the sentence
+    kept /tmp/tasksuite-xzfvwiyo
+  1/3 pass       17.2s    9 exchanges    6 actions  out   418  first in 2550  | I have created the file `reminder.txt` in the home folder wi
+    kept /tmp/tasksuite-1dkwzwd_
+  2/3 pass       17.3s    9 exchanges    6 actions  out   426  first in 2550  | I have created a new text file called `reminder.txt` in the 
+    kept /tmp/tasksuite-ip2iocdx
+  3/3 pass       16.6s    9 exchanges    6 actions  out   522  first in 2550  | Done. I created a new text file called `reminder.txt` in the
+
+find-app: the calculator computed 144 / 12 = 12, the agent having found it itself
+    kept /tmp/tasksuite-m67uypd9
+  1/3 pass       17.1s    9 exchanges    7 actions  out   510  first in 2557  | The calculator shows that 144 divided by 12 equals **12**.
+    kept /tmp/tasksuite-ugx4qmbe
+  2/3 pass       17.1s   10 exchanges    7 actions  out   439  first in 2557  | 144 divided by 12 is 12.
+    kept /tmp/tasksuite-_sf2z2rh
+  3/3 pass       18.7s   10 exchanges    7 actions  out   541  first in 2557  | The calculation is complete. On the calculator, I entered 14
+
+traverse: a file the run saved under /home names all three text files there
+    kept /tmp/tasksuite-c1dvjeuv
+  1/3 pass      224.9s   54 exchanges   78 actions  out  5747  first in 2567  | Done. I've created a spreadsheet listing all 13 text files f
+    kept /tmp/tasksuite-c2rb1iev
+  2/3 pass      157.0s   54 exchanges   58 actions  out  4634  first in 2567
+    kept /tmp/tasksuite-a7yhj2ep
+  3/3 pass      155.3s   39 exchanges   43 actions  out  3385  first in 2567  | Done. I've created a spreadsheet listing all text files foun
+
+==============================================================================
+task                  pass   median s  exchanges  actions  out tok
+------------------------------------------------------------------------------
+calculator      3/3             11.5          4        7      510
+open-and-edit   3/3             22.6         10        8      607
+new-sheet       3/3             18.7          7        5      472
+write-text      3/3             17.2          9        6      426
+find-app        3/3             17.1         10        7      510
+traverse        3/3            157.0         54       58     4634
+------------------------------------------------------------------------------
+overall         18/18
+
+wrote docs/results/2026-09-12/moe-thinking-on.json

@@ -160,8 +160,13 @@ class Endpoint:
         # off two different answers compares two different pieces of work.
         self.greedy = greedy
 
-    def chat(self, messages, tools=None, max_tokens=512, think=None, grammar=None):
-        """One completion. Returns (reply, timings, wall_clock_seconds)."""
+    def chat(self, messages, tools=None, max_tokens=512, think=None, grammar=None, extra=None):
+        """One completion. Returns (reply, timings, wall_clock_seconds).
+
+        `extra` is merged into the request body, for the one-off knobs a
+        group wants to compare (`tool_choice`, say) without every caller
+        learning a parameter for each.
+        """
         body = {
             "model": self.model,
             "messages": messages,
@@ -185,6 +190,8 @@ class Endpoint:
             body["chat_template_kwargs"] = {"reasoning_effort": think}
         if grammar:
             body["grammar"] = grammar
+        if extra:
+            body.update(extra)
 
         request = urllib.request.Request(
             f"{self.url}/v1/chat/completions",
@@ -230,13 +237,20 @@ def report(name, timings, wall, extra=""):
     gen_ms = timings.get("predicted_ms", 0.0)
     prefill_rate = (prefill / prefill_ms * 1000) if prefill_ms else 0
     gen_rate = (gen / gen_ms * 1000) if gen_ms else 0
+    # Speculation, when the server is doing any: how many tokens the draft
+    # offered and how many the model kept. The ratio is the whole story of
+    # whether a draft head or an n-gram lookup is paying its way.
+    drafted = timings.get("draft_n", 0) or 0
+    accepted = timings.get("draft_n_accepted", 0) or 0
+    draft = f" | draft {accepted}/{drafted}" if drafted else ""
     print(f"  {name:<34} wall {wall:6.2f}s | "
           f"prefill {prefill:6d} tok @ {prefill_rate:7.1f} tok/s ({prefill_ms/1000:5.2f}s) | "
-          f"gen {gen:5d} tok @ {gen_rate:5.1f} tok/s ({gen_ms/1000:5.2f}s){extra}")
+          f"gen {gen:5d} tok @ {gen_rate:5.1f} tok/s ({gen_ms/1000:5.2f}s){draft}{extra}")
     return {
         "name": name, "wall": wall,
         "prefill_tokens": prefill, "prefill_s": prefill_ms / 1000, "prefill_rate": prefill_rate,
         "gen_tokens": gen, "gen_s": gen_ms / 1000, "gen_rate": gen_rate,
+        "drafted": drafted, "accepted": accepted,
     }
 
 
@@ -322,6 +336,63 @@ def group_batching(api, results):
         results.append(report(f"batch, thinking {effort}", timings, wall, detail))
 
 
+def group_grammar(api, results):
+    """What the server's tool-call grammar costs, and what it buys.
+
+    llama.cpp builds a grammar from the tool schemas on every request that
+    carries `tools`. For this model's template (the Qwen3-Coder XML shape)
+    it is lazy: nothing is constrained until `<tool_call>` appears, then the
+    function name, the parameter names and every argument are held to the
+    schema, the `act` action to its enum included. So the closed vocabulary
+    the harness sends already reaches the sampler; nothing has to be
+    generated in GBNF by hand. What the server does not do is jump forward:
+    a token the grammar leaves no choice about is still sampled one step at
+    a time, so a grammar cannot make a tool call faster, only certain.
+
+    Three shapes of one exchange, greedy, same content in each: the tools
+    as the harness sends them (lazy grammar), the same with `tool_choice`
+    required (the grammar from the first token), and the tools described
+    in the prompt with no `tools` field at all (no grammar, and the model
+    writes the XML from memory).
+    """
+    print("\nGRAMMAR: the same tool call with the server's grammar lazy, from the first token, and absent")
+    prompt = ("Add 12 and 34 on the calculator. It is open as awcalc#1 and this is its "
+              "interface:\n\n" + CALC_VIEW)
+    described = SYSTEM + (
+        "\n\nThe tools, as JSON schemas:\n" + json.dumps(TOOLS) +
+        "\n\nCall a tool by writing, on its own lines, "
+        "<tool_call>\\n<function=NAME>\\n<parameter=ARGUMENT>\\nVALUE\\n</parameter>\\n"
+        "</function>\\n</tool_call>, one block per call."
+    )
+    shapes = (
+        ("tools, lazy grammar", SYSTEM, TOOLS, {}),
+        ("tools, grammar from token one", SYSTEM, TOOLS, {"tool_choice": "required"}),
+        ("tools in the prompt, no grammar", described, None, {}),
+    )
+    for label, system, tools, extra in shapes:
+        rates = []
+        for round_number in range(3):
+            messages = [{"role": "system", "content": system},
+                        {"role": "user", "content": prompt}]
+            try:
+                payload, timings, wall = api.chat(messages, tools=tools, max_tokens=1024,
+                                                  think="off", extra=extra)
+            except urllib.error.HTTPError as err:
+                print(f"  {label:<34} refused: {err.read().decode()[:120]}")
+                break
+            message = payload["choices"][0]["message"]
+            calls = message.get("tool_calls") or []
+            text = message.get("content") or ""
+            # Without the grammar the call is text; count the blocks the
+            # parser would have found, so the three shapes report one thing.
+            found = len(calls) or text.count("<tool_call>")
+            row = report(f"{label} {round_number + 1}", timings, wall, f" | {found} call(s)")
+            results.append(row)
+            rates.append(row["gen_rate"])
+        if rates:
+            print(f"  {'':<34} median gen {statistics.median(rates):.1f} tok/s")
+
+
 def group_repeat(api, results, rounds):
     """The same exchange several times, for a spread rather than one number."""
     print(f"\nSPREAD: the same exchange {rounds} times, thinking off")
@@ -351,6 +422,7 @@ GROUPS = {
     "cached": group_cached,
     "exchange": group_exchange,
     "batching": group_batching,
+    "grammar": group_grammar,
 }
 
 

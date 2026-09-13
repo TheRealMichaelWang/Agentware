@@ -178,8 +178,17 @@ const SYSTEM_DIRS: &[&str] = &["bin", "apps", "default_wallpapers", "default_the
 
 /// How long to wait for a volume's device to appear. virtio-blk is built in
 /// and there before init runs; the bound keeps a machine without a drive
-/// from waiting long on one.
+/// from waiting long on one. A USB stick on real hardware takes seconds to
+/// enumerate, so `agentware.volume-wait=<ms>` on the kernel command line
+/// lengthens it for a boot that needs that; QEMU never carries it.
 const VOLUME_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+fn volume_wait() -> std::time::Duration {
+    kernel_arg("agentware.volume-wait")
+        .and_then(|ms| ms.parse().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(VOLUME_WAIT)
+}
 
 /// Mount the system volume and bind its directories into the root.
 ///
@@ -195,7 +204,7 @@ pub fn mount_system() {
     }
     let device = kernel_arg("agentware.system").unwrap_or_else(|| SYSTEM_DEVICE.to_owned());
 
-    let deadline = std::time::Instant::now() + VOLUME_WAIT;
+    let deadline = std::time::Instant::now() + volume_wait();
     while !Path::new(&device).exists() {
         if std::time::Instant::now() >= deadline {
             kerr!("system: no volume at {device}; nothing beyond the supervisor can run");
@@ -261,7 +270,7 @@ pub fn mount_state() {
     }
     let device = kernel_arg("agentware.state").unwrap_or_else(|| STATE_DEVICE.to_owned());
 
-    let deadline = std::time::Instant::now() + VOLUME_WAIT;
+    let deadline = std::time::Instant::now() + volume_wait();
     while !Path::new(&device).exists() {
         if std::time::Instant::now() >= deadline {
             kwarn!("state: no volume at {device}; settings will not outlive this boot");
@@ -418,6 +427,14 @@ fn kernel_arg(key: &str) -> Option<String> {
         .split_whitespace()
         .find_map(|word| word.strip_prefix(key).and_then(|rest| rest.strip_prefix('=')))
         .map(str::to_owned)
+}
+
+/// Whether a bare word is on the kernel command line, `agentware.report-only`
+/// say: a flag rather than a setting, present or not.
+pub fn kernel_flag(name: &str) -> bool {
+    fs::read_to_string("/proc/cmdline")
+        .map(|cmdline| cmdline.split_whitespace().any(|word| word == name))
+        .unwrap_or(false)
 }
 
 /// Unmount everything in reverse order, best effort. Called during shutdown.

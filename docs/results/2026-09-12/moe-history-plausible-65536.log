@@ -1,0 +1,64 @@
+the fixture (120 turns) was started over 1 time(s) to reach 65536 tokens
+backend: local, 3 run(s) per task, padded with 181 turns of conversation (about 65536 tokens, fixture wrapped 1 time(s))
+
+calculator: the calculator computed 12 + 34 = 46 and the reply says so
+    kept /tmp/tasksuite-7hvblax9
+  1/3 pass       56.4s    4 exchanges   10 actions  out  1152  first in 67309  | 12 + 34 = 46.
+    kept /tmp/tasksuite-grrkkeyy
+  2/3 pass       88.4s    9 exchanges   29 actions  out  2287  first in 67309  | The calculator is stuck in a loop showing 46. Since I can’t 
+    kept /tmp/tasksuite-xhtx0ur6
+  3/3 pass       56.8s    4 exchanges    9 actions  out  1143  first in 67309  | I didn't clear before starting. 12 + 34 is 46, but the calcu
+
+open-and-edit: quarter.csv has 500 in D4 and the rest of the sheet intact
+    kept /tmp/tasksuite-un14pfw_
+  1/3 pass      131.2s   21 exchanges   18 actions  out  1896  first in 67317  | D4 now holds 500 and quarter.csv is saved.
+    kept /tmp/tasksuite-1q5wc06v
+  2/3 pass      166.3s   19 exchanges   27 actions  out  2940  first in 67317  | Saved quarter.csv. D4 is 500.
+    kept /tmp/tasksuite-g2vow9sz
+  3/3 FAIL      117.8s   22 exchanges   19 actions  out  1947  first in 67317  | I have been trying to save quarter.csv since you asked me to
+
+new-sheet: greeting.csv exists with Hello in A1
+    kept /tmp/tasksuite-own4exxq
+  1/3 pass      125.4s   16 exchanges   18 actions  out  2663  first in 67319  | Created /home/greeting.csv with "Hello" in A1.
+    kept /tmp/tasksuite-902gn5tl
+  2/3 pass       96.9s   14 exchanges   14 actions  out  2191  first in 67319  | Created /home/greeting.csv with "Hello" in A1.
+    kept /tmp/tasksuite-nq2fhzqt
+  3/3 pass      112.7s   11 exchanges   13 actions  out  2319  first in 67319  | Created /home/greeting.csv with Hello in A1.
+
+write-text: reminder.txt exists and holds the sentence
+    kept /tmp/tasksuite-snu9tula
+  1/3 FAIL       55.6s   17 exchanges   15 actions  out  1336  first in 67313  | The File menu items are all disabled (actions list is empty)
+    kept /tmp/tasksuite-ic0pxm39
+  2/3 pass       99.9s    9 exchanges   14 actions  out  2095  first in 67313  | Created /home/reminder.txt with the text "Buy milk".
+    kept /tmp/tasksuite-unf4pucd
+  3/3 FAIL      106.5s   23 exchanges   18 actions  out  1860  first in 67313  | I got stuck. The last 6 things I tried all left the workspac
+
+find-app: the calculator computed 144 / 12 = 12, the agent having found it itself
+    kept /tmp/tasksuite-_tl_npaz
+  1/3 pass       68.6s    5 exchanges   18 actions  out  1720  first in 67320  | The calculator only keeps the last number typed; I cannot re
+    kept /tmp/tasksuite-sq7b6hsl
+  2/3 pass      110.1s   10 exchanges   43 actions  out  3276  first in 67320  | The display shows 12. The calculator computed 144 ÷ 12 = 12.
+    kept /tmp/tasksuite-vx07ipp1
+  3/3 pass       71.5s    6 exchanges   13 actions  out  1796  first in 67320  | 144 ÷ 12 = 12.
+
+traverse: a file the run saved under /home names every text file on the machine, each with its folder
+    kept /tmp/tasksuite-rj2z2gev
+  1/3 FAIL      120.7s   11 exchanges   19 actions  out  3369  first in 67330  | Saved /home/text-files.csv. It contains the paths of the fou
+    kept /tmp/tasksuite-wf1f6ht5
+  2/3 FAIL      114.3s   15 exchanges   19 actions  out  2887  first in 67330  | Created /home/text-files.csv with seven paths: /home/errands
+    kept /tmp/tasksuite-d1bzm9zr
+  3/3 FAIL      146.1s   12 exchanges   20 actions  out  3774  first in 67330  | Saved /home/txtfiles.csv with one text file: /home/notes/ide
+
+==============================================================================
+task                  pass   median s  exchanges  actions  out tok
+------------------------------------------------------------------------------
+calculator      3/3             56.8          4       10     1152
+open-and-edit   2/3            131.2         21       19     1947
+new-sheet       3/3            112.7         14       14     2319
+write-text      1/3             99.9         17       15     1860
+find-app        3/3             71.5          6       18     1796
+traverse        0/3            120.7         12       19     3369
+------------------------------------------------------------------------------
+overall         12/18
+
+wrote docs/results/2026-09-12/moe-history-plausible-65536.json

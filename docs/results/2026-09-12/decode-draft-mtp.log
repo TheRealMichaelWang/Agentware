@@ -1,0 +1,39 @@
+model:   Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf
+context: 131072
+url:     http://127.0.0.1:8080
+
+AGENTIC EXCHANGE: read a view, emit a tool call. The real unit of work
+  exchange, thinking off             wall   5.02s | prefill   1302 tok @   703.9 tok/s ( 1.85s) | gen   300 tok @  94.8 tok/s ( 3.16s) | draft 225/225 | 6 call(s): act,act,act,act,act,act
+                                     -> {"app":"awcalc","action":"click","target":"one"}
+  exchange, thinking low             wall   4.07s | prefill      2 tok @    36.5 tok/s ( 0.05s) | gen   371 tok @  92.5 tok/s ( 4.01s) | draft 278/285 | 6 call(s): act,act,act,act,act,act
+                                     -> {"app":"awcalc","action":"click","target":"one"}
+  exchange, thinking medium          wall   4.11s | prefill      2 tok @    39.6 tok/s ( 0.05s) | gen   371 tok @  91.5 tok/s ( 4.05s) | draft 278/285 | 6 call(s): act,act,act,act,act,act
+                                     -> {"app":"awcalc","action":"click","target":"one"}
+
+BATCHING: will it emit several calls in one message when it can?
+  batch, thinking off                wall   4.10s | prefill    534 tok @   581.8 tok/s ( 0.92s) | gen   300 tok @  94.4 tok/s ( 3.18s) | draft 225/225 | 6 call(s) in one message
+  batch, thinking medium             wall   4.47s | prefill      2 tok @    35.1 tok/s ( 0.06s) | gen   408 tok @  92.6 tok/s ( 4.41s) | draft 304/312 | 6 call(s) in one message
+
+GRAMMAR: the same tool call with the server's grammar lazy, from the first token, and absent
+  tools, lazy grammar 1              wall   4.33s | prefill    487 tok @   600.2 tok/s ( 0.81s) | gen   322 tok @  93.2 tok/s ( 3.46s) | draft 243/243 | 6 call(s)
+  tools, lazy grammar 2              wall   3.26s | prefill      4 tok @    62.2 tok/s ( 0.06s) | gen   300 tok @  94.1 tok/s ( 3.19s) | draft 225/225 | 6 call(s)
+  tools, lazy grammar 3              wall   3.52s | prefill      4 tok @    72.2 tok/s ( 0.06s) | gen   322 tok @  93.2 tok/s ( 3.45s) | draft 243/243 | 6 call(s)
+                                     median gen 93.2 tok/s
+  tools, grammar from token one 1    wall   3.24s | prefill      4 tok @    67.9 tok/s ( 0.06s) | gen   300 tok @  94.6 tok/s ( 3.17s) | draft 225/225 | 6 call(s)
+  tools, grammar from token one 2    wall   3.49s | prefill      4 tok @    67.6 tok/s ( 0.06s) | gen   322 tok @  94.0 tok/s ( 3.43s) | draft 243/243 | 6 call(s)
+  tools, grammar from token one 3    wall   3.24s | prefill      4 tok @    69.6 tok/s ( 0.06s) | gen   300 tok @  94.6 tok/s ( 3.17s) | draft 225/225 | 6 call(s)
+                                     median gen 94.6 tok/s
+  tools in the prompt, no grammar 1  wall   5.02s | prefill   1130 tok @   673.1 tok/s ( 1.68s) | gen   312 tok @  95.2 tok/s ( 3.28s) | draft 234/234 | 6 call(s)
+  tools in the prompt, no grammar 2  wall   3.34s | prefill      4 tok @    70.3 tok/s ( 0.06s) | gen   312 tok @  95.3 tok/s ( 3.28s) | draft 234/234 | 6 call(s)
+  tools in the prompt, no grammar 3  wall   3.33s | prefill      4 tok @    74.7 tok/s ( 0.05s) | gen   312 tok @  95.2 tok/s ( 3.28s) | draft 234/234 | 6 call(s)
+                                     median gen 95.2 tok/s
+
+SPREAD: the same exchange 5 times, thinking off
+  repeat 1                           wall   4.04s | prefill    516 tok @   629.4 tok/s ( 0.82s) | gen   300 tok @  95.4 tok/s ( 3.14s) | draft 225/225 | 6 call(s)
+  repeat 2                           wall   3.27s | prefill      4 tok @    62.4 tok/s ( 0.06s) | gen   300 tok @  93.9 tok/s ( 3.19s) | draft 225/225 | 6 call(s)
+  repeat 3                           wall   3.25s | prefill      4 tok @    71.1 tok/s ( 0.06s) | gen   300 tok @  94.3 tok/s ( 3.18s) | draft 225/225 | 6 call(s)
+  repeat 4                           wall   3.25s | prefill      4 tok @    71.1 tok/s ( 0.06s) | gen   300 tok @  94.1 tok/s ( 3.19s) | draft 225/225 | 6 call(s)
+  repeat 5                           wall   3.23s | prefill      4 tok @    70.6 tok/s ( 0.06s) | gen   300 tok @  94.9 tok/s ( 3.16s) | draft 225/225 | 6 call(s)
+                                     median 3.25s, p95 4.04s, min 3.23s, max 4.04s
+
+wrote docs/results/2026-09-12/decode-draft-mtp.json

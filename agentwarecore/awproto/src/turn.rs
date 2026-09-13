@@ -180,6 +180,16 @@ pub const KIND_THOUGHT: &str = "thought";
 pub const KIND_ACTION: &str = "action";
 pub const KIND_RESULT: &str = "result";
 pub const KIND_ERROR: &str = "error";
+/// One tool call the agent made, as JSON `{"name": ..., "input": ...}`, not
+/// shown in the pane: the desk keeps these and hands them back with the
+/// reply as the turn's place in the history, so the next turn's model sees
+/// that the work was done with tools rather than a report that it was.
+pub const KIND_CALL: &str = "call";
+
+/// The line that separates an agent's reply from the calls that earned it
+/// in a history entry's text: the reply, this line, then one JSON call per
+/// line. A control character, so no reply can contain it by accident.
+pub const HISTORY_CALLS: &str = "\u{1e}calls";
 
 /// Longest frame either side accepts. Conversation history can be long, so this
 /// is looser than the control socket's ceiling and tighter than a document's.

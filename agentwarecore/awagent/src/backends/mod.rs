@@ -58,12 +58,14 @@ pub fn from_config(id: &str, settings: &Settings) -> Result<Box<dyn Backend>, St
             LOCAL_HOST,
             LOCAL_PORT,
             config.model.to_owned(),
-            // Thinking off. It is where the tokens go, and on a local model
-            // tokens are the whole cost of an exchange; it is also what a
-            // draft model predicts worst, so it loses at both ends. Measured
-            // on this machine: acceptance 0.97 on a tool call and 0.52 on
-            // reasoning.
-            false,
+            // Off by default and a setting rather than a constant. It is
+            // where the tokens go, and on a local model tokens are the whole
+            // cost of an exchange; it is also what a draft model predicts
+            // worst, so it loses at both ends. Measured on this machine:
+            // acceptance 0.97 on a tool call and 0.52 on reasoning. What it
+            // buys in correctness is the task suite's question, and the
+            // setting is what lets the suite ask it.
+            settings.local_thinking,
         ))),
         other => Err(format!("the {other} backend is not built yet")),
     }

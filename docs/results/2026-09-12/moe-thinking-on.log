@@ -1,0 +1,63 @@
+backend: local, 3 run(s) per task, settings agent/local-thinking=on
+
+calculator: the calculator computed 12 + 34 = 46 and the reply says so
+    kept /tmp/tasksuite-q77uupli
+  1/3 pass       25.3s    9 exchanges    6 actions  out  1106  first in 2543  | The sum of 12 and 34 is 46.
+    kept /tmp/tasksuite-t796bjf1
+  2/3 pass       16.1s    5 exchanges    6 actions  out   875  first in 2543  | The result of 12 + 34 is 46.
+    kept /tmp/tasksuite-ech02o5v
+  3/3 pass       23.0s    4 exchanges    6 actions  out  1438  first in 2543  | The result is 46.
+
+open-and-edit: quarter.csv has 500 in D4 and the rest of the sheet intact
+    kept /tmp/tasksuite-t9q_kf46
+  1/3 FAIL      102.8s    4 exchanges    0 actions  out  8497  first in 2552  | The model ran out of room before it could answer.
+    kept /tmp/tasksuite-_mp_3auo
+  2/3 pass       47.5s   14 exchanges   11 actions  out  2004  first in 2552  | Done. I opened `quarter.csv`, entered 500 into cell D4, and 
+    kept /tmp/tasksuite-zmtweib5
+  3/3 pass       62.0s   15 exchanges   10 actions  out  2433  first in 2552  | I have successfully opened quarter.csv, entered 500 into cel
+
+new-sheet: greeting.csv exists with Hello in A1
+    kept /tmp/tasksuite-mq34qwjp
+  1/3 pass       23.6s    7 exchanges    5 actions  out  1167  first in 2554  | I've created a new spreadsheet with "Hello" in cell A1 and s
+    kept /tmp/tasksuite-tbf1a1m8
+  2/3 pass       34.3s    5 exchanges    6 actions  out  2074  first in 2554  | The spreadsheet has been created with "Hello" in cell A1 and
+    kept /tmp/tasksuite-qyr2vrxy
+  3/3 pass       31.1s    6 exchanges    5 actions  out  1625  first in 2554  | Done. I've created a new spreadsheet with "Hello" in cell A1
+
+write-text: reminder.txt exists and holds the sentence
+    kept /tmp/tasksuite-skp9wvd5
+  1/3 pass       25.1s    8 exchanges    5 actions  out  1200  first in 2548  | I created a new text file named `reminder.txt` in the home f
+    kept /tmp/tasksuite-qrhdikg4
+  2/3 pass       22.0s    6 exchanges    5 actions  out  1237  first in 2548  | Done. I created a new text file called `reminder.txt` in the
+    kept /tmp/tasksuite-6rdyeuwx
+  3/3 pass       39.8s    6 exchanges    6 actions  out  2328  first in 2548  | I've created the text file `reminder.txt` in the home folder
+
+find-app: the calculator computed 144 / 12 = 12, the agent having found it itself
+    kept /tmp/tasksuite-1x4jhfsh
+  1/3 pass       30.0s    5 exchanges   15 actions  out  1776  first in 2555  | 144 divided by 12 is 12. The calculator confirms this result
+    kept /tmp/tasksuite-haqa1pyc
+  2/3 pass       24.7s    4 exchanges    7 actions  out  1495  first in 2555  | 144 divided by 12 is 12.
+    kept /tmp/tasksuite-3mo5caha
+  3/3 pass       28.7s    4 exchanges    7 actions  out  1791  first in 2555  | 144 divided by 12 is 12.
+
+traverse: a file the run saved under /home names all three text files there
+    kept /tmp/tasksuite-_ez0qwiz
+  1/3 pass      144.1s   35 exchanges   43 actions  out  5170  first in 2565  | Done! I've created a spreadsheet listing all 13 text files f
+    kept /tmp/tasksuite-5dtq8vqs
+  2/3 pass      294.5s   54 exchanges   95 actions  out  9612  first in 2565
+    kept /tmp/tasksuite-874ryykj
+  3/3 pass      165.2s   38 exchanges   61 actions  out  6793  first in 2565  | The spreadsheet has been created and saved to `/home/text_fi
+
+==============================================================================
+task                  pass   median s  exchanges  actions  out tok
+------------------------------------------------------------------------------
+calculator      3/3             23.0          5        6     1106
+open-and-edit   2/3             62.0         14       10     2433
+new-sheet       3/3             31.1          6        5     1625
+write-text      3/3             25.1          6        5     1237
+find-app        3/3             28.7          4        7     1776
+traverse        3/3            165.2         38       61     6793
+------------------------------------------------------------------------------
+overall         17/18
+
+wrote docs/results/2026-09-12/moe-thinking-on.json

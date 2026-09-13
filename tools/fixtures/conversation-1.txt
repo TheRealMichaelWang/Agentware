@@ -1,0 +1,1113 @@
+# Earlier conversation for the padded-history measurement (tools/padding.py).
+# One turn per block: what the human asked, then the agent's entry as the
+# agentdesk keeps it since 12 September 2026: the actions the turn took, one
+# line each in the words the pane showed, then a blank line, then the reply.
+# Lines indented two spaces continue the entry above. Written in the
+# register of the real runs in docs/results/2026-09-12. Lines starting with
+# # are not part of it.
+#
+# Nothing in here is one of the task suite's own tasks: a history that
+# already holds "add 12 and 34" answered is one in which asking it again is
+# a repeat. The sums, files and cells here are deliberately other ones.
+
+H: Add 27 and 45 on the calculator.
+A: Actions this turn (8):
+  - reading what is open
+  - opening awcalc
+  - click two in awcalc#1: done
+  - click seven in awcalc#1: done
+  - click plus in awcalc#1: done
+  - click four in awcalc#1: done
+  - click five in awcalc#1: done
+  - click equals in awcalc#1: done
+
+  27 + 45 = 72.
+
+H: What's in the notes folder?
+A: Actions this turn (4):
+  - reading what is open
+  - opening awfiles
+  - reading awfiles#1
+  - click entry-1 in awfiles#1: done
+
+  Two files: ideas.txt and shopping.txt. Nothing else is in there.
+
+H: Open quarter.csv and put 320 in C4.
+A: Actions this turn (7):
+  - reading what is open
+  - opening awsheet
+  - click menu-file in awsheet#1: done
+  - click menu-open in awsheet#1: done
+  - click file-dialog-entry-0 in awsheet#1: done
+  - type-text "320" into sheet!C4 in awsheet#1: done
+  - click menu-save in awsheet#1: done
+
+  Done. I opened quarter.csv, put 320 into cell C4, and saved the file.
+
+H: Actually make that 360, I read the wrong line.
+A: Actions this turn (3):
+  - reading awsheet#1
+  - type-text "360" into sheet!C4 in awsheet#1: done
+  - click menu-save in awsheet#1: done
+
+  Changed C4 from 320 to 360 and saved quarter.csv again.
+
+H: What does column D hold in that sheet?
+A: Actions this turn (1):
+  - reading A1:F7 of book/1 in awsheet#1
+
+  Column D is headed Q4. Rows 2 to 6 hold 410, 390, 550, 475 and 620; the rest of the column is empty.
+
+H: Rename welcome.txt to readme.txt.
+A: Actions this turn (5):
+  - reading awfiles#1
+  - click up in awfiles#1: done
+  - toggle mark-3 in awfiles#1: done
+  - click rename in awfiles#1: done
+  - type-text "readme.txt" into rename-name in awfiles#1: done
+
+  Renamed /home/welcome.txt to /home/readme.txt. The contents are unchanged.
+
+H: What time is it?
+A: The taskbar clock shows 14:32, UTC, because no time zone is set. The Settings app's Time page is where one is chosen.
+
+H: Set the time zone to Pacific, that's minus eight.
+A: Actions this turn (4):
+  - opening awsettings
+  - click category-time in awsettings#1: done
+  - reading awsettings#1
+  - click zone--08:00 in awsettings#1: done
+
+  Set the UTC offset to -08:00 on the Time page. The clock now reads 06:32.
+
+H: Make a new text file in the home folder called errands.txt that says post the parcel.
+A: Actions this turn (6):
+  - opening awtext
+  - type-text "Post the parcel" into editor in awtext#1: done
+  - click menu-file in awtext#1: done
+  - click menu-save-as in awtext#1: done
+  - type-text "errands.txt" into file-dialog-name in awtext#1: done
+  - click file-dialog-confirm in awtext#1: done
+
+  Created /home/errands.txt with the text "Post the parcel".
+
+H: Add eggs to it on a second line.
+A: Actions this turn (3):
+  - reading awtext#1
+  - type-text "Post the parcel\nEggs" into editor in awtext#1: done
+  - click menu-save in awtext#1: done
+
+  Added a second line, "Eggs". errands.txt now has two lines and is saved.
+
+H: How many files are in home, not counting folders?
+A: Actions this turn (1):
+  - reading awfiles#1
+
+  Four: quarter.csv, uscities.csv, readme.txt and errands.txt. The notes folder is the only folder.
+
+H: Copy shopping.txt from notes to home.
+A: Actions this turn (5):
+  - click entry-1 in awfiles#1: done
+  - toggle mark-1 in awfiles#1: done
+  - click copy-to in awfiles#1: done
+  - click file-dialog-up in awfiles#1: done
+  - click file-dialog-confirm in awfiles#1: done
+
+  Copied /home/notes/shopping.txt to /home/shopping.txt. The original is still in notes.
+
+H: Now delete the one in notes.
+A: Actions this turn (4):
+  - reading awfiles#1
+  - toggle mark-1 in awfiles#1: done
+  - click delete in awfiles#1: done
+  - click confirm-yes in awfiles#1: done
+
+  Deleted /home/notes/shopping.txt. The explorer asked whether I was sure; I confirmed. The copy in home is untouched.
+
+H: What's 1500 times 1.08?
+A: Actions this turn (10):
+  - click clear in awcalc#1: done
+  - click one in awcalc#1: done
+  - click five in awcalc#1: done
+  - click zero in awcalc#1: done
+  - click zero in awcalc#1: done
+  - click times in awcalc#1: done
+  - click one in awcalc#1: done
+  - click point in awcalc#1: done
+  - click zero in awcalc#1: done
+  - click eight in awcalc#1: done
+
+  1500 × 1.08 = 1620, on the calculator.
+
+H: And 1620 divided by 12?
+A: Actions this turn (4):
+  - click divide in awcalc#1: done
+  - click one in awcalc#1: done
+  - click two in awcalc#1: done
+  - click equals in awcalc#1: done
+
+  1620 ÷ 12 = 135.
+
+H: Change the wallpaper to something darker.
+A: Actions this turn (4):
+  - click category-desktop in awsettings#1: done
+  - reading awsettings#1
+  - open wallpaper in awsettings#1: done
+  - select wallpaper-2 in awsettings#1: done
+
+  Set the wallpaper to /default_wallpapers/night.svg on the Settings app's Desktop page. The other shipped choices are dusk and meadow.
+
+H: I don't like it, put the old one back.
+A: Actions this turn (2):
+  - open wallpaper in awsettings#1: done
+  - select wallpaper-0 in awsettings#1: done
+
+  Wallpaper set back to dusk.svg.
+
+H: Open uscities.csv and tell me the biggest city.
+A: Actions this turn (4):
+  - click menu-file in awsheet#1: done
+  - click menu-open in awsheet#1: done
+  - click file-dialog-entry-1 in awsheet#1: done
+  - reading A1:B7 of book/2 in awsheet#1
+
+  uscities.csv lists five cities with populations. The largest is New York at 8,336,817 in row 2.
+
+H: Sort it by population.
+A: The spreadsheet has no sort; there are no formulas or operations beyond typing into cells. I can retype the rows in order if you want that.
+
+H: Yes, do that, biggest first.
+A: Actions this turn (11):
+  - type-text "New York" into sheet!A2 in awsheet#1: done
+  - type-text "8336817" into sheet!B2 in awsheet#1: done
+  - type-text "Los Angeles" into sheet!A3 in awsheet#1: done
+  - type-text "3979576" into sheet!B3 in awsheet#1: done
+  - type-text "Chicago" into sheet!A4 in awsheet#1: done
+  - type-text "2693976" into sheet!B4 in awsheet#1: done
+  - type-text "Houston" into sheet!A5 in awsheet#1: done
+  - type-text "2320268" into sheet!B5 in awsheet#1: done
+  - type-text "Phoenix" into sheet!A6 in awsheet#1: done
+  - type-text "1680992" into sheet!B6 in awsheet#1: done
+  - click menu-save in awsheet#1: done
+
+  Retyped rows 2 to 6 in descending order of population: New York, Los Angeles, Chicago, Houston, Phoenix. Saved uscities.csv.
+
+H: Make a new spreadsheet with Draft in A1 and save it as scratch.csv.
+A: Actions this turn (6):
+  - click menu-file in awsheet#1: done
+  - click menu-new in awsheet#1: done
+  - type-text "Draft" into sheet!A1 in awsheet#1: done
+  - click menu-save-as in awsheet#1: done
+  - type-text "scratch.csv" into file-dialog-name in awsheet#1: done
+  - click file-dialog-confirm in awsheet#1: done
+
+  Created a new sheet, typed "Draft" into A1, and saved it as /home/scratch.csv.
+
+H: What applications are open right now?
+A: Actions this turn (1):
+  - reading what is open
+
+  Three windows: the file explorer, the spreadsheet with two tabs (uscities.csv and scratch.csv), and the calculator.
+
+H: Close the calculator.
+A: I can't close windows; only you can, from the cross on the title bar. Everything I do is through the application's own controls.
+
+H: Fine. In scratch.csv put Copy in B1.
+A: Actions this turn (3):
+  - click tab-3 in awsheet#1: done
+  - type-text "Copy" into sheet!B1 in awsheet#1: done
+  - click menu-save in awsheet#1: done
+
+  Typed "Copy" into B1 of scratch.csv and saved.
+
+H: How much is 19.99 plus 4.50 plus 12?
+A: Actions this turn (14):
+  - click clear in awcalc#1: done
+  - click one in awcalc#1: done
+  - click nine in awcalc#1: done
+  - click point in awcalc#1: done
+  - click nine in awcalc#1: done
+  - click nine in awcalc#1: done
+  - click plus in awcalc#1: done
+  - click four in awcalc#1: done
+  - click point in awcalc#1: done
+  - click five in awcalc#1: done
+  - click plus in awcalc#1: done
+  - click one in awcalc#1: done
+  - click two in awcalc#1: done
+  - click equals in awcalc#1: done
+
+  19.99 + 4.50 + 12 = 36.49.
+
+H: Take 15 percent off that.
+A: Actions this turn (6):
+  - click times in awcalc#1: done
+  - click zero in awcalc#1: done
+  - click point in awcalc#1: done
+  - click eight in awcalc#1: done
+  - click five in awcalc#1: done
+  - click equals in awcalc#1: done
+
+  36.49 × 0.85 = 31.0165, so 31.02 to the cent.
+
+H: Make a folder in home called archive.
+A: Actions this turn (4):
+  - click up in awfiles#1: done
+  - click new-folder in awfiles#1: done
+  - type-text "archive" into new-folder-name in awfiles#1: done
+  - click confirm-yes in awfiles#1: done
+
+  Created /home/archive. It is empty.
+
+H: Move readme.txt into it.
+A: Actions this turn (4):
+  - toggle mark-4 in awfiles#1: done
+  - click move-to in awfiles#1: done
+  - click file-dialog-entry-0 in awfiles#1: done
+  - click file-dialog-confirm in awfiles#1: done
+
+  Moved /home/readme.txt to /home/archive/readme.txt.
+
+H: What's in ideas.txt?
+A: Actions this turn (4):
+  - click menu-file in awtext#1: done
+  - click menu-open in awtext#1: done
+  - click file-dialog-entry-2 in awtext#1: done
+  - reading awtext#1
+
+  Three lines: "Build a birdhouse", "Learn to solder", and "Weekend: hike the ridge trail".
+
+H: Add a fourth line, fix the bike brakes.
+A: Actions this turn (2):
+  - type-text "Build a birdhouse\nLearn to solder\nWeekend: hike the ridge trail\nFix the bike brakes" into editor in awtext#1: done
+  - click menu-save in awtext#1: done
+
+  Added "Fix the bike brakes" as the fourth line of /home/notes/ideas.txt and saved it.
+
+H: Is there a spell checker in the text editor?
+A: No. The editor is one text box per file with a File menu: New, Open, Save, Save as. It checks nothing.
+
+H: Put the total of column B in quarter.csv into B7.
+A: Actions this turn (14):
+  - click tab-1 in awsheet#1: done
+  - reading A1:F7 of book/1 in awsheet#1
+  - click clear in awcalc#1: done
+  - click one in awcalc#1: done
+  - click two in awcalc#1: done
+  - click zero in awcalc#1: done
+  - click plus in awcalc#1: done
+  - click one in awcalc#1: done
+  - click three in awcalc#1: done
+  - click five in awcalc#1: done
+  - click plus in awcalc#1: done
+  - ... 2 more ...
+  - type-text "655" into sheet!B7 in awsheet#1: done
+  - click menu-save in awsheet#1: done
+
+  Column B rows 2 to 6 are 120, 135, 98, 160 and 142, which add to 655 on the calculator. Typed 655 into B7 and saved quarter.csv.
+
+H: Do the same for C.
+A: Actions this turn (3):
+  - reading A1:F7 of book/1 in awsheet#1
+  - type-text "702" into sheet!C7 in awsheet#1: done
+  - click menu-save in awsheet#1: done
+
+  Column C rows 2 to 6 add to 702. Typed 702 into C7 and saved.
+
+H: And D.
+A: Actions this turn (2):
+  - type-text "2445" into sheet!D7 in awsheet#1: done
+  - click menu-save in awsheet#1: done
+
+  Column D rows 2 to 6 are 410, 390, 550, 475 and 620, which is 2445. Typed 2445 into D7 and saved.
+
+H: Change the theme to light if there is one.
+A: Actions this turn (3):
+  - reading awsettings#1
+  - open theme in awsettings#1: done
+  - close theme in awsettings#1: done
+
+  There is only one theme on this machine, dark.xml in /default_themes. The dropdown offers nothing else, so I left it.
+
+H: What is 2 to the power of 10?
+A: Actions this turn (21):
+  - click clear in awcalc#1: done
+  - click two in awcalc#1: done
+  - click times in awcalc#1: done
+  - click two in awcalc#1: done
+  - click equals in awcalc#1: done
+  - click times in awcalc#1: done
+  - click two in awcalc#1: done
+  - click equals in awcalc#1: done
+  - click times in awcalc#1: done
+  - click two in awcalc#1: done
+  - ... 9 more ...
+  - click equals in awcalc#1: done
+  - reading awcalc#1
+
+  The calculator has no power key. 2 multiplied by itself ten times is 1024; I got there by pressing × 2 = nine times from 2.
+
+H: Open the file explorer at the apps folder.
+A: Actions this turn (4):
+  - reading awfiles#1
+  - click up in awfiles#1: done
+  - click entry-0 in awfiles#1: done
+  - reading awfiles#1
+
+  The explorer is showing /apps: awcalc, awfiles, awsettings, awsheet, awtext, awstubborn and awtest.
+
+H: What's awstubborn?
+A: Actions this turn (2):
+  - click entry-5 in awfiles#1: done
+  - reading awfiles#1
+
+  A folder with an exec and nothing else, no description. It is one of the supervisor's self-test stand-ins, not an application the start menu shows.
+
+H: Go back to home.
+A: Actions this turn (3):
+  - click up in awfiles#1: done
+  - click up in awfiles#1: done
+  - click entry-3 in awfiles#1: done
+
+  The explorer is showing /home again.
+
+H: Save a copy of quarter.csv as quarter-backup.csv.
+A: Actions this turn (4):
+  - click menu-file in awsheet#1: done
+  - click menu-save-as in awsheet#1: done
+  - type-text "quarter-backup.csv" into file-dialog-name in awsheet#1: done
+  - click file-dialog-confirm in awsheet#1: done
+
+  Used Save as on the quarter.csv tab and saved it as /home/quarter-backup.csv. The tab now shows the backup; the original is unchanged on disk.
+
+H: Switch back to the original.
+A: Actions this turn (3):
+  - click menu-file in awsheet#1: done
+  - click menu-open in awsheet#1: done
+  - click file-dialog-entry-0 in awsheet#1: done
+
+  Opened /home/quarter.csv again; it has its own tab now, and quarter-backup.csv is still open beside it.
+
+H: How many rows does uscities.csv have?
+A: Actions this turn (2):
+  - click tab-2 in awsheet#1: done
+  - reading A1:B10 of book/2 in awsheet#1
+
+  Six rows with anything in them: a header row and five cities.
+
+H: Add Philadelphia with 1,603,797 as a new row.
+A: Actions this turn (3):
+  - type-text "Philadelphia" into sheet!A7 in awsheet#1: done
+  - type-text "1603797" into sheet!B7 in awsheet#1: done
+  - click menu-save in awsheet#1: done
+
+  Typed "Philadelphia" into A7 and 1603797 into B7 of uscities.csv and saved.
+
+H: Is my API key set?
+A: Actions this turn (2):
+  - click category-agent in awsettings#1: done
+  - reading awsettings#1
+
+  The Agent page says a key is set, 108 characters. I can see that one is set, not what it is; the field shows asterisks.
+
+H: Clear it.
+A: Actions this turn (2):
+  - clear api-key in awsettings#1: done
+  - click api-key-save in awsettings#1: done
+
+  Cleared the API key field and saved. The page now says no key is set and that the agent will answer it cannot reach a hosted model.
+
+H: Put it back, it's sk-ant-api03-example-key-for-this-conversation-only.
+A: Actions this turn (2):
+  - type-text "sk-ant-api03-example-key-for-this-conversation-only" into api-key in awsettings#1: done
+  - click api-key-save in awsettings#1: done
+
+  Typed the key into the field and saved. The page reports a key of 55 characters.
+
+H: What's 365 times 24?
+A: Actions this turn (8):
+  - click clear in awcalc#1: done
+  - click three in awcalc#1: done
+  - click six in awcalc#1: done
+  - click five in awcalc#1: done
+  - click times in awcalc#1: done
+  - click two in awcalc#1: done
+  - click four in awcalc#1: done
+  - click equals in awcalc#1: done
+
+  365 × 24 = 8760.
+
+H: Make the agent's cursor faster.
+A: Actions this turn (4):
+  - reading awsettings#1
+  - set-value "300" into ui-delay-max in awsettings#1: done
+  - set-value "30" into ui-delay-min in awsettings#1: done
+  - click ui-delay-save in awsettings#1: done
+
+  On the Agent page under Computer Use I moved the slowest slider from 600ms to 300ms and the fastest from 40ms to 30ms, then saved.
+
+H: Too fast, I can't follow it. Middle ground.
+A: Actions this turn (2):
+  - set-value "450" into ui-delay-max in awsettings#1: done
+  - click ui-delay-save in awsettings#1: done
+
+  Slowest set to 450ms, fastest left at 30ms, saved.
+
+H: Create a sheet called budget.csv with headings Item, Cost, Notes.
+A: Actions this turn (8):
+  - click menu-file in awsheet#1: done
+  - click menu-new in awsheet#1: done
+  - type-text "Item" into sheet!A1 in awsheet#1: done
+  - type-text "Cost" into sheet!B1 in awsheet#1: done
+  - type-text "Notes" into sheet!C1 in awsheet#1: done
+  - click menu-save-as in awsheet#1: done
+  - type-text "budget.csv" into file-dialog-name in awsheet#1: done
+  - click file-dialog-confirm in awsheet#1: done
+
+  Created a new sheet, typed Item, Cost and Notes into A1, B1 and C1, and saved it as /home/budget.csv.
+
+H: Add rent 1200, power 85, internet 60.
+A: Actions this turn (7):
+  - type-text "Rent" into sheet!A2 in awsheet#1: done
+  - type-text "1200" into sheet!B2 in awsheet#1: done
+  - type-text "Power" into sheet!A3 in awsheet#1: done
+  - type-text "85" into sheet!B3 in awsheet#1: done
+  - type-text "Internet" into sheet!A4 in awsheet#1: done
+  - type-text "60" into sheet!B4 in awsheet#1: done
+  - click menu-save in awsheet#1: done
+
+  Added three rows under the headings: Rent 1200, Power 85, Internet 60. Saved budget.csv.
+
+H: Total the cost column into B5.
+A: Actions this turn (12):
+  - click clear in awcalc#1: done
+  - click one in awcalc#1: done
+  - click two in awcalc#1: done
+  - click zero in awcalc#1: done
+  - click zero in awcalc#1: done
+  - click plus in awcalc#1: done
+  - click eight in awcalc#1: done
+  - click five in awcalc#1: done
+  - click plus in awcalc#1: done
+  - click six in awcalc#1: done
+  - click zero in awcalc#1: done
+  - click equals in awcalc#1: done
+
+  1200 + 85 + 60 = 1345. Typed 1345 into B5 and saved.
+
+H: Label it Total in A5.
+A: Actions this turn (2):
+  - type-text "Total" into sheet!A5 in awsheet#1: done
+  - click menu-save in awsheet#1: done
+
+  Typed "Total" into A5 and saved budget.csv.
+
+H: What files have I made today?
+A: Since this conversation began: errands.txt, scratch.csv, quarter-backup.csv, budget.csv, the archive folder, and the copy of shopping.txt in home.
+
+H: Delete quarter-backup.csv, I don't need it.
+A: Actions this turn (4):
+  - reading awfiles#1
+  - toggle mark-3 in awfiles#1: done
+  - click delete in awfiles#1: done
+  - click confirm-yes in awfiles#1: done
+
+  Deleted /home/quarter-backup.csv after confirming the explorer's question. Its tab in the spreadsheet is still open; closing it will not bring the file back.
+
+H: Close that tab then.
+A: Actions this turn (2):
+  - click tab-4 in awsheet#1: done
+  - close tab-4 in awsheet#1: done
+
+  Closed the quarter-backup.csv tab. It asked nothing, because the tab had no unsaved changes.
+
+H: What's 999 minus 1001?
+A: Actions this turn (10):
+  - click clear in awcalc#1: done
+  - click nine in awcalc#1: done
+  - click nine in awcalc#1: done
+  - click nine in awcalc#1: done
+  - click minus in awcalc#1: done
+  - click one in awcalc#1: done
+  - click zero in awcalc#1: done
+  - click zero in awcalc#1: done
+  - click one in awcalc#1: done
+  - click equals in awcalc#1: done
+
+  999 − 1001 = −2.
+
+H: Open shopping.txt and read it to me.
+A: Actions this turn (4):
+  - click menu-file in awtext#1: done
+  - click menu-open in awtext#1: done
+  - click file-dialog-entry-4 in awtext#1: done
+  - reading awtext#1
+
+  shopping.txt has five lines: milk, bread, apples, coffee, dish soap.
+
+H: Remove coffee.
+A: Actions this turn (2):
+  - type-text "milk\nbread\napples\ndish soap" into editor in awtext#1: done
+  - click menu-save in awtext#1: done
+
+  Deleted the coffee line. shopping.txt now has four lines and is saved.
+
+H: Change the wallpaper to a picture in the home folder if there is one.
+A: Actions this turn (5):
+  - click category-desktop in awsettings#1: done
+  - open wallpaper in awsettings#1: done
+  - select wallpaper-choose in awsettings#1: done
+  - reading awsettings#1
+  - click file-dialog-cancel in awsettings#1: done
+
+  There are no pictures under /home, only CSV and text files. The wallpaper chooser accepts SVG and PNG; nothing on the machine outside /default_wallpapers qualifies.
+
+H: Okay, set meadow then.
+A: Actions this turn (2):
+  - open wallpaper in awsettings#1: done
+  - select wallpaper-1 in awsettings#1: done
+
+  Wallpaper set to /default_wallpapers/meadow.svg.
+
+H: Convert 72 degrees Fahrenheit to Celsius.
+A: Actions this turn (12):
+  - click clear in awcalc#1: done
+  - click seven in awcalc#1: done
+  - click two in awcalc#1: done
+  - click minus in awcalc#1: done
+  - click three in awcalc#1: done
+  - click two in awcalc#1: done
+  - click equals in awcalc#1: done
+  - click times in awcalc#1: done
+  - click five in awcalc#1: done
+  - click divide in awcalc#1: done
+  - click nine in awcalc#1: done
+  - click equals in awcalc#1: done
+
+  (72 − 32) × 5 ÷ 9 = 22.22 on the calculator, so about 22 °C.
+
+H: And 100 Celsius to Fahrenheit.
+A: Actions this turn (11):
+  - click clear in awcalc#1: done
+  - click one in awcalc#1: done
+  - click zero in awcalc#1: done
+  - click zero in awcalc#1: done
+  - click times in awcalc#1: done
+  - click nine in awcalc#1: done
+  - click divide in awcalc#1: done
+  - click five in awcalc#1: done
+  - click plus in awcalc#1: done
+  - ... 1 more ...
+  - click equals in awcalc#1: done
+
+  100 × 9 ÷ 5 + 32 = 212 °F.
+
+H: Make a text file called todo.txt with three lines: call the bank, renew passport, water plants.
+A: Actions this turn (6):
+  - click menu-file in awtext#1: done
+  - click menu-new in awtext#1: done
+  - type-text "call the bank\nrenew passport\nwater plants" into editor in awtext#1: done
+  - click menu-save-as in awtext#1: done
+  - type-text "todo.txt" into file-dialog-name in awtext#1: done
+  - click file-dialog-confirm in awtext#1: done
+
+  Created /home/todo.txt with those three lines, one per line.
+
+H: Mark the first one done by putting DONE in front of it.
+A: Actions this turn (2):
+  - type-text "DONE call the bank\nrenew passport\nwater plants" into editor in awtext#1: done
+  - click menu-save in awtext#1: done
+
+  The first line now reads "DONE call the bank". Saved.
+
+H: How long is the ideas file in words?
+A: Actions this turn (2):
+  - click tab-1 in awtext#1: done
+  - reading awtext#1
+
+  Nineteen words across its four lines, counted from the editor's text.
+
+H: Copy budget.csv into archive.
+A: Actions this turn (4):
+  - toggle mark-0 in awfiles#1: done
+  - click copy-to in awfiles#1: done
+  - click file-dialog-entry-0 in awfiles#1: done
+  - click file-dialog-confirm in awfiles#1: done
+
+  Copied /home/budget.csv to /home/archive/budget.csv. The original stays in home.
+
+H: What's in archive now?
+A: Actions this turn (2):
+  - click entry-0 in awfiles#1: done
+  - reading awfiles#1
+
+  Two files: readme.txt and budget.csv.
+
+H: Empty the archive folder.
+A: Actions this turn (3):
+  - click mark-all in awfiles#1: done
+  - click delete in awfiles#1: done
+  - click confirm-yes in awfiles#1: done
+
+  Marked both files and deleted them after confirming. /home/archive is empty again.
+
+H: And remove the folder.
+A: Actions this turn (4):
+  - click up in awfiles#1: done
+  - toggle mark-0 in awfiles#1: done
+  - click delete in awfiles#1: done
+  - click confirm-yes in awfiles#1: done
+
+  Deleted /home/archive.
+
+H: Put today's date in A1 of scratch.csv.
+A: Actions this turn (3):
+  - click tab-3 in awsheet#1: done
+  - type-text "2026-09-12" into sheet!A1 in awsheet#1: done
+  - click menu-save in awsheet#1: done
+
+  The machine's clock shows the date 12 September 2026 on the taskbar. Typed 2026-09-12 into A1, replacing "Draft", and saved scratch.csv.
+
+H: No, keep Draft, put the date in A2.
+A: Actions this turn (3):
+  - type-text "Draft" into sheet!A1 in awsheet#1: done
+  - type-text "2026-09-12" into sheet!A2 in awsheet#1: done
+  - click menu-save in awsheet#1: done
+
+  Restored "Draft" in A1, typed 2026-09-12 into A2, and saved.
+
+H: What's 48 divided by 7, to two decimals?
+A: Actions this turn (5):
+  - click clear in awcalc#1: done
+  - click four in awcalc#1: done
+  - click eight in awcalc#1: done
+  - click divide in awcalc#1: done
+  - click seven in awcalc#1: done
+
+  48 ÷ 7 = 6.857142..., so 6.86.
+
+H: Which app edits CSV files?
+A: Actions this turn (1):
+  - looking for an app for "edit CSV files"
+
+  The spreadsheet, awsheet. It reads and writes CSV, one open file per tab, and is the only application that does.
+
+H: Which one would I use for a plain text note?
+A: Actions this turn (1):
+  - looking for an app for "plain text note"
+
+  The text editor, awtext: one text file per tab, with the same File menu as the spreadsheet.
+
+H: Open the settings app and tell me what pages it has.
+A: Actions this turn (1):
+  - reading awsettings#1
+
+  Three pages in the rail: Desktop (wallpaper and theme), Time (the UTC offset), and Agent (the API key, workspace, local model and Computer Use).
+
+H: Type the word draft at the end of errands.txt.
+A: Actions this turn (5):
+  - click menu-file in awtext#1: done
+  - click menu-open in awtext#1: done
+  - click file-dialog-entry-1 in awtext#1: done
+  - type-text "Post the parcel\nEggs\ndraft" into editor in awtext#1: done
+  - click menu-save in awtext#1: done
+
+  Added "draft" as a third line of errands.txt and saved. It now reads: Post the parcel, Eggs, draft.
+
+H: That was meant to go at the end of the last line, not a new line.
+A: Actions this turn (2):
+  - type-text "Post the parcel\nEggs draft" into editor in awtext#1: done
+  - click menu-save in awtext#1: done
+
+  Fixed: the second line now reads "Eggs draft", there are two lines again, and the file is saved.
+
+H: Add up every cost in budget.csv again, I changed power to 95.
+A: Actions this turn (6):
+  - click tab-5 in awsheet#1: done
+  - reading A1:C5 of book/4 in awsheet#1
+  - click clear in awcalc#1: done
+  - ... 11 more ...
+  - type-text "1355" into sheet!B5 in awsheet#1: done
+  - click menu-save in awsheet#1: done
+
+  B3 reads 95 now. 1200 + 95 + 60 = 1355; updated B5 to 1355 and saved budget.csv.
+
+H: How many spreadsheets are on the whole machine?
+A: Actions this turn (8):
+  - reading awfiles#1
+  - click entry-2 in awfiles#1: done
+  - reading awfiles#1
+  - click up in awfiles#1: done
+  - click up in awfiles#1: done
+  - click entry-0 in awfiles#1: done
+  - reading awfiles#1
+  - click up in awfiles#1: done
+
+  Five, walking home and its folders with the explorer: quarter.csv, uscities.csv, scratch.csv, budget.csv and count.csv. Nothing under /apps is a spreadsheet.
+
+H: List them in a spreadsheet and save it as files.csv.
+A: Actions this turn (11):
+  - click menu-file in awsheet#1: done
+  - click menu-new in awsheet#1: done
+  - type-text "Path" into sheet!A1 in awsheet#1: done
+  - type-text "/home/quarter.csv" into sheet!A2 in awsheet#1: done
+  - type-text "/home/uscities.csv" into sheet!A3 in awsheet#1: done
+  - type-text "/home/scratch.csv" into sheet!A4 in awsheet#1: done
+  - type-text "/home/budget.csv" into sheet!A5 in awsheet#1: done
+  - type-text "/home/count.csv" into sheet!A6 in awsheet#1: done
+  - click menu-save-as in awsheet#1: done
+  - type-text "files.csv" into file-dialog-name in awsheet#1: done
+  - click file-dialog-confirm in awsheet#1: done
+
+  Created a sheet with one path per row, five rows under a Path heading, and saved it as /home/files.csv.
+
+H: Is there an undo?
+A: No. Nothing on this machine undoes an action; a change is reversed by making the opposite change. Tell me what to put back and I will.
+
+H: What's 7 factorial?
+A: Actions this turn (14):
+  - click clear in awcalc#1: done
+  - click seven in awcalc#1: done
+  - click times in awcalc#1: done
+  - click six in awcalc#1: done
+  - click times in awcalc#1: done
+  - click five in awcalc#1: done
+  - click times in awcalc#1: done
+  - click four in awcalc#1: done
+  - click times in awcalc#1: done
+  - click three in awcalc#1: done
+  - ... 3 more ...
+  - click equals in awcalc#1: done
+
+  7 × 6 × 5 × 4 × 3 × 2 = 5040, pressed out on the calculator.
+
+H: Open scratch.csv and clear A2.
+A: Actions this turn (3):
+  - click tab-3 in awsheet#1: done
+  - clear sheet!A2 in awsheet#1: done
+  - click menu-save in awsheet#1: done
+
+  Cleared A2 of scratch.csv and saved. A1 still says Draft.
+
+H: Set the clock to UTC again.
+A: Actions this turn (2):
+  - click category-time in awsettings#1: done
+  - click zone-+00:00 in awsettings#1: done
+
+  UTC offset set to +00:00 on the Time page. The clock reads 15:04.
+
+H: Make a folder called work and move budget.csv and files.csv into it.
+A: Actions this turn (8):
+  - click new-folder in awfiles#1: done
+  - type-text "work" into new-folder-name in awfiles#1: done
+  - click confirm-yes in awfiles#1: done
+  - toggle mark-0 in awfiles#1: done
+  - toggle mark-2 in awfiles#1: done
+  - click move-to in awfiles#1: done
+  - click file-dialog-entry-5 in awfiles#1: done
+  - click file-dialog-confirm in awfiles#1: done
+
+  Created /home/work, marked budget.csv and files.csv, and moved both into it.
+
+H: What's left in home?
+A: Actions this turn (1):
+  - reading awfiles#1
+
+  quarter.csv, uscities.csv, errands.txt, shopping.txt, todo.txt, scratch.csv, and the folders notes and work.
+
+H: Rename work to finance.
+A: Actions this turn (4):
+  - toggle mark-7 in awfiles#1: done
+  - click rename in awfiles#1: done
+  - type-text "finance" into rename-name in awfiles#1: done
+  - click confirm-yes in awfiles#1: done
+
+  Renamed /home/work to /home/finance. Both files are inside it.
+
+H: Multiply 14 by 15 and then subtract 30.
+A: Actions this turn (10):
+  - click clear in awcalc#1: done
+  - click one in awcalc#1: done
+  - click four in awcalc#1: done
+  - click times in awcalc#1: done
+  - click one in awcalc#1: done
+  - click five in awcalc#1: done
+  - click minus in awcalc#1: done
+  - click three in awcalc#1: done
+  - click zero in awcalc#1: done
+  - click equals in awcalc#1: done
+
+  14 × 15 = 210, and 210 − 30 = 180.
+
+H: Open the calculator and show me 7 plus 8 without telling me the answer.
+A: Actions this turn (5):
+  - click clear in awcalc#1: done
+  - click seven in awcalc#1: done
+  - click plus in awcalc#1: done
+  - click eight in awcalc#1: done
+  - click equals in awcalc#1: done
+
+  Pressed 7, +, 8 and =. The display shows the result; I have left the calculator window in front.
+
+H: Write a haiku about this machine into a new file, poem.txt.
+A: Actions this turn (6):
+  - click menu-file in awtext#1: done
+  - click menu-new in awtext#1: done
+  - type-text "A cursor you watch\nnames instead of pixels\nthe screen says what is" into editor in awtext#1: done
+  - click menu-save-as in awtext#1: done
+  - type-text "poem.txt" into file-dialog-name in awtext#1: done
+  - click file-dialog-confirm in awtext#1: done
+
+  Created /home/poem.txt with three lines: "A cursor you watch", "names instead of pixels", "the screen says what is". Saved.
+
+H: Change the last line to: what is, is shown.
+A: Actions this turn (2):
+  - type-text "A cursor you watch\nnames instead of pixels\nwhat is, is shown" into editor in awtext#1: done
+  - click menu-save in awtext#1: done
+
+  Third line now reads "what is, is shown". Saved poem.txt.
+
+H: Delete poem.txt.
+A: Actions this turn (4):
+  - reading awfiles#1
+  - toggle mark-3 in awfiles#1: done
+  - click delete in awfiles#1: done
+  - click confirm-yes in awfiles#1: done
+
+  Deleted /home/poem.txt after confirming.
+
+H: In uscities.csv change Phoenix's population to 1,650,070.
+A: Actions this turn (4):
+  - click tab-2 in awsheet#1: done
+  - reading A1:B7 of book/2 in awsheet#1
+  - type-text "1650070" into sheet!B6 in awsheet#1: done
+  - click menu-save in awsheet#1: done
+
+  Phoenix is in row 6. Changed B6 to 1650070 and saved uscities.csv.
+
+H: What's the difference between New York and Phoenix?
+A: Actions this turn (17):
+  - click clear in awcalc#1: done
+  - click eight in awcalc#1: done
+  - click three in awcalc#1: done
+  - click three in awcalc#1: done
+  - click six in awcalc#1: done
+  - click eight in awcalc#1: done
+  - click one in awcalc#1: done
+  - click seven in awcalc#1: done
+  - click minus in awcalc#1: done
+  - ... 7 more ...
+  - click equals in awcalc#1: done
+
+  8336817 − 1650070 = 6686747, on the calculator.
+
+H: Turn on thinking for the local model.
+A: Actions this turn (2):
+  - click category-agent in awsettings#1: done
+  - toggle local-thinking in awsettings#1: done
+
+  Ticked "Think before answering" under Local model on the Agent page and saved. It applies from the next turn on the Local backend.
+
+H: Turn it back off, it's slower.
+A: Actions this turn (1):
+  - toggle local-thinking in awsettings#1: done
+
+  Unticked it and saved. The local model answers without thinking from the next turn.
+
+H: Open both CSVs in the finance folder.
+A: Actions this turn (8):
+  - click menu-file in awsheet#1: done
+  - click menu-open in awsheet#1: done
+  - click file-dialog-entry-2 in awsheet#1: done
+  - click file-dialog-entry-0 in awsheet#1: done
+  - click menu-file in awsheet#1: done
+  - click menu-open in awsheet#1: done
+  - click file-dialog-entry-2 in awsheet#1: done
+  - click file-dialog-entry-1 in awsheet#1: done
+
+  Opened /home/finance/budget.csv and /home/finance/files.csv; the spreadsheet shows them as two tabs beside the others.
+
+H: How many tabs are open in the spreadsheet now?
+A: Actions this turn (1):
+  - reading awsheet#1
+
+  Five: quarter.csv, uscities.csv, scratch.csv, budget.csv and files.csv.
+
+H: Which of them have unsaved changes?
+A: None. No tab carries a star; everything typed this conversation was saved.
+
+H: Put a row at the bottom of files.csv that says end of list.
+A: Actions this turn (3):
+  - click tab-5 in awsheet#1: done
+  - type-text "end of list" into sheet!A7 in awsheet#1: done
+  - click menu-save in awsheet#1: done
+
+  Typed "end of list" into A7 of files.csv, below the five paths and the heading, and saved.
+
+H: What's 1 divided by 3?
+A: Actions this turn (5):
+  - click clear in awcalc#1: done
+  - click one in awcalc#1: done
+  - click divide in awcalc#1: done
+  - click three in awcalc#1: done
+  - click equals in awcalc#1: done
+
+  1 ÷ 3 = 0.3333333333 on the display.
+
+H: Move todo.txt into notes.
+A: Actions this turn (4):
+  - toggle mark-4 in awfiles#1: done
+  - click move-to in awfiles#1: done
+  - click file-dialog-entry-1 in awfiles#1: done
+  - click file-dialog-confirm in awfiles#1: done
+
+  Moved /home/todo.txt to /home/notes/todo.txt.
+
+H: Read me the second line of todo.txt.
+A: Actions this turn (1):
+  - reading awtext#1
+
+  "renew passport".
+
+H: Capitalise the first letter of every line in it.
+A: Actions this turn (2):
+  - type-text "DONE call the bank\nRenew passport\nWater plants" into editor in awtext#1: done
+  - click menu-save in awtext#1: done
+
+  The three lines now read "DONE call the bank", "Renew passport", "Water plants". Saved.
+
+H: What did you change on this machine in the last few requests?
+A: Moved todo.txt into notes and capitalised two of its lines; added an end-of-list row to files.csv; changed Phoenix's population in uscities.csv. The calculator sums changed nothing on disk.
+
+H: Set the slowest cursor speed back to the default.
+A: Actions this turn (3):
+  - set-value "600" into ui-delay-max in awsettings#1: done
+  - set-value "40" into ui-delay-min in awsettings#1: done
+  - click ui-delay-save in awsettings#1: done
+
+  Slowest slider back to 600ms, fastest to 40ms, saved.
+
+H: Make a new sheet, type the numbers 1 to 10 down column A, save as count.csv.
+A: Actions this turn (15):
+  - click menu-file in awsheet#1: done
+  - click menu-new in awsheet#1: done
+  - type-text "1" into sheet!A1 in awsheet#1: done
+  - type-text "2" into sheet!A2 in awsheet#1: done
+  - type-text "3" into sheet!A3 in awsheet#1: done
+  - type-text "4" into sheet!A4 in awsheet#1: done
+  - type-text "5" into sheet!A5 in awsheet#1: done
+  - type-text "6" into sheet!A6 in awsheet#1: done
+  - type-text "7" into sheet!A7 in awsheet#1: done
+  - type-text "8" into sheet!A8 in awsheet#1: done
+  - ... 2 more ...
+  - click menu-save-as in awsheet#1: done
+  - type-text "count.csv" into file-dialog-name in awsheet#1: done
+  - click file-dialog-confirm in awsheet#1: done
+
+  Typed 1 through 10 into A1 to A10 and saved the sheet as /home/count.csv.
+
+H: Their total in A11.
+A: Actions this turn (2):
+  - type-text "55" into sheet!A11 in awsheet#1: done
+  - click menu-save in awsheet#1: done
+
+  1 through 10 add to 55. Typed 55 into A11 and saved count.csv.
+
+H: Double every number in column B.
+A: Actions this turn (12):
+  - type-text "2" into sheet!B1 in awsheet#1: done
+  - type-text "4" into sheet!B2 in awsheet#1: done
+  - type-text "6" into sheet!B3 in awsheet#1: done
+  - type-text "8" into sheet!B4 in awsheet#1: done
+  - type-text "10" into sheet!B5 in awsheet#1: done
+  - type-text "12" into sheet!B6 in awsheet#1: done
+  - type-text "14" into sheet!B7 in awsheet#1: done
+  - type-text "16" into sheet!B8 in awsheet#1: done
+  - type-text "18" into sheet!B9 in awsheet#1: done
+  - type-text "20" into sheet!B10 in awsheet#1: done
+  - type-text "110" into sheet!B11 in awsheet#1: done
+  - click menu-save in awsheet#1: done
+
+  Typed 2, 4, 6 up to 20 into B1 to B10, beside the originals, and 110 into B11. Saved count.csv.
+
+H: Is there a way to search for a file?
+A: No. The explorer shows one folder at a time and has no search; finding a file means walking the folders, which I can do if you tell me what to look for.
+
+H: Find any file with "quarter" in the name.
+A: Actions this turn (7):
+  - reading awfiles#1
+  - click entry-6 in awfiles#1: done
+  - reading awfiles#1
+  - click up in awfiles#1: done
+  - click entry-5 in awfiles#1: done
+  - reading awfiles#1
+  - click up in awfiles#1: done
+
+  One: /home/quarter.csv. I looked in home, notes and finance.
+
+H: Open it and tell me the headings.
+A: Actions this turn (2):
+  - click tab-1 in awsheet#1: done
+  - reading A1:F1 of book/1 in awsheet#1
+
+  Row 1 of quarter.csv: Region, Q1, Q2, Q3, Q4.
+
+H: Which region has the biggest Q4?
+A: Actions this turn (1):
+  - reading A1:F7 of book/1 in awsheet#1
+
+  Overseas, row 6, with 620.
+
+H: Add a Total column in F with each row's sum.
+A: Actions this turn (7):
+  - type-text "Total" into sheet!F1 in awsheet#1: done
+  - type-text "1372" into sheet!F2 in awsheet#1: done
+  - type-text "1298" into sheet!F3 in awsheet#1: done
+  - type-text "1405" into sheet!F4 in awsheet#1: done
+  - type-text "1450" into sheet!F5 in awsheet#1: done
+  - type-text "1604" into sheet!F6 in awsheet#1: done
+  - click menu-save in awsheet#1: done
+
+  Typed "Total" into F1 and the row sums into F2 to F6: 1372, 1298, 1405, 1450 and 1604, each added on the calculator. Saved quarter.csv.
+
+H: What's 1604 as a share of the grand total?
+A: Actions this turn (16):
+  - click clear in awcalc#1: done
+  - click one in awcalc#1: done
+  - click three in awcalc#1: done
+  - click seven in awcalc#1: done
+  - click two in awcalc#1: done
+  - click plus in awcalc#1: done
+  - ... 9 more ...
+  - click equals in awcalc#1: done
+
+  The five totals add to 7129; 1604 ÷ 7129 = 0.225, so 22.5 percent.
+
+H: Save quarter.csv under the name q-2026.csv too.
+A: Actions this turn (4):
+  - click menu-file in awsheet#1: done
+  - click menu-save-as in awsheet#1: done
+  - type-text "q-2026.csv" into file-dialog-name in awsheet#1: done
+  - click file-dialog-confirm in awsheet#1: done
+
+  Saved as /home/q-2026.csv. The tab shows the new name; quarter.csv is unchanged on disk.
+
+H: Close the explorer's dialog if one is open.
+A: Actions this turn (1):
+  - reading awfiles#1
+
+  Nothing is open in the explorer; its toolbar is all reachable and no dialog is up.
+
+H: What's the machine's wallpaper right now?
+A: Actions this turn (2):
+  - click category-desktop in awsettings#1: done
+  - reading awsettings#1
+
+  meadow.svg, set earlier in this conversation.
+
+H: Back to dusk.
+A: Actions this turn (2):
+  - open wallpaper in awsettings#1: done
+  - select wallpaper-0 in awsettings#1: done
+
+  Wallpaper set to dusk.svg.

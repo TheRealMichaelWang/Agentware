@@ -29,8 +29,10 @@
 mod backend;
 mod backends;
 mod consequences;
+mod history;
 mod http;
 mod interrupt;
+mod padding;
 
 use std::collections::HashSet;
 use std::io::Write as _;
@@ -65,6 +67,24 @@ const INTERRUPTIONS: u32 = 3;
 /// task suite tunes them.
 const NUDGE: u32 = 3;
 const STUCK: u32 = 6;
+
+/// What the model is told when it ends a turn having called no tool at all.
+///
+/// The failure this answers was measured on 12 September 2026 and it is the
+/// dominant one under a long history: asked to do something on the machine,
+/// with a conversation of earlier requests and the agent's reports behind
+/// it, the model answers in one exchange with a report of work it has not
+/// done ("Changed D4 from 475 to 500 in quarter.csv, saved."), the shape of
+/// the replies in front of it. No prompt wording measured moved it much.
+/// The harness, though, can see the shape exactly: a turn that is over and
+/// never listed, read, opened or acted on anything. So it says so, once,
+/// and asks again. A turn that was a question costs one short exchange for
+/// it; a turn that was a request gets done.
+const ZERO_ACTION_NUDGE: &str = "Nothing was done on the machine this turn: no application was \
+listed, read, opened or acted on, so nothing you have just described has happened and the \
+human's screen is unchanged. If the request needs the machine, do it now, in this turn, with \
+the tools, and then report only what actually happened. If it was a question that needs no \
+action, answer it.";
 
 /// How long to wait for an application to appear after asking for it. An
 /// application is forked by PID 1 and attaches when its first tree arrives,
@@ -149,6 +169,11 @@ number. list_apps gives the handle of every open window and open_app gives the h
 the one it opened. read_app, read_cells and act take the handle, never the bare name: two \
 windows of one application are two handles, and the name alone is refused.
 - Read before acting: list_apps, then read_app, then act.
+- Every request is new work. Earlier replies in this conversation report what was done for \
+earlier requests, and none of it counts for this one: the machine has to be read and acted \
+on again, in this turn, before there is anything to report. A reply describing actions you \
+have not performed in this turn is a false report; the human is looking at the screen and \
+will see that nothing happened.
 - When the work needs an application that is not open, call search_apps first and say what \
 you want to do, not what you think it is called. It answers with what this machine has, \
 what each one is for, and whether it is already open. Never guess an application's name: \
@@ -370,18 +395,33 @@ fn main() {
     // the prompt as the newest message. Telemetry never appears here; the
     // model's own working notes from earlier turns ended when those turns
     // did, exactly as the architecture intends.
-    let mut messages: Vec<ModelMessage> = context
-        .history
-        .iter()
-        .filter(|message| !message.text.trim().is_empty())
-        .map(|message| {
-            if message.role == turn::ROLE_AGENT {
-                ModelMessage::assistant_text(&message.text)
-            } else {
-                ModelMessage::user_text(&message.text)
+    // An agent's entry carries the calls it made (`history::expand`), so an
+    // earlier turn reads as work done with tools and not as a report.
+    let mut next_id = 0;
+    let mut messages: Vec<ModelMessage> = Vec::new();
+    for message in context.history.iter().filter(|message| !message.text.trim().is_empty()) {
+        if message.role == turn::ROLE_AGENT {
+            messages.extend(history::expand(&message.text, &mut next_id));
+        } else {
+            messages.push(ModelMessage::user_text(&message.text));
+        }
+    }
+    // A measurement, never a machine in ordinary use: the task suite asks
+    // for a long conversation to already be behind the prompt, to find
+    // where the model stops being good at it.
+    if let Some(path) = padding::requested() {
+        match padding::read(&path) {
+            Ok(earlier) => {
+                log(&format!(
+                    "padding the history with {} message(s) from {path}, because the command \
+                     line asked for it",
+                    earlier.len()
+                ));
+                messages.splice(0..0, earlier);
             }
-        })
-        .collect();
+            Err(err) => log(&format!("the command line named {path} as history: {err}")),
+        }
+    }
     messages.push(ModelMessage::user_text(&context.prompt));
 
     let tools = tool_definitions(&context.installed);
@@ -412,6 +452,10 @@ fn main() {
     // the model is reasoning about a workspace that has just changed, and the
     // rest of that reasoning is about a workspace that no longer exists.
     let watch = Watch::new(agent.link.fd());
+    // Whether any tool has been called this turn, and whether the model has
+    // already been told when it tried to end the turn without one.
+    let mut called_any = false;
+    let mut nudged = false;
     loop {
         let mut interruptions: u32 = 0;
         let assistant = loop {
@@ -454,9 +498,24 @@ fn main() {
             .collect();
 
         if calls.is_empty() {
+            // A turn ending without one tool called is either a question
+            // answered or a request reported as done that was not. The
+            // harness cannot tell which, and it does not have to: it says
+            // what it knows, once, and lets the model decide.
+            if !called_any && !nudged && matches!(assistant.stop, Stop::EndTurn) {
+                nudged = true;
+                agent.say(
+                    turn::KIND_ACTION,
+                    "the model ended the turn without touching the machine; asking it to check",
+                );
+                messages.push(ModelMessage { role: Role::Assistant, content: assistant.content });
+                messages.push(ModelMessage::user_text(ZERO_ACTION_NUDGE));
+                continue;
+            }
             finish_turn(&mut agent, &assistant);
             return;
         }
+        called_any = true;
 
         // The narration between tool calls, now that it is known to be
         // narration rather than the reply.
@@ -475,6 +534,9 @@ fn main() {
         // doing and why it changes none of the answers.
         let mut pending = calls.iter().cloned().peekable();
         while let Some((id, name, input)) = pending.next() {
+            // The call itself, for the desk's history (`turn::KIND_CALL`);
+            // the pane shows the action lines below, never this.
+            agent.say(turn::KIND_CALL, &json!({"name": name, "input": input}).to_string());
             if name == "act" {
                 let mut run = vec![(id, input)];
                 while pending.peek().is_some_and(|(_, next, _)| next == "act") {

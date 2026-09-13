@@ -9,6 +9,26 @@ KERNEL := kernel-build/arch/x86/boot/bzImage
 # for the pages it touches. `make pack` rebuilds both the way an installer
 # would; the state volume below is the one disk it never touches.
 INITRAMFS := initramfs.cpio.gz
+# The bare-metal boot stage is the same archive plus the GPU's firmware,
+# which amdgpu asks for while it probes, before any disk is mounted. The
+# QEMU one stays without it: virtio-gpu wants none, and an initramfs is
+# unpacked into RAM on every boot. The files come from the linux-firmware
+# submodule (the official tree, pinned to a release), named as the driver
+# requests them. The list is this machine's: the Strix Halo's IP discovery
+# table (GC 11.5.1, PSP 14.0.1, DCN 3.5.1, VCN 4.0.6 twice, SDMA 6.1.1,
+# VPE 6.1.1) read off /sys/class/drm/card1/device/ip_discovery on 13
+# September 2026, mapped to file names by the driver's own MODULE_FIRMWARE
+# lines. The SMU on an APU carries its firmware in the BIOS, and the ISP
+# (the camera pipeline, 3.8 MB on its own) is not built in.
+INITRAMFS_USB := initramfs-usb.cpio.gz
+FIRMWARE_TREE := linux-firmware
+FIRMWARE := $(addprefix amdgpu/, \
+	gc_11_5_1_pfp.bin gc_11_5_1_me.bin gc_11_5_1_mec.bin gc_11_5_1_rlc.bin \
+	gc_11_5_1_imu.bin gc_11_5_1_mes_2.bin gc_11_5_1_mes1.bin \
+	psp_14_0_1_toc.bin psp_14_0_1_ta.bin \
+	dcn_3_5_1_dmcub.bin \
+	vcn_4_0_6.bin vcn_4_0_6_1.bin \
+	sdma_6_1_1.bin vpe_6_1_1.bin)
 SYSTEM_IMG := system.img
 FS_DIR := sysroot
 AW_CORE_DIR := agentwarecore
@@ -17,7 +37,7 @@ TARGET := x86_64-unknown-linux-musl
 BIN_DIR := $(AW_CORE_DIR)/target/$(TARGET)/release
 APPS_BIN_DIR := $(AW_APPS_DIR)/target/$(TARGET)/release
 
-.PHONY: all build buildcore buildapps pack run selftest clean cleanstate kernel kernelconfig configure_anthropic_key
+.PHONY: all build buildcore buildapps pack usb run selftest clean cleanstate kernel kernelconfig kernel-usb kernelconfig-usb configure_anthropic_key
 
 # Guest display size. virtio-vga defaults to 1280x800 and the compositor takes
 # the driver's preferred mode, so these two numbers are the whole of it.
@@ -110,6 +130,37 @@ kernelconfig:
 	$(MAKE) -C kernel-build savedefconfig
 	mv kernel-build/defconfig $(KERNEL_CONFIG)
 
+# The bare-metal kernel: the same source, a second configuration, built in
+# a worktree of the submodule so the two trees never share an object file.
+# kernel/agentware-usb.config adds what a real screen and a real disk need
+# (the EFI framebuffer as the console until amdgpu takes over, amdgpu itself
+# with its display core and fbdev emulation, NVMe, UAS) and a built-in
+# command line, so the EFI stub boots it with no loader; tools/usbstick.sh
+# puts it on a stick. `make kernelconfig-usb` saves the configuration back
+# after `make -C kernel-usb-src menuconfig`.
+KERNEL_USB_SRC := kernel-usb-src
+KERNEL_USB := $(KERNEL_USB_SRC)/arch/x86/boot/bzImage
+KERNEL_USB_CONFIG := kernel/agentware-usb.config
+
+kernel-usb: $(KERNEL_USB_SRC)/Makefile
+	cp $(KERNEL_USB_CONFIG) $(KERNEL_USB_SRC)/.config
+	$(MAKE) -C $(KERNEL_USB_SRC) olddefconfig
+	$(MAKE) -C $(KERNEL_USB_SRC) -j$(shell nproc) bzImage
+
+kernelconfig-usb:
+	$(MAKE) -C $(KERNEL_USB_SRC) savedefconfig
+	mv $(KERNEL_USB_SRC)/defconfig $(KERNEL_USB_CONFIG)
+
+$(KERNEL_USB_SRC)/Makefile: kernel-build/Makefile
+	git -C kernel-build worktree add --detach ../$(KERNEL_USB_SRC) HEAD
+
+# The firmware submodule, if it has not been fetched: the official
+# linux-firmware tree at kernel.org, shallow, and checked out sparse so the
+# working tree holds the amdgpu directory alone rather than every vendor's.
+$(FIRMWARE_TREE)/WHENCE:
+	git submodule update --init --depth 1 $(FIRMWARE_TREE)
+	git -C $(FIRMWARE_TREE) sparse-checkout set amdgpu
+
 # The submodule, if it has not been fetched. Shallow, because the Linux
 # history is several gigabytes nobody here needs.
 kernel-build/Makefile:
@@ -153,6 +204,14 @@ pack: build
 	# needs privileges to exist on a filesystem, not in an archive, and that
 	# is what keeps sudo out of the build.
 	tools/mkinitramfs.py $(BIN_DIR)/supervisor $(INITRAMFS)
+
+# Everything a USB stick needs: the image, the bare-metal kernel, and the
+# boot stage with the GPU's firmware in it. tools/usbstick.sh copies them on.
+usb: pack kernel-usb $(INITRAMFS_USB)
+
+$(INITRAMFS_USB): pack $(FIRMWARE_TREE)/WHENCE
+	tools/mkinitramfs.py $(BIN_DIR)/supervisor $(INITRAMFS_USB) \
+		--firmware-tree $(FIRMWARE_TREE) --firmware $(FIRMWARE)
 
 	# 3. Copy the compiled Rust binaries
 	cp $(BIN_DIR)/haimanager $(FS_DIR)/bin/haimanager

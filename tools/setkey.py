@@ -114,13 +114,59 @@ def with_key(text, key):
     return text.replace("</settings>", section + "</settings>", 1)
 
 
+def set_element(text, path, value):
+    """The same settings, with the element at `path` holding `value`.
+
+    `path` is the element's place under the root, `agent/local-thinking` or
+    `agent/computer-use/min-delay`. An element that exists is replaced in
+    place; one that does not is added at the end of its section, and a
+    section that does not exist is added at the end of its parent, so a
+    setting the file has never carried can still be set. This is what the
+    task suite uses to put a machine into one configuration per run without
+    booting it first, and it is deliberately as plain as the reader on the
+    other side: the settings module reads elements by path and nothing else.
+    """
+    if "<settings>" not in text:
+        text = defaults_with("")
+    return _set_within(text, "settings", path.split("/"), escape(value), 1)
+
+
+def _set_within(text, parent, path, value, depth):
+    head, rest = path[0], path[1:]
+    opened, closed = "<%s>" % parent, "</%s>" % parent
+    start = text.index(opened) + len(opened)
+    end = text.index(closed, start)
+    before, inner, after = text[:start], text[start:end], text[end:]
+    indent = "  " * depth
+    if rest:
+        section = r"<%s>.*?</%s>" % (head, head)
+        if not re.search(section, inner, re.S):
+            inner += "%s<%s>\n%s</%s>\n" % (indent, head, indent, head)
+        # Recurse into the section rather than the whole text, so a leaf name
+        # shared between sections lands in the right one.
+        return before + _set_within(inner, head, rest, value, depth + 1) + after
+    leaf = r"<%s\s*/>|<%s>.*?</%s>" % (head, head, head)
+    element = "<%s>%s</%s>" % (head, value, head)
+    if re.search(leaf, inner, re.S):
+        return before + re.sub(leaf, lambda _: element, inner, count=1, flags=re.S) + after
+    return before + inner + indent + element + "\n" + after
+
+
 def write_settings(image, text):
     """Replace the settings file in the image.
 
     `rm` unlinks without freeing the old inode's blocks, which leaves the
     filesystem inconsistent in exactly the way `e2fsck` exists to repair, so
-    the check afterwards is part of the write rather than a precaution. Its
-    exit code 1 means it corrected something, which is the expected outcome.
+    a check is part of the write rather than a precaution. Its exit code 1
+    means it corrected something, which is the expected outcome.
+
+    The check runs *between* the unlink and the write, not only after. Done
+    after both, the new file had been handed the old inode's still-claimed
+    blocks and the repair resolved the double claim by cutting the new file
+    to the old one's length: a settings file that grew by one element came
+    back truncated mid-word, the guest could not parse it, and rewrote the
+    defaults over it, key and all. A key replaces a key of the same length,
+    which is why this never showed until the task suite added an element.
     """
     scratch = tempfile.mkdtemp(prefix="agentware-key-")
     local = os.path.join(scratch, SETTINGS)
@@ -128,16 +174,27 @@ def write_settings(image, text):
         with open(local, "w") as handle:
             handle.write(text)
 
+        # First of all, replay the journal. An image from a running machine
+        # has one, and an fsck that replays it *after* a debugfs write puts
+        # the journal's copy of the inode table back over the write: the
+        # name stays in the directory pointing at inode 0 and the guest
+        # sees no file. Once replayed, the later checks only fix counts.
+        _repair(image)
         debugfs(image, "rm /%s" % SETTINGS, writable=True)
+        _repair(image)
         debugfs(image, "write %s %s" % (local, SETTINGS), writable=True)
-
-        done = subprocess.run(["e2fsck", "-fy", image], capture_output=True, text=True)
-        if done.returncode > 1:
-            raise SystemExit("e2fsck could not repair %s:\n%s" % (image, done.stdout))
+        _repair(image)
     finally:
         if os.path.exists(local):
             os.remove(local)
         os.rmdir(scratch)
+
+
+def _repair(image):
+    """`e2fsck -fy`, stopping only on what it could not fix."""
+    done = subprocess.run(["e2fsck", "-fy", image], capture_output=True, text=True)
+    if done.returncode > 1:
+        raise SystemExit("e2fsck could not repair %s:\n%s" % (image, done.stdout))
 
 
 def main():

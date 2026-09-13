@@ -22,6 +22,7 @@
 //!   <agent>
 //!     <anthropic-key>sk-ant-...</anthropic-key>
 //!     <workspace-id>wrkspc_...</workspace-id>
+//!     <local-thinking>off</local-thinking>
 //!     <computer-use>
 //!       <min-delay>40</min-delay>
 //!       <max-delay>600</max-delay>
@@ -29,6 +30,13 @@
 //!   </agent>
 //! </settings>
 //! ```
+//!
+//! `local-thinking` is whether the model on the machine reasons before it
+//! answers. A machine setting rather than a per-conversation one because it
+//! is a property of the one model this machine runs, not of what is being
+//! asked: the hosted models decide it themselves. Off is the default and the
+//! measurements are why (see `awagent::backends`): thinking is where a local
+//! model's tokens go, and it is the part a draft head predicts worst.
 //!
 //! ## The agent
 //!
@@ -132,6 +140,9 @@ pub struct Settings {
     /// the API will not accept without one. `None` for an ordinary
     /// workspace-scoped key, which already says which workspace it is.
     pub anthropic_workspace: Option<String>,
+    /// Whether the model on the machine thinks before it answers. Off
+    /// unless someone turns it on: see the module documentation for why.
+    pub local_thinking: bool,
     /// How long the agent's cursor may take to show one action, at both ends
     /// of the range. Nothing waits on it: see [`crate::pace`].
     pub pace: Pace,
@@ -145,10 +156,17 @@ impl Default for Settings {
             utc_offset: 0,
             anthropic_key: None,
             anthropic_workspace: None,
+            local_thinking: false,
             pace: Pace::default(),
         }
     }
 }
+
+/// The two words `local-thinking` is written as. Words rather than a
+/// boolean's spelling, because the file is edited by hand as well as by the
+/// Settings app and "on" is what a person writes.
+pub const THINKING_ON: &str = "on";
+pub const THINKING_OFF: &str = "off";
 
 impl Settings {
     /// Read the settings file, creating it with the defaults if there is none.
@@ -197,12 +215,13 @@ impl Settings {
     pub fn to_xml(&self) -> String {
         let wallpaper = self.wallpaper.as_deref().unwrap_or(WALLPAPER_NONE);
         format!(
-            "<settings>\n  <desktop>\n    <wallpaper>{}</wallpaper>\n    <theme>{}</theme>\n  </desktop>\n  <time>\n    <utc-offset>{}</utc-offset>\n  </time>\n  <agent>\n    <anthropic-key>{}</anthropic-key>\n    <workspace-id>{}</workspace-id>\n    <computer-use>\n      <min-delay>{}</min-delay>\n      <max-delay>{}</max-delay>\n    </computer-use>\n  </agent>\n</settings>\n",
+            "<settings>\n  <desktop>\n    <wallpaper>{}</wallpaper>\n    <theme>{}</theme>\n  </desktop>\n  <time>\n    <utc-offset>{}</utc-offset>\n  </time>\n  <agent>\n    <anthropic-key>{}</anthropic-key>\n    <workspace-id>{}</workspace-id>\n    <local-thinking>{}</local-thinking>\n    <computer-use>\n      <min-delay>{}</min-delay>\n      <max-delay>{}</max-delay>\n    </computer-use>\n  </agent>\n</settings>\n",
             escape(wallpaper),
             escape(&self.theme),
             format_offset(self.utc_offset),
             escape(self.anthropic_key.as_deref().unwrap_or("")),
             escape(self.anthropic_workspace.as_deref().unwrap_or("")),
+            if self.local_thinking { THINKING_ON } else { THINKING_OFF },
             self.pace.min.as_millis(),
             self.pace.max.as_millis(),
         )
@@ -350,6 +369,13 @@ fn parse(text: &str) -> Option<Settings> {
         .map(|text| text.trim())
         .filter(|text| !text.is_empty())
         .map(str::to_owned);
+    // Only the word turns it on. A missing element, an older file, or a hand
+    // edit that spelt it some other way is off, which is the default and the
+    // cheaper of the two mistakes.
+    let local_thinking = values
+        .get("settings/agent/local-thinking")
+        .map(|text| text.trim().eq_ignore_ascii_case(THINKING_ON))
+        .unwrap_or(false);
     // A file from before Computer Use existed has neither element and gets
     // the default range. One that has been hand edited into nonsense gets it
     // too, per element: `Pace::new` puts the ends in order and inside the
@@ -362,7 +388,15 @@ fn parse(text: &str) -> Option<Settings> {
         millis("settings/agent/computer-use/min-delay").unwrap_or(fallback.min),
         millis("settings/agent/computer-use/max-delay").unwrap_or(fallback.max),
     );
-    Some(Settings { wallpaper, theme, utc_offset, anthropic_key, anthropic_workspace, pace })
+    Some(Settings {
+        wallpaper,
+        theme,
+        utc_offset,
+        anthropic_key,
+        anthropic_workspace,
+        local_thinking,
+        pace,
+    })
 }
 
 /// Every element's text, keyed by its path from the root, `a/b/c`. Elements
@@ -457,11 +491,26 @@ mod tests {
             utc_offset: -300,
             anthropic_key: Some("sk-ant-a&b<c>\"d\"".into()),
             anthropic_workspace: Some("wrkspc_&<>".into()),
+            local_thinking: true,
             pace: Pace::new(Duration::from_millis(25), Duration::from_millis(900)),
         };
         assert_eq!(parse(&settings.to_xml()), Some(settings));
         let none = Settings { wallpaper: None, utc_offset: 345, ..Settings::default() };
         assert_eq!(parse(&none.to_xml()), Some(none));
+    }
+
+    #[test]
+    fn thinking_is_off_unless_the_file_says_on() {
+        let on = "<settings><agent><local-thinking> On </local-thinking></agent></settings>";
+        assert!(parse(on).unwrap().local_thinking);
+        for text in [
+            "<settings><agent><local-thinking>off</local-thinking></agent></settings>",
+            "<settings><agent><local-thinking>yes</local-thinking></agent></settings>",
+            "<settings><agent><local-thinking/></agent></settings>",
+            "<settings><agent/></settings>",
+        ] {
+            assert!(!parse(text).unwrap().local_thinking, "{text}");
+        }
     }
 
     #[test]

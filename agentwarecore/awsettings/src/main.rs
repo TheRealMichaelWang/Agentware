@@ -66,6 +66,10 @@ struct Settings {
     /// The workspace as typed but not yet saved, on the same terms as the
     /// key: committed on Enter or Save, never per keystroke.
     workspace_edit: String,
+    /// Whether the model on the machine thinks before answering, as saved.
+    /// A checkbox commits on the click: one toggle is one write, unlike a
+    /// drag or a half-typed key.
+    thinking: bool,
     /// How long the agent's cursor may take, as stored and as being typed.
     pace: awproto::pace::Pace,
     pace_edit: computeruse::Editing,
@@ -104,6 +108,7 @@ fn main() {
         key_edit: stored.anthropic_key.unwrap_or_default(),
         workspace: stored.anthropic_workspace.clone(),
         workspace_edit: stored.anthropic_workspace.unwrap_or_default(),
+        thinking: stored.local_thinking,
         pace: stored.pace,
         pace_edit: computeruse::Editing::new(stored.pace),
         seen: settings::modified(),
@@ -180,6 +185,7 @@ impl Settings {
                 self.workspace_edit = stored.anthropic_workspace.clone().unwrap_or_default();
             }
             self.workspace = stored.anthropic_workspace;
+            self.thinking = stored.local_thinking;
         }
 
         // The dialog first: it owns its ids and ignores the rest.
@@ -289,6 +295,7 @@ impl Settings {
             }
             ("workspace-id", display::ACTION_SUBMIT)
             | ("workspace-id-save", display::ACTION_CLICK) => self.save_workspace(),
+            ("local-thinking", display::ACTION_TOGGLE) => self.save_thinking(!self.thinking),
 
             (target, display::ACTION_CLICK) if target.starts_with("category-") => {
                 let name = &target["category-".len()..];
@@ -611,6 +618,31 @@ impl Settings {
         self.status = Some(status);
     }
 
+    /// Save whether the local model thinks. One click, one write: a checkbox
+    /// has nothing half-typed to protect.
+    fn save_thinking(&mut self, thinking: bool) {
+        let mut stored = Stored::load();
+        stored.local_thinking = thinking;
+        let status = match stored.save() {
+            Ok(()) => {
+                let mut status = if thinking {
+                    "the local model will think before answering, from the next turn".to_owned()
+                } else {
+                    "the local model will answer without thinking, from the next turn".to_owned()
+                };
+                if !settings::persistent() {
+                    status.push_str(" (no state volume: kept until power off)");
+                }
+                self.thinking = thinking;
+                self.seen = settings::modified();
+                status
+            }
+            Err(err) => format!("could not save the setting: {err}"),
+        };
+        log(&status);
+        self.status = Some(status);
+    }
+
     /// The Agent page: the key the agent authenticates with. Which model
     /// answers is not a machine setting: it is chosen per agentdesk, in the
     /// pane, beside the conversation it applies to.
@@ -664,6 +696,20 @@ impl Settings {
             r#"            <text role="caption" color="muted">Which model answers is chosen in each agentdesk's pane.</text>"#
         );
         out.push_str("          </vstack>\n        </group>\n");
+
+        // The one model this machine runs, and the one thing about it that
+        // is a preference rather than a fact of the hardware. Which model it
+        // is belongs beside the wallpaper the day a second one fits.
+        let checked = if self.thinking { " checked" } else { "" };
+        let _ = writeln!(
+            out,
+            r#"        <group label="Local model">
+          <vstack gap="sm">
+            <checkbox id="local-thinking" label="Think before answering"{checked} description="Whether the model on this machine reasons before each answer. Slower, and every token of it is paid for here; whether it is more correct is what the task suite measures"/>
+            <text role="caption" color="muted">Applies from the next turn on the Local backend. The hosted models decide this themselves.</text>
+          </vstack>
+        </group>"#
+        );
 
         self.pace_edit.render(out, self.pace);
 

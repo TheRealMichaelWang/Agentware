@@ -1,0 +1,39 @@
+model:   Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf
+context: 131072
+url:     http://127.0.0.1:8080
+
+AGENTIC EXCHANGE: read a view, emit a tool call. The real unit of work
+  exchange, thinking off             wall   6.81s | prefill   1302 tok @   754.5 tok/s ( 1.73s) | gen   300 tok @  59.1 tok/s ( 5.08s) | draft 98/304 | 6 call(s): act,act,act,act,act,act
+                                     -> {"app":"awcalc","action":"click","target":"one"}
+  exchange, thinking low             wall   4.48s | prefill      2 tok @    38.2 tok/s ( 0.05s) | gen   384 tok @  86.8 tok/s ( 4.42s) | draft 241/315 | 6 call(s): act,act,act,act,act,act
+                                     -> {"app":"awcalc","action":"click","target":"one"}
+  exchange, thinking medium          wall   4.18s | prefill      2 tok @    43.0 tok/s ( 0.05s) | gen   371 tok @  90.0 tok/s ( 4.12s) | draft 264/379 | 6 call(s): act,act,act,act,act,act
+                                     -> {"app":"awcalc","action":"click","target":"one"}
+
+BATCHING: will it emit several calls in one message when it can?
+  batch, thinking off                wall   3.80s | prefill    534 tok @   634.7 tok/s ( 0.84s) | gen   300 tok @ 101.8 tok/s ( 2.95s) | draft 241/315 | 6 call(s) in one message
+  batch, thinking medium             wall   5.13s | prefill      2 tok @    38.6 tok/s ( 0.05s) | gen   410 tok @  80.9 tok/s ( 5.07s) | draft 243/379 | 6 call(s) in one message
+
+GRAMMAR: the same tool call with the server's grammar lazy, from the first token, and absent
+  tools, lazy grammar 1              wall   4.15s | prefill    487 tok @   642.5 tok/s ( 0.76s) | gen   322 tok @  96.7 tok/s ( 3.33s) | draft 241/315 | 6 call(s)
+  tools, lazy grammar 2              wall   2.83s | prefill      4 tok @    74.8 tok/s ( 0.05s) | gen   322 tok @ 116.4 tok/s ( 2.77s) | draft 299/384 | 6 call(s)
+  tools, lazy grammar 3              wall   2.82s | prefill      4 tok @    80.0 tok/s ( 0.05s) | gen   322 tok @ 116.4 tok/s ( 2.77s) | draft 299/384 | 6 call(s)
+                                     median gen 116.4 tok/s
+  tools, grammar from token one 1    wall   2.82s | prefill      4 tok @    80.4 tok/s ( 0.05s) | gen   322 tok @ 116.3 tok/s ( 2.77s) | draft 299/384 | 6 call(s)
+  tools, grammar from token one 2    wall   2.84s | prefill      4 tok @    80.1 tok/s ( 0.05s) | gen   322 tok @ 115.9 tok/s ( 2.78s) | draft 299/384 | 6 call(s)
+  tools, grammar from token one 3    wall   2.83s | prefill      4 tok @    81.5 tok/s ( 0.05s) | gen   322 tok @ 116.1 tok/s ( 2.77s) | draft 299/384 | 6 call(s)
+                                     median gen 116.1 tok/s
+  tools in the prompt, no grammar 1  wall   4.55s | prefill   1130 tok @   712.0 tok/s ( 1.59s) | gen   300 tok @ 103.3 tok/s ( 2.90s) | draft 241/315 | 6 call(s)
+  tools in the prompt, no grammar 2  wall   2.94s | prefill      4 tok @    78.1 tok/s ( 0.05s) | gen   300 tok @ 103.9 tok/s ( 2.89s) | draft 241/315 | 6 call(s)
+  tools in the prompt, no grammar 3  wall   2.94s | prefill      4 tok @    78.9 tok/s ( 0.05s) | gen   300 tok @ 104.0 tok/s ( 2.88s) | draft 241/315 | 6 call(s)
+                                     median gen 103.9 tok/s
+
+SPREAD: the same exchange 5 times, thinking off
+  repeat 1                           wall   3.79s | prefill    516 tok @   664.9 tok/s ( 0.78s) | gen   300 tok @ 102.1 tok/s ( 2.94s) | draft 241/315 | 6 call(s)
+  repeat 2                           wall   2.98s | prefill      4 tok @    76.1 tok/s ( 0.05s) | gen   300 tok @ 102.7 tok/s ( 2.92s) | draft 241/315 | 6 call(s)
+  repeat 3                           wall   2.98s | prefill      4 tok @    80.2 tok/s ( 0.05s) | gen   300 tok @ 102.8 tok/s ( 2.92s) | draft 241/315 | 6 call(s)
+  repeat 4                           wall   2.98s | prefill      4 tok @    80.0 tok/s ( 0.05s) | gen   300 tok @ 102.8 tok/s ( 2.92s) | draft 241/315 | 6 call(s)
+  repeat 5                           wall   2.99s | prefill      4 tok @    80.1 tok/s ( 0.05s) | gen   300 tok @ 102.3 tok/s ( 2.93s) | draft 241/315 | 6 call(s)
+                                     median 2.98s, p95 3.79s, min 2.98s, max 3.79s
+
+wrote docs/results/2026-09-12/decode-ngram-mod.json

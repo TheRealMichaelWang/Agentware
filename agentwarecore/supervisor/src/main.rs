@@ -114,6 +114,18 @@ fn main() {
     // argument; the supervisor only says whether one exists.
     early::configure_network();
 
+    // `agentware.report-only`: stop here, with the boot report and the
+    // volumes on screen, and start nothing. For a machine being brought up
+    // for the first time (the bare-metal spike, docs/OnDevicePlan.md 1.5),
+    // where the compositor cannot come up yet and its restart loop would
+    // scroll the report off a console that has no scrollback before anyone
+    // could photograph it. Ctrl-Alt-Del still reboots, from the kernel.
+    if early::kernel_flag("agentware.report-only") {
+        early::enable_ctrl_alt_del();
+        kinfo!("agentware.report-only: stopping here, as asked; Ctrl-Alt-Del reboots");
+        park();
+    }
+
     // Stage 3. This has to happen before the first child is spawned: the signal
     // mask survives fork and exec, so anything started beforehand would inherit
     // a blocked SIGTERM and become unkillable.
@@ -323,7 +335,9 @@ fn handle_signal(signal: libc::c_int, services: &mut Services, desks: &mut Desks
 fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
         if !IS_INIT.load(Ordering::SeqCst) {
-            eprintln!("supervisor panicked: {info}");
+            // Not `eprintln!`: a panic hook that can panic is an abort.
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "supervisor panicked: {info}");
             return;
         }
 

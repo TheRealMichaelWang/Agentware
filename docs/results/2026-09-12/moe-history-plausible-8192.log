@@ -1,0 +1,63 @@
+backend: local, 3 run(s) per task, padded with 44 turns of conversation (about 8192 tokens, fixture wrapped 0 time(s))
+
+calculator: the calculator computed 12 + 34 = 46 and the reply says so
+    kept /tmp/tasksuite-al2bz2qs
+  1/3 pass       54.2s    6 exchanges    9 actions  out  1333  first in 17925  | 12 + 34 = 46.
+    kept /tmp/tasksuite-4_sdr2b8
+  2/3 pass       34.8s    5 exchanges    7 actions  out   736  first in 17925  | 12 + 34 = 46.
+    kept /tmp/tasksuite-d9a3ewuf
+  3/3 pass       38.9s    6 exchanges    8 actions  out   996  first in 17925  | 12 + 34 = 46.
+
+open-and-edit: quarter.csv has 500 in D4 and the rest of the sheet intact
+    kept /tmp/tasksuite-5_4d_s30
+  1/3 pass       62.0s   16 exchanges   16 actions  out  1603  first in 17933  | Open quarter.csv, set D4 to 500, and saved. The asterisk on 
+    kept /tmp/tasksuite-su1lexsb
+  2/3 pass       62.4s   19 exchanges   16 actions  out  1325  first in 17933  | Opened /home/quarter.csv, typed 500 into D4, and saved the f
+    kept /tmp/tasksuite-901ub_hw
+  3/3 pass       98.3s   20 exchanges   21 actions  out  3120  first in 17933  | D4 is now 500 and quarter.csv is saved.
+
+new-sheet: greeting.csv exists with Hello in A1
+    kept /tmp/tasksuite-6xa0k6cc
+  1/3 pass      179.1s   18 exchanges   16 actions  out  9347  first in 17935  | Created /home/greeting.csv with "Hello" in cell A1. The tab 
+    kept /tmp/tasksuite-547fjrcx
+  2/3 pass       61.6s   15 exchanges   12 actions  out  1427  first in 17935  | Saved /home/greeting.csv with "Hello" in A1.
+    kept /tmp/tasksuite-gwp6skae
+  3/3 pass       72.0s   13 exchanges   14 actions  out  2173  first in 17935  | Saved /home/greeting.csv with "Hello" in A1.
+
+write-text: reminder.txt exists and holds the sentence
+    kept /tmp/tasksuite-2qkc5uen
+  1/3 FAIL       42.7s   18 exchanges   15 actions  out  1520  first in 17929  | I've typed "Buy milk" into the editor, but the Save as dialo
+    kept /tmp/tasksuite-wc2gcidj
+  2/3 pass       36.0s   10 exchanges   10 actions  out  1109  first in 17929  | Saved /home/reminder.txt with "Buy milk".
+    kept /tmp/tasksuite-2ljhu7_k
+  3/3 pass       53.9s   12 exchanges   12 actions  out  1482  first in 17929  | Created /home/reminder.txt with "Buy milk".
+
+find-app: the calculator computed 144 / 12 = 12, the agent having found it itself
+    kept /tmp/tasksuite-x98t3k3t
+  1/3 pass       37.3s    5 exchanges    9 actions  out   905  first in 17936  | The display shows 12, so 144 ÷ 12 = 12.
+    kept /tmp/tasksuite-cw01q1jj
+  2/3 pass       42.2s    4 exchanges   10 actions  out  1278  first in 17936  | It shows 12 now; the earlier 144 and ÷ 12 didn’t register. T
+    kept /tmp/tasksuite-4117ywae
+  3/3 pass       89.9s   18 exchanges   35 actions  out  2826  first in 17936  | The calculator shows 12. 144 divided by 12 is 12.
+
+traverse: a file the run saved under /home names every text file on the machine, each with its folder
+    kept /tmp/tasksuite-d57sopz2
+  1/3 FAIL      257.8s   34 exchanges  115 actions  out 10481  first in 17946  | I've created a spreadsheet listing all the text files found 
+    kept /tmp/tasksuite-oeryroku
+  2/3 FAIL      128.2s    2 exchanges   33 actions  out  8250  first in 17946  | There is only one text file on the machine: /home/welcome.tx
+    kept /tmp/tasksuite-lkhutswk
+  3/3 FAIL      150.7s   30 exchanges   64 actions  out  5528  first in 17946  | I'm unable to save the spreadsheet through the available con
+
+==============================================================================
+task                  pass   median s  exchanges  actions  out tok
+------------------------------------------------------------------------------
+calculator      3/3             38.9          6        8      996
+open-and-edit   3/3             62.4         19       16     1603
+new-sheet       3/3             72.0         15       14     2173
+write-text      2/3             42.7         12       12     1482
+find-app        3/3             42.2          5       10     1278
+traverse        0/3            150.7         30       64     8250
+------------------------------------------------------------------------------
+overall         14/18
+
+wrote docs/results/2026-09-12/moe-history-plausible-8192.json

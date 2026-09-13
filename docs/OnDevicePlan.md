@@ -180,6 +180,86 @@ What this answers:
 **Proves itself when:** the supervisor's boot report appears on the physical
 screen. Not the compositor. Just the report.
 
+**Prepared 13 September 2026, awaiting the boot.** What was needed, and
+what it found out before any reboot:
+
+* The machine is Strix Halo (Radeon 8060S, PCI `1002:1586`), booted by
+  UEFI with **Secure Boot on**, which will refuse an unsigned kernel; it has
+  to be turned off in the firmware setup for the stick to boot at all. Its
+  GPU blocks are gfx 11.0, psp 13.0, smu 14.0, sdma 6.0, vcn 4.0.5 and dcn
+  3.5, which is not the firmware list this section guessed; amdgpu is not in
+  the spike's kernel and the list is for Phase 5.
+* The QEMU kernel config lacked everything a screen needs before a GPU
+  driver: no framebuffer, no `efifb`, no framebuffer console, no NVMe, no
+  UAS. The USB kernel is a git worktree of the submodule (`kernel-usb-src/`,
+  ignored) with `SYSFB`, `FB_EFI`, `FRAMEBUFFER_CONSOLE`, `BLK_DEV_NVME`,
+  `USB_UAS` and a built-in command line, so the EFI stub boots it with no
+  loader: `initrd=/initramfs.cpio.gz console=tty0 agentware.system=/dev/sda2
+  agentware.state=/dev/sda3 agentware.volume-wait=15000`. The stub takes
+  forward slashes in the initrd path; backslashes do not survive Kconfig.
+* The supervisor waited 500ms for a volume, which is right for virtio and
+  wrong for a USB stick that takes seconds to enumerate, so
+  `agentware.volume-wait=<ms>` lengthens it on the command line and QEMU
+  keeps its half second.
+* `tools/usbstick.sh` lays the stick out without root, through udisks: a
+  FAT32 ESP with the kernel as `EFI/BOOT/BOOTX64.EFI` and the initramfs, an
+  ext4 system volume holding the sysroot tree, an empty ext4 state volume.
+  The first boot is expected to reach the boot report, mount both volumes,
+  and then fail to start the compositor for want of a DRM device, which is
+  the spike's stopping point.
+
+**Attempt 1, 13 September: the kernel booted and the supervisor aborted
+itself 300 microseconds in.** The photograph showed the EFI framebuffer,
+USB and HID up, the initramfs unpacked, "Run /init as init process", then
+a general protection fault in init at a `hlt` and "Attempted to kill init!
+exitcode=0xb". The `hlt` is the one in musl's `abort()`. The cause was the
+command line, not the hardware: it ended `console=ttyS0`, the last
+`console=` is what `/dev/console` becomes, PID 1's stderr is `/dev/console`,
+and this machine has no serial port. The supervisor's first log line goes
+through `eprintln!` before `/dev/kmsg` exists; `eprintln!` panics when the
+write fails; the panic hook reported the panic through the same stderr; a
+panic inside a panic is an abort. Reproduced exactly in QEMU under OVMF with
+`-serial none` (same fault, same offset in the binary), which is how the
+spike will be tested from now on: the stick's layout as a loop image, the
+real firmware path, and the screen photographed through the monitor. Fixed
+twice over: the supervisor writes its pre-kmsg lines and its panic message
+with writes that cannot fail into a panic (`klog::stderr`), and the built-in
+command line now ends `console=tty0`. Under QEMU with no serial port the
+fixed initramfs boots to the report, mounts the system and state volumes off
+the USB disk, and starts the compositor, which exits for want of a display
+and is restarted with backoff, on the old command line and the new. That
+restart loop would scroll the report off a console with no scrollback
+before a phone could be pointed at it, so the spike's command line also
+carries `agentware.report-only`: the supervisor mounts the volumes, prints
+the report, and parks, with Ctrl-Alt-Del handed back to the kernel. Under
+QEMU with no serial port the screen then holds: virtual filesystems, "DRM:
+no /dev/dri nodes", two evdev nodes, the USB disk found as sda1 to sda3,
+`/dev/sda2` mounted on `/system` and bound in, `/dev/sda3` on `/state`,
+`/home` off it, the resolver written, "stopping here, as asked". The stick
+carries that kernel and initramfs, verified byte for byte. Attempt 2 is
+expected to show the same screen on the Framework.
+
+**Attempt 2, 13 September: it worked.** The Framework Desktop booted the
+stick to the supervisor's boot report and the line
+`agentware.report-only: stopping here, as asked`, and Ctrl-Alt-Del rebooted
+it back into Ubuntu. Two attempts, one day, the failure between them a
+console bug rather than a hardware one. What the spike set out to answer:
+
+* A kernel built from this tree's config plus the pieces above boots this
+  hardware, through the EFI stub with no loader, with the firmware's
+  framebuffer as its console.
+* The initramfs works unchanged: the supervisor and `/dev/console`, 259 KB.
+  amdgpu firmware was not in it and not needed for this; its size is a
+  Phase 5 question with a known answer (a few MB).
+* The supervisor found and mounted its volumes off the USB stick; NVMe was
+  built in but not exercised, since nothing of ours is on the internal
+  drives yet.
+
+**What the answer changes:** Phase 5 is scheduled with confidence. The
+port converged in a day, and the remaining work is what the Phase 5 list
+already says: amdgpu with its firmware, the real display and input, the
+one-drive layout, a DHCP client.
+
 **What the answer changes:** if this takes two days, Phase 5 is scheduled with
 confidence. If it is still fighting after a week, the bare metal port becomes a
 project of its own and everything else proceeds against the host server for
@@ -272,22 +352,79 @@ as unknown.
   model was seen to invent a `read_cells` call against an application with no
   spreadsheet in it. That is what the Phase 2 suite is for, and it is now the
   blocking item rather than the model.
-* **Where quality actually falls off with context.** The 32k figure is one
-  person's impression. The suite can measure it: run the same tasks with padded
-  history at 8k, 16k, 32k, 48k. **This number sets the slot size, the context
-  budget and the history trimming threshold**, which the design says should all
-  be the same figure.
-* **Thinking on versus off.** Half answered: it is the largest token lever and
-  it is now off on the local path, because it also has the worst draft
-  acceptance (0.52 against 0.97 for a tool call) and so loses twice. What is
-  not answered is what it costs in correctness, which needs the task suite.
-* **KV quantization.** q8 and q4 against pass rate. This buys slot count.
-* **Does slot save and restore work with Vulkan and quantized KV**, and how fast.
-  The three-tier cache design rests on a restore being a second or two.
-* **Does llama.cpp reserve KV up front or lazily.** Decides whether the memory
-  floor is a guarantee or needs a different mechanism.
-* **Does llama.cpp build against musl with the Vulkan loader.** The only open
-  question that changes the shape of the design rather than a number in it.
+* **Where quality actually falls off with context: it was falling off the
+  history's shape, not its length, and the shape is fixed.** Measured 12
+  September 2026 with the 35B MoE, six tasks, three runs each, the suite's
+  strict checks, no history 17/18. Padding the history with a hand-written
+  conversation of the kind a person has with this machine (varied requests,
+  the agent's replies in the register of the real ones, none of the suite's
+  tasks in it: `tools/fixtures/`, sized by the model's tokenizer through
+  `tools/padding.py`) gave **0 of 15 short-task runs at 8k tokens**, every
+  one a single exchange with no tool call and a report of work not done,
+  copied in shape from the nearest earlier turn. The cause is what the
+  agentdesk kept as history: the human's text and the agent's reply, with
+  every tool call of every turn dropped at the turn boundary as "detritus".
+  Forty turns of that show a model no tool call anywhere, and it concludes
+  that in this conversation requests are answered with a report. Listing
+  the actions as text above each reply made it write that text itself, 0
+  of 3 again. Carrying the calls as what they are, tool-use blocks with
+  their arguments and a placeholder result (`agentdesk` keeps them,
+  `awagent/src/history.rs` rebuilds them), gave **11 of 12 short-task runs
+  at 8k**, the miss a genuine one, fifteen real actions that lost a dialog.
+  No history stayed at 17/18. The length question is now searched from 32k
+  upward on that history (`search.sh`); the figure below is what that
+  found. Two earlier curves, one from three hundred copies of a single
+  action report and one from an answers-only conversation, are kept in the
+  results directory for what they are: bounds, not the answer.
+  What did not change: a long turn grows about 58k tokens above its
+  history, so the slot stays 128k and the history budget must leave a turn
+  that room; and tool calls are dearer than their prose, 44 turns being 8k
+  tokens as text and 18k once the chat template renders the calls.
+* **Thinking on versus off: answered, off, and it is a setting now.** The
+  suite on 12 September 2026, same server and same day for both, thinking
+  off 17/18 and thinking on 17/18. Thinking bought no pass. It cost two to
+  three times the output tokens on every short task (calculator 387 against
+  1106; write-text 522 against 2328), doubled their wall clock (open-and-edit
+  22s against 47 to 62s), and its one miss was new in kind: the model
+  reasoned in circles for the whole 8192-token output budget and never
+  issued a tool call. On the long task it did help, cutting `traverse` to
+  35 to 54 exchanges against 39 to 54 and 144s against 155s on the best
+  runs, which is the one place a plan is worth thinking about. It is
+  `<agent><local-thinking>` in `settings.xml`, a checkbox on the Settings
+  app's Agent page, off by default, read by the agent at each turn. What
+  this model's template offers is on or off; the server's budget knob is
+  ignored by it, so there is no number to set.
+* **KV quantization: answered, and not worth it for the MoE.** q8 scored
+  17/18 against f16's 18/18 (the miss unrelated to precision), saves 1.2 GiB
+  per 128k slot because hybrid attention keeps the KV small anyway, and
+  costs 25% of prefill speed on Vulkan. Stay at f16. q4 not measured; there
+  is nothing for it to buy.
+* **Slot save and restore: answered, it works, at f16 and q8.** 114k tokens
+  save in 0.5s and restore in 0.3s against 242s to prefill; a restored
+  conversation is reused in full by any request that continues it, which
+  every exchange does. An exact repeat of the saved prompt is the one shape
+  that is not resumed, because this hybrid model cannot rewind to
+  re-evaluate the last token without a checkpoint the save file does not
+  carry; that shape never occurs. `tools/slotbench.py`.
+* **KV reservation: answered, up front.** 128k pins 2.4 GiB more than 32k
+  before any token is sent, so the floor is a guarantee.
+* **Does llama.cpp build against musl with the Vulkan loader: yes, and the
+  shape it forces is a dynamically linked process.** Measured 12 September
+  2026 with a musl cross toolchain (GCC 11.2.1, musl.cc), the Khronos loader
+  1.4.362 built with it (window-system support off, and `USE_GAS=OFF`
+  because the assembly trampolines need a generated helper the host cannot
+  run), and llama.cpp at 058df67 configured as a declared cross build so its
+  own two build-time helpers (the shader generator and the UI embedder) are
+  built by the host compiler. `llama-server` links, 67 MB, and prints its
+  version under musl's dynamic loader. What it cannot be is static: the
+  Vulkan loader finds a driver by `dlopen`, and a static musl binary has no
+  `dlopen`. So the inference service in Phase 6 is either the image's first
+  dynamically linked process, carrying musl's `ld-musl`, `libstdc++`,
+  `libgomp`, the loader and a musl-built Mesa RADV ICD, or it links the ICD
+  directly and bypasses the loader. Both are work in Phase 5's territory
+  (a musl Mesa is the larger half); neither is a change to the design. The
+  recipe is `~/llm/musl/build.sh` on the development machine, outside the
+  tree.
 
 **Proves itself when:** every open question in OnDevice.md is either answered or
 explicitly reclassified as not mattering.
@@ -297,14 +434,44 @@ explicitly reclassified as not mattering.
 Now, and not before, because everything here is tuning and Phase 3 says what to
 tune against.
 
-* **Grammar-constrained tool calls.** GBNF generated from the same closed action
-  vocabulary the tool schema is generated from, so the two cannot drift. Watch
-  for forced-token fast-forwarding actually engaging; if it does not, most of the
-  benefit is missing.
-* **Prompt-lookup speculation**, which needs no draft model and suits output that
-  is mostly ids copied out of the context. A draft model only if lookup
-  underperforms.
-* **The thinking budget** as a setting rather than a constant.
+* **Grammar-constrained tool calls: already there, and worth nothing in
+  speed.** llama.cpp builds a grammar from the tool schemas on every request
+  that carries `tools`; for this model's template (the Qwen3-Coder XML shape)
+  it engages at `<tool_call>` and holds the function name, the parameter
+  names and every argument to the schema, the `act` enum included. So the
+  closed vocabulary the harness sends already reaches the sampler, and
+  there is no GBNF to write. Measured 12 September (`modelbench --only
+  grammar`, greedy, MTP draft): lazy grammar 93.2 tok/s, grammar from the
+  first token 94.6, no grammar at all 95.2. The server does not jump forward
+  over forced tokens, so a grammar cannot make a call faster; it makes it
+  well-formed, which it already was. Nothing to do here.
+* **Speculation: measured, and the answer is the draft head first, n-gram
+  lookup second.** Same exchanges, greedy, tok/s of generation:
+
+  | mode | first exchange | later exchanges | acceptance |
+  | --- | --- | --- | --- |
+  | none | 57.4 | 57.6 | |
+  | MTP draft head | 94.8 | 94.3 | 1.00 |
+  | n-gram simple | 71.7 | 72.4 | 0.62 |
+  | n-gram mod | 59.1 | 102.7 to 116.4 | 0.74 |
+  | MTP + n-gram simple | 88.3 | 89.3 | 0.73 |
+  | MTP + n-gram mod | 78.0 | 101.2 to 139 | 0.68 |
+
+  Prompt lookup does exactly what the plan guessed: once a turn's context
+  holds a tool call to copy from, `ngram-mod` beats the draft head by a
+  fifth; on the first exchange, with nothing to copy, it is no faster than
+  no speculation. The draft head is flat at 1.6x whatever the context
+  holds. Adding the simple lookup to the draft head made it slightly
+  worse; adding `ngram-mod` to it is the best of all on every exchange
+  after the first (120 tok/s on the repeated exchange, 139 on a grammar
+  shape) and costs a sixth on the first, where the lookup's misses are
+  drafts the model has to refuse. A turn is one first exchange and several
+  later ones, so `--spec-type draft-mtp,ngram-mod` is the serving
+  configuration now. What none of this changes: prefill is still the cost
+  of an exchange, and generation at 120 tok/s is 2.5s of a 4s exchange
+  only because these are 300-token calls measured greedy.
+* **The thinking budget as a setting: done**, as on or off, which is all the
+  template takes (Phase 3 above).
 * **History trimming at the turn boundary**, in the agentdesk, to the threshold
   Phase 3 established. This is the only cut the design makes into context, and
   the reasoning for cutting there and nowhere else is in OnDevice.md.
@@ -332,7 +499,11 @@ Informed by the 1.5 spike, and sequenced so each step has a visible result.
    `agentware.state=`, which already exist. The state volume stops being a 64MB
    image: models are tens of gigabytes and the cache budget is two hundred, so
    decide here whether settings, models and caches share a partition or are
-   separated by lifetime.
+   separated by lifetime. **One drive**, decided 13 September 2026: the OS
+   and the state volume live on the same drive, as partitions if they are
+   separate at all; QEMU's two virtio drives are a development convenience
+   and not the shape of the install. The USB stick of Phase 1.5 already has
+   that shape.
 5. **Display.** amdgpu modesetting, real EDID, real connectors. The compositor
    talks DRM/KMS, which should survive, but this is where the single-output
    question gets answered.
@@ -343,6 +514,61 @@ Informed by the 1.5 spike, and sequenced so each step has a visible result.
 
 **Proves itself when:** `tools/screenshot.py`'s scenarios pass on the physical
 machine, and the Phase 2 suite runs on it.
+
+**Steps 1, 2 and 3 built, 13 September 2026, awaiting the boot.** What
+the stick now carries, and what was learned making it:
+
+* **The firmware is a submodule**, `linux-firmware/`, the official tree at
+  kernel.org pinned to its 20260910 release, shallow and checked out sparse
+  to the `amdgpu` directory (101 MB of working tree over 792 MB of pack;
+  the alternative was Ubuntu's `/lib/firmware`, which is the same files
+  with no record of which release). The list this section guessed was
+  wrong in every version number. The real one was read off the GPU's own
+  IP discovery table (`/sys/class/drm/card1/device/ip_discovery`, no root
+  needed): GC 11.5.1, PSP 14.0.1, DCN 3.5.1, VCN 4.0.6 with two instances,
+  SDMA 6.1.1, VPE 6.1.1, and mapped to file names by the driver's
+  `MODULE_FIRMWARE` lines, since the prefix rules (`psp_14_0_1_toc` is
+  served by `psp_v13_0.c`; VCN's second instance wants `vcn_4_0_6_1.bin`)
+  are not guessable either. Fourteen files, 3.5 MB unpacked, 1.3 MB in
+  the archive. The SMU on an APU needs none (its firmware is in the BIOS)
+  and the ISP, the camera pipeline, is 3.8 MB on its own and not built.
+* **The initramfs carries it**, at `/lib/firmware/amdgpu/`, because the
+  driver is built in and asks for its firmware while it probes, before PID
+  1 has mounted anything; `tools/mkinitramfs.py` writes the directory
+  records too, since the kernel's unpacker creates nothing it is not told
+  to. It is a second archive, `initramfs-usb.cpio.gz`, 1.5 MB against the
+  QEMU one's 259 KB, because virtio-gpu wants no firmware and an initramfs
+  is unpacked into RAM on every boot. `make usb` builds the image, the
+  bare-metal kernel and this archive; `tools/usbstick.sh` copies them.
+* **The bare-metal kernel configuration is checked in**,
+  `kernel/agentware-usb.config`, and `make kernel-usb` builds it into the
+  `kernel-usb-src` worktree the way `make kernel` builds the QEMU one. It
+  adds `DRM_AMDGPU` with `DRM_AMD_DC` and `DRM_FBDEV_EMULATION` (the console
+  survives the driver taking the screen from `efifb`), and drops i915, AGP,
+  the compute stack (`HSA_AMD`), the SI and CIK generations and the ISP.
+  The built-in command line no longer carries `agentware.report-only`: the
+  boot is expected to reach the desk.
+* **amdgpu refuses the compositor's dirty call.** `DRM_IOCTL_MODE_DIRTYFB`
+  is what makes virtio-gpu transfer a frame; amdgpu's `amdgpu_dirtyfb`
+  answers `ENOSYS` to any caller with a file, meaning every userspace one,
+  and the compositor logged "could not present" on every frame it would
+  have drawn, into a kernel log with the rate limit off. The card scans
+  out of the dumb buffer the CPU wrote, so nothing is lost; `Display`
+  now learns from the first `ENOSYS` and stops asking, one log line.
+* **Tested the way Phase 1.5 was**: the stick's layout on a loop device
+  (`tools/usbstick.sh` takes one; `udisksctl loop-setup -f` needs no root),
+  booted under OVMF as a USB disk with no serial port and photographed
+  through the monitor (`tools/usbboot.py`, which is that recipe as a tool).
+  The desk is up at twelve seconds, off the USB disk, on virtio-vga. What
+  that cannot test is the one thing this step is for: QEMU has no Strix
+  Halo, so amdgpu's own bring-up, the firmware being found and accepted,
+  and the compositor on a real connector are the boot's to answer.
+
+What the boot should show, in order: the firmware's framebuffer as the
+console, the kernel's amdgpu lines as it takes the screen over, the
+supervisor's report, then the desk. If the desk does not appear, the
+compositor's error is on the console and the supervisor restarts it with
+backoff, so the line to photograph is the one that repeats.
 
 **Also measure here:** compositor paint time at the panel's native resolution.
 The design withdrew the claim that software rasterization starves the model of
